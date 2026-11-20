@@ -1,0 +1,1431 @@
+/**
+ * Workerd Sandbox Runner
+ *
+ * Implements the SandboxRunner interface for Node.js deployments using
+ * workerd as a sidecar process. Plugins run in isolated V8 isolates
+ * with capability-scoped access to EmDash APIs.
+ *
+ * Architecture:
+ * - Node spawns workerd with a generated capnp config
+ * - Each plugin is a nanoservice with its own internal port
+ * - Plugins communicate with Node via a backing service HTTP server
+ * - Node invokes plugin hooks/routes via HTTP to the plugin's port
+ * - Plugins call back to Node for content/media/KV/email operations
+ *
+ * The backing service HTTP server runs in the Node process and handles
+ * authenticated requests from plugins. Each plugin receives a unique
+ * auth token that encodes its ID and capabilities.
+ */
+
+import { execFileSync } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { rmSync } from "node:fs";
+import { writeFile, mkdir, rm, unlink } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { Server } from "node:http";
+import { createRequire } from "node:module";
+import type { Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type {
+	ContentActionCallbacks,
+	SandboxRunner,
+	SandboxedPluginInstance,
+	SandboxCommentModerateCallback,
+	SandboxInvocationOptions,
+	SandboxEmailSendCallback,
+	SandboxContentCreateCallback,
+	SandboxOptions,
+	SandboxRunnerFactory,
+	SerializedRequest,
+} from "emdash";
+import type { PluginManifest } from "emdash";
+// @ts-ignore -- SandboxUnavailableError is a class export, not type-only
+import {
+	createSandboxRouteError,
+	getSandboxRouteErrorEnvelope,
+	SandboxUnavailableError,
+} from "emdash";
+
+import { createBackingServiceHandler } from "./backing-service.js";
+import type { BackingServiceHandler } from "./backing-service.js";
+import { generateCapnpConfig, pluginSocketName } from "./capnp.js";
+import type { LoadedPlugin } from "./capnp.js";
+import { MiniflareDevRunner } from "./dev-runner.js";
+import {
+	killWorkerdChildren,
+	signalWorkerd,
+	spawnWorkerd,
+	supportsWorkerdWatchdog,
+	unrefWorkerd,
+} from "./workerd-process.js";
+import { waitForWorkerdReady } from "./workerd-startup.js";
+import { generatePluginWrapper, parseRouteTransport, stringifyRouteTransport } from "./wrapper.js";
+
+/** Replace non-alphanumeric chars for safe file/worker names */
+const SAFE_ID_RE = /[^a-z0-9_-]/gi;
+
+/**
+ * Stub for the "emdash" module that sandbox-entry plugins import to get
+ * `definePlugin`. The marketplace bundler inlines this via an alias, but
+ * statically-loaded sandboxed plugins (from `sandboxed: [...]`) embed
+ * their `dist/sandbox-entry.mjs` as-is, which still has the bare import.
+ * Providing the module here keeps that path working without rebuilding
+ * every plugin. Mirrors `EMDASH_SHIM` in @emdash-cms/cloudflare.
+ */
+const EMDASH_SHIM = "export const definePlugin = (d) => d;\n";
+const EMDASH_SHIM_FILE = "emdash-shim.js";
+
+/**
+ * Build the minimal env for spawning workerd. Passing the full
+ * process.env risks leaking host secrets (DATABASE_URL, API keys, etc.)
+ * to plugins via workerd's nodejs_compat process.env polyfill, even
+ * though plugin code is otherwise isolated. Keep this list as small as
+ * possible.
+ *
+ * Operators who need additional vars in the workerd child can list
+ * them in EMDASH_WORKERD_PASSTHROUGH_ENV (comma-separated).
+ */
+export function minimalWorkerdEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	// Vars workerd / its dependencies might need to start:
+	const ALLOW = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"];
+	for (const k of ALLOW) {
+		const v = process.env[k];
+		if (v !== undefined) env[k] = v;
+	}
+	const passthrough = process.env.EMDASH_WORKERD_PASSTHROUGH_ENV;
+	if (passthrough) {
+		for (const k of passthrough.split(",")) {
+			const trimmed = k.trim();
+			if (!trimmed) continue;
+			const v = process.env[trimmed];
+			if (v !== undefined) env[trimmed] = v;
+		}
+	}
+	return env;
+}
+
+/** Use Unix domain sockets for the backing service (lower latency than TCP).
+ * Falls back to TCP on Windows where Unix sockets are not available. */
+const USE_UNIX_SOCKET = process.platform !== "win32";
+
+const LIFECYCLE_KEY = Symbol.for("emdash.workerd-runner-lifecycle");
+const lifecycleGlobal = globalThis as typeof globalThis & {
+	[LIFECYCLE_KEY]?: {
+		runners: Set<WorkerdSandboxRunner>;
+		removedSignalHandlers: Set<"SIGTERM" | "SIGINT">;
+		onRemoveListener: typeof onRemoveListener;
+		onSigterm: () => void;
+		onSigint: () => void;
+		onExit: () => void;
+	};
+};
+const lifecycle = (lifecycleGlobal[LIFECYCLE_KEY] ??= {
+	runners: new Set<WorkerdSandboxRunner>(),
+	removedSignalHandlers: new Set<"SIGTERM" | "SIGINT">(),
+	onRemoveListener,
+	onSigterm,
+	onSigint,
+	onExit: onHostExit,
+});
+const activeRunners = lifecycle.runners;
+
+function handleSignal(signal: "SIGTERM" | "SIGINT"): void {
+	const handler = signal === "SIGTERM" ? lifecycle.onSigterm : lifecycle.onSigint;
+	const hasOtherHandlers =
+		lifecycle.removedSignalHandlers.has(signal) ||
+		process.listeners(signal).some((listener) => listener !== handler);
+	if (hasOtherHandlers) {
+		for (const runner of activeRunners) runner["allowHostDrain"]();
+		if (process.platform !== "win32" && !supportsWorkerdWatchdog()) {
+			// A native re-raise skips JavaScript exit handlers; without the EOF
+			// watchdog, cleanup must complete before application handlers run.
+			for (const runner of activeRunners) {
+				void runner.terminateAll();
+				runner["cleanupExitFiles"]();
+			}
+			killWorkerdChildren();
+		}
+		process.off(signal, handler);
+		return;
+	}
+	for (const runner of activeRunners) void runner.terminateAll();
+	killWorkerdChildren();
+	onHostExit();
+	process.off(signal, handler);
+	process.kill(process.pid, signal);
+}
+
+function onRemoveListener(event: string | symbol, listener: (...args: never[]) => unknown): void {
+	if (event !== "SIGTERM" && event !== "SIGINT") return;
+	const handler = event === "SIGTERM" ? lifecycle.onSigterm : lifecycle.onSigint;
+	if (listener === handler) return;
+	// A once-listener removes itself before later signal listeners run. Keep
+	// its ownership until the synchronous dispatch has finished.
+	lifecycle.removedSignalHandlers.add(event);
+	queueMicrotask(() => lifecycle.removedSignalHandlers.delete(event));
+}
+
+function onSigterm(): void {
+	handleSignal("SIGTERM");
+}
+
+function onSigint(): void {
+	handleSignal("SIGINT");
+}
+
+function onHostExit(): void {
+	for (const runner of activeRunners) runner["cleanupExitFiles"]();
+}
+
+function registerSigHandler(runner: WorkerdSandboxRunner): void {
+	if (activeRunners.size === 0) {
+		process.on("removeListener", lifecycle.onRemoveListener);
+		process.prependListener("SIGTERM", lifecycle.onSigterm);
+		process.prependListener("SIGINT", lifecycle.onSigint);
+		process.on("exit", lifecycle.onExit);
+	}
+	activeRunners.add(runner);
+}
+
+function unregisterSigHandler(runner: WorkerdSandboxRunner): void {
+	activeRunners.delete(runner);
+	if (activeRunners.size === 0) {
+		process.off("SIGTERM", lifecycle.onSigterm);
+		process.off("SIGINT", lifecycle.onSigint);
+		process.off("exit", lifecycle.onExit);
+		process.off("removeListener", lifecycle.onRemoveListener);
+	}
+}
+
+/**
+ * Default resource limits for sandboxed plugins.
+ * Matches Cloudflare production limits.
+ */
+const DEFAULT_LIMITS = {
+	cpuMs: 50,
+	memoryMb: 128,
+	subrequests: 30,
+	wallTimeMs: 30_000,
+} as const;
+
+/**
+ * Resolved resource limits with defaults applied.
+ */
+interface ResolvedLimits {
+	cpuMs: number;
+	memoryMb: number;
+	subrequests: number;
+	wallTimeMs: number;
+}
+
+function resolveLimits(limits?: SandboxOptions["limits"]): ResolvedLimits {
+	return {
+		cpuMs: limits?.cpuMs ?? DEFAULT_LIMITS.cpuMs,
+		memoryMb: limits?.memoryMb ?? DEFAULT_LIMITS.memoryMb,
+		subrequests: limits?.subrequests ?? DEFAULT_LIMITS.subrequests,
+		wallTimeMs: limits?.wallTimeMs ?? DEFAULT_LIMITS.wallTimeMs,
+	};
+}
+
+/**
+ * Probe every plugin's `/__ready` endpoint in parallel. Returns true iff
+ * every plugin responds with `ok`. Exported for testing; not re-exported
+ * from the package barrel.
+ */
+export async function probeAllReady(
+	plugins: Iterable<{ port: number }>,
+	invokeToken: string,
+	perProbeTimeoutMs = 1000,
+): Promise<boolean> {
+	const targets = [...plugins];
+	if (targets.length === 0) return true;
+	const checks = targets.map((p) =>
+		fetch(`http://127.0.0.1:${p.port}/__ready`, {
+			signal: AbortSignal.timeout(perProbeTimeoutMs),
+			headers: { Authorization: `Bearer ${invokeToken}` },
+		})
+			.then((r) => r.ok)
+			.catch(() => false),
+	);
+	const results = await Promise.all(checks);
+	return results.every(Boolean);
+}
+
+/**
+ * Minimal shape of the runner that the exit handler needs. Pulled out so
+ * the handler can be built and tested in isolation -- the identity guard
+ * (`host.workerdProcess !== proc`) is the load-bearing piece.
+ */
+export type ExitHandlerHost = {
+	workerdProcess: ChildProcess | null;
+	healthy: boolean;
+	shuttingDown: boolean;
+	intentionalStop: boolean;
+	scheduleRestart(): void;
+};
+
+/**
+ * Build an exit handler bound to a specific spawned workerd process.
+ *
+ * The handler short-circuits if the host has already moved on to a newer
+ * workerd (`host.workerdProcess !== proc`), which would otherwise let a
+ * late exit from a prior process clobber the live one's handle and mark
+ * it unhealthy. Exported for testing; not re-exported from the package
+ * barrel.
+ */
+export function makeWorkerdExitHandler(
+	host: ExitHandlerHost,
+	proc: ChildProcess,
+): (code: number | null, signal: NodeJS.Signals | null) => void {
+	return (code, signal) => {
+		if (host.workerdProcess !== proc) return; // stale handler from a prior workerd
+		host.healthy = false;
+		host.workerdProcess = null;
+		if (host.shuttingDown) return;
+		// Skip crash recovery for intentional stops (e.g., reload via
+		// stopWorkerd() during restart()). Reset the flag so the next
+		// exit, if it happens unexpectedly, is treated as a real crash.
+		if (host.intentionalStop) {
+			host.intentionalStop = false;
+			return;
+		}
+		// Restart on non-zero exit code OR signal-based termination (OOM, kill)
+		if ((code !== 0 && code !== null) || signal) {
+			const reason = signal ? `signal ${signal}` : `code ${code}`;
+			console.error(`[emdash:workerd] workerd exited with ${reason}`);
+			host.scheduleRestart();
+		}
+	};
+}
+
+/**
+ * Send SIGTERM and resolve when the process exits, escalating to SIGKILL
+ * after `timeoutMs` if it ignores the term signal. Forced stops send SIGKILL
+ * immediately.
+ *
+ * The fallback timer is cleared on clean exit so it does not keep the Node
+ * event loop alive past termination -- previously a stale timer would
+ * delay `terminateAll()` and process shutdown by up to 5 seconds. Exported
+ * for testing.
+ */
+export function waitForProcessExit(
+	proc: ChildProcess,
+	timeoutMs = 5000,
+	options: { force?: boolean } = {},
+): Promise<void> {
+	let killTimer: ReturnType<typeof setTimeout> | null = null;
+	const exitPromise = new Promise<void>((resolve) => {
+		proc.once("exit", () => resolve());
+	});
+	if (options.force) {
+		signalWorkerd(proc, "SIGKILL");
+	} else {
+		signalWorkerd(proc, "SIGTERM");
+		killTimer = setTimeout(() => {
+			killTimer = null;
+			if (proc.exitCode === null && proc.signalCode == null) signalWorkerd(proc, "SIGKILL");
+		}, timeoutMs);
+	}
+	return exitPromise.finally(() => {
+		if (killTimer !== null) clearTimeout(killTimer);
+	});
+}
+
+/** Decoded claims encoded in a per-plugin auth token. */
+export interface PluginTokenClaims {
+	pluginId: string;
+	version: string;
+	nonce: string;
+	capabilities: string[];
+	allowedHosts: string[];
+	storageCollections: string[];
+}
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isTokenClaims(value: unknown): value is PluginTokenClaims {
+	if (!isRecord(value)) return false;
+	return (
+		typeof value.pluginId === "string" &&
+		typeof value.version === "string" &&
+		typeof value.nonce === "string" &&
+		isStringArray(value.capabilities) &&
+		isStringArray(value.allowedHosts) &&
+		isStringArray(value.storageCollections)
+	);
+}
+
+/**
+ * Workerd sandbox runner for Node.js deployments.
+ *
+ * Manages a workerd child process and a backing service HTTP server.
+ * Plugins are added/removed by regenerating the capnp config and
+ * restarting workerd (millisecond cold start).
+ */
+export class WorkerdSandboxRunner implements SandboxRunner {
+	private options: SandboxOptions;
+	private limits: ResolvedLimits;
+	private siteInfo?: {
+		name: string;
+		url: string;
+		locale: string;
+		trailingSlash?: "always" | "never" | "ignore";
+	};
+
+	/** Loaded plugins indexed by pluginId (manifest.id:manifest.version) */
+	private plugins = new Map<string, LoadedPlugin>();
+	private configurationVersion = 0;
+
+	/** Backing service HTTP server (runs in Node) */
+	private backingServer: Server | null = null;
+	private backingConnections = new Set<Socket>();
+	private hostDraining = false;
+	private backingPort = 0;
+	private backingService: BackingServiceHandler | null = null;
+	private backingSocketPath: string | null = null;
+	private eagerStartTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** workerd child process */
+	private workerdProcess: ChildProcess | null = null;
+
+	/** Master secret for generating per-plugin auth tokens */
+	private masterSecret = randomBytes(32).toString("hex");
+
+	/**
+	 * Per-startup token the runner sends on every hook/route invocation
+	 * to its plugins. Plugins reject requests without this token, which
+	 * prevents same-host attackers from invoking plugin hooks directly
+	 * via the per-plugin TCP listener on 127.0.0.1.
+	 */
+	private invokeToken = randomBytes(32).toString("hex");
+
+	/** Temporary directory for capnp config and plugin code files */
+	private configDir: string | null = null;
+
+	/** Email send callback, wired from EmailPipeline */
+	private emailSendCallback: SandboxEmailSendCallback | null = null;
+	private commentModerateCallback: SandboxCommentModerateCallback | null = null;
+	private contentCreateCallback: SandboxContentCreateCallback | null = null;
+	private contentActionsCallback: ContentActionCallbacks | null = null;
+	private cronRescheduleCallback: (() => void) | null = null;
+
+	/** Epoch counter, incremented on each workerd restart */
+	private epoch = 0;
+
+	/** Whether workerd is currently healthy */
+	private healthy = false;
+
+	/** Whether workerd needs to be (re)started before next invocation */
+	private needsRestart = false;
+
+	/** Serializes concurrent ensureRunning() calls */
+	private startupPromise: Promise<void> | null = null;
+	private stoppingPromise: Promise<void> | null = null;
+	private timeoutProbes = new Set<Promise<void>>();
+	private timeoutWatchdogs = new Set<ReturnType<typeof setTimeout>>();
+
+	/** Crash restart state */
+	private crashCount = 0;
+	private crashWindowStart = 0;
+	private restartTimer: ReturnType<typeof setTimeout> | null = null;
+	private restartWaiters = new Set<() => void>();
+	private shuttingDown = false;
+
+	/** True once the crash budget is spent; invocations cannot restart workerd. */
+	private gaveUp = false;
+
+	/** True when the last isAvailable() call could not run the workerd binary. */
+	private binaryFailed = false;
+
+	/**
+	 * True when stopWorkerd() is intentionally tearing down the child
+	 * (e.g., on intentional restart() to reload plugins). The exit handler
+	 * uses this to skip crash recovery for intentional stops, otherwise
+	 * every plugin reload would trigger a phantom crash-restart cycle.
+	 */
+	private intentionalStop = false;
+
+	constructor(options: SandboxOptions) {
+		this.options = options;
+		this.limits = resolveLimits(options.limits);
+		this.siteInfo = options.siteInfo;
+		this.emailSendCallback = options.emailSend ?? null;
+		this.commentModerateCallback = options.commentModerate ?? null;
+		this.contentActionsCallback = options.contentActions ?? null;
+
+		// Warn about unenforceable resource limits. Standalone workerd
+		// only supports wall-time enforcement on the Node path. cpuMs,
+		// memoryMb, and subrequests are Cloudflare
+		// platform features and are not enforced here.
+		if (
+			options.limits &&
+			(options.limits.cpuMs !== undefined ||
+				options.limits.memoryMb !== undefined ||
+				options.limits.subrequests !== undefined)
+		) {
+			console.warn(
+				"[emdash:workerd] cpuMs, memoryMb, and subrequests limits are not enforced " +
+					"by standalone workerd. Only wallTimeMs is enforced on the Node path. " +
+					"For full resource isolation, deploy on Cloudflare Workers.",
+			);
+		}
+
+		// Preserve host signal behavior while stopping sandbox children.
+		registerSigHandler(this);
+	}
+
+	/**
+	 * Check if workerd is available on this system.
+	 */
+	isAvailable(): boolean {
+		try {
+			const bin = this.resolveWorkerdBinary();
+			// execFileSync (not execSync) so paths with spaces or shell
+			// metacharacters are passed verbatim, not shell-split.
+			execFileSync(bin, ["--version"], { stdio: "ignore", timeout: 5000 });
+			this.binaryFailed = false;
+			return true;
+		} catch {
+			this.binaryFailed = true;
+			return false;
+		}
+	}
+
+	/**
+	 * Resolve the workerd binary path from node_modules.
+	 * Avoids npx which can download binaries at runtime (supply chain risk).
+	 */
+	private resolveWorkerdBinary(): string {
+		try {
+			const esmRequire = createRequire(import.meta.url);
+			// workerd exports the native executable path. Its CLI entry can be
+			// a Node shim, whose exit would leave the actual isolate running.
+			const workerd: unknown = esmRequire("workerd");
+			if (!isRecord(workerd) || typeof workerd.default !== "string") {
+				throw new Error("workerd did not export a binary path");
+			}
+			return workerd.default;
+		} catch {
+			// Fallback: try workerd on PATH
+			return "workerd";
+		}
+	}
+
+	/**
+	 * Check if the workerd process is currently healthy.
+	 *
+	 * Returns false when needsRestart is set (process not yet started or
+	 * needs to be restarted), since callers using this for monitoring or
+	 * external health checks expect "running and serving requests".
+	 *
+	 * Internal callers that just want to defer-then-invoke should use
+	 * ensureRunning() instead, which handles the deferred startup.
+	 */
+	isHealthy(): boolean {
+		if (this.needsRestart) return false;
+		return this.healthy && this.workerdProcess !== null && !this.workerdProcess.killed;
+	}
+
+	/**
+	 * Why the runner cannot run plugins: a binary the last isAvailable() call
+	 * could not run, or why an invocation cannot reach workerd, the message
+	 * SandboxUnavailableError carries.
+	 *
+	 * Once the crash budget is spent, invocations leave workerd stopped until
+	 * a configuration change or server restart resets the budget.
+	 */
+	unavailableReason(): string {
+		if (this.binaryFailed) {
+			return "workerd is missing or its binary does not run on this platform; reinstall with optional dependencies enabled";
+		}
+		if (this.gaveUp) {
+			return "workerd crashed 5 times in 60 seconds and the runner stopped retrying; restart the server";
+		}
+		return "workerd is not running";
+	}
+
+	/**
+	 * Ensure workerd is running. Called before first invocation.
+	 * Batches plugin loading: all plugins are registered via load(),
+	 * then workerd starts once on the first hook/route call.
+	 */
+	async ensureRunning(options?: { waitForPendingRestart?: boolean }): Promise<void> {
+		if (this.shuttingDown || this.gaveUp || this.plugins.size === 0) return;
+		if (this.timeoutProbes.size > 0) {
+			await Promise.all(this.timeoutProbes);
+			return this.ensureRunning(options);
+		}
+		if (this.restartTimer) {
+			if (!options?.waitForPendingRestart) return;
+			await new Promise<void>((resolve) => {
+				this.restartWaiters.add(resolve);
+			});
+			return this.ensureRunning(options);
+		}
+		// If a startup is already in progress, wait for it
+		if (this.startupPromise) {
+			await this.startupPromise;
+			return this.ensureRunning(options);
+		}
+		if (!this.needsRestart) return;
+
+		// Serialize: concurrent callers await the same promise.
+		// Don't clear needsRestart until startup succeeds, so a transient
+		// failure (readiness timeout, spawn error) can be retried by
+		// an invocation after the restart backoff.
+		const configurationVersion = this.configurationVersion;
+		this.startupPromise = this.restart();
+		let restartSucceeded = false;
+		try {
+			await this.startupPromise;
+			this.needsRestart = configurationVersion !== this.configurationVersion;
+			restartSucceeded = true;
+		} catch (error) {
+			console.error("[emdash:workerd] startup failed:", error);
+			if (!this.restartTimer && !this.gaveUp) this.scheduleRestart();
+			throw error;
+		} finally {
+			// Always clear startupPromise so a failed start doesn't block
+			// subsequent retries. needsRestart stays true on failure (set above
+			// only after the await succeeds), enabling automatic retry.
+			this.startupPromise = null;
+		}
+		if (this.needsRestart && restartSucceeded) {
+			if (this.plugins.size === 0) {
+				this.needsRestart = false;
+				await this.stopWorkerd();
+			} else {
+				await this.ensureRunning(options);
+			}
+		}
+	}
+
+	/**
+	 * Set the email send callback for sandboxed plugins.
+	 */
+	setEmailSend(callback: SandboxEmailSendCallback | null): void {
+		this.emailSendCallback = callback;
+	}
+
+	setCommentModerate(callback: SandboxCommentModerateCallback | null): void {
+		this.commentModerateCallback = callback;
+	}
+
+	setContentCreate(callback: SandboxContentCreateCallback | null): void {
+		this.contentCreateCallback = callback;
+	}
+
+	setContentActions(callback: ContentActionCallbacks | null): void {
+		this.contentActionsCallback = callback;
+	}
+
+	setCronReschedule(callback: (() => void) | null): void {
+		this.cronRescheduleCallback = callback;
+	}
+
+	/**
+	 * Load a sandboxed plugin.
+	 *
+	 * Adds the plugin to the configuration and restarts workerd
+	 * to pick up the new nanoservice.
+	 */
+	async load(manifest: PluginManifest, code: string): Promise<SandboxedPluginInstance> {
+		const pluginId = `${manifest.id}:${manifest.version}`;
+
+		// Return cached plugin if already loaded
+		const existing = this.plugins.get(pluginId);
+		if (existing) {
+			return new WorkerdSandboxedPlugin(pluginId, manifest, this.limits, this);
+		}
+
+		const token = this.generatePluginToken(manifest);
+
+		this.plugins.set(pluginId, { manifest, code, port: 0, token, active: true });
+		this.configurationVersion++;
+
+		// Defer workerd start: collect all plugins first, start once.
+		// The runtime loads plugins sequentially, so we batch by deferring
+		// the actual workerd spawn until the first hook/route invocation.
+		this.needsRestart = true;
+		this.gaveUp = false;
+		this.crashCount = 0;
+		this.crashWindowStart = 0;
+		this.scheduleEagerStart();
+
+		return new WorkerdSandboxedPlugin(pluginId, manifest, this.limits, this);
+	}
+
+	setPluginActive(pluginId: string, active: boolean): void {
+		const entry = this.plugins.get(pluginId);
+		if (!entry || entry.active === active) return;
+		entry.active = active;
+		this.backingService?.removePlugin(entry.manifest.id, entry.manifest.version);
+		if (active) {
+			entry.token = this.generatePluginToken(entry.manifest);
+			this.configurationVersion++;
+			this.needsRestart = true;
+			this.gaveUp = false;
+			this.crashCount = 0;
+			this.crashWindowStart = 0;
+			this.scheduleEagerStart();
+		}
+	}
+
+	/**
+	 * Unload a single plugin (called from WorkerdSandboxedPlugin.terminate()).
+	 *
+	 * Removes the plugin from the in-memory map and marks needsRestart so
+	 * the next invocation rebuilds workerd without it. We don't restart
+	 * eagerly here because update/uninstall flows often unload immediately
+	 * before loading the new version, and back-to-back restarts are wasteful.
+	 */
+	unloadPlugin(pluginId: string): void {
+		const entry = this.plugins.get(pluginId);
+		if (!entry) return;
+		this.plugins.delete(pluginId);
+		this.configurationVersion++;
+		this.backingService?.removePlugin(entry.manifest.id, entry.manifest.version);
+		if (this.plugins.size === 0) {
+			void this.stopWorkerd();
+		} else {
+			this.needsRestart = true;
+			this.gaveUp = false;
+			this.crashCount = 0;
+			this.crashWindowStart = 0;
+			this.scheduleEagerStart();
+		}
+	}
+
+	/**
+	 * Schedule eager workerd start with a short debounce.
+	 * Batches rapid load/unload sequences into a single restart.
+	 */
+	private scheduleEagerStart(): void {
+		if (this.eagerStartTimer) clearTimeout(this.eagerStartTimer);
+		this.eagerStartTimer = setTimeout(() => {
+			this.eagerStartTimer = null;
+			this.ensureRunning().catch(() => {});
+		}, 50);
+		if (this.hostDraining) this.eagerStartTimer.unref();
+	}
+
+	/**
+	 * Terminate all loaded plugins and shut down workerd.
+	 */
+	async terminateAll(): Promise<void> {
+		this.shuttingDown = true;
+		if (this.restartTimer) {
+			clearTimeout(this.restartTimer);
+			this.restartTimer = null;
+		}
+		this.resolveRestartWaiters();
+		if (this.eagerStartTimer) {
+			clearTimeout(this.eagerStartTimer);
+			this.eagerStartTimer = null;
+		}
+		this.plugins.clear();
+		this.configurationVersion++;
+		await this.stopWorkerd();
+		await this.startupPromise?.catch(() => {});
+		await this.stopWorkerd();
+		await this.stopBackingServer();
+		if (this.configDir) {
+			await rm(this.configDir, { recursive: true, force: true }).catch(() => {});
+			this.configDir = null;
+		}
+		unregisterSigHandler(this);
+	}
+
+	private allowHostDrain(): void {
+		this.hostDraining = true;
+		this.backingServer?.unref();
+		for (const connection of this.backingConnections) connection.unref();
+		if (this.workerdProcess) unrefWorkerd(this.workerdProcess);
+		this.eagerStartTimer?.unref();
+		this.restartTimer?.unref();
+		for (const timer of this.timeoutWatchdogs) timer.unref();
+	}
+
+	private cleanupExitFiles(): void {
+		for (const path of [this.configDir, this.backingSocketPath]) {
+			if (!path) continue;
+			try {
+				rmSync(path, { recursive: true, force: true });
+			} catch {
+				// Exit handlers cannot await filesystem cleanup or abort other runners' cleanup.
+			}
+		}
+	}
+
+	private resolveRestartWaiters(): void {
+		for (const resolve of this.restartWaiters) resolve();
+		this.restartWaiters.clear();
+	}
+
+	/**
+	 * Schedule a restart with exponential backoff.
+	 * Backoff: 1s, 2s, 4s, cap at 30s.
+	 * Gives up after 5 failures within 60 seconds.
+	 */
+	private scheduleRestart(): void {
+		if (this.shuttingDown || this.plugins.size === 0) return;
+
+		if (this.restartTimer) {
+			clearTimeout(this.restartTimer);
+			this.restartTimer = null;
+		}
+		const now = Date.now();
+
+		// Reset crash window if it's been more than 60 seconds
+		if (now - this.crashWindowStart > 60_000) {
+			this.crashCount = 0;
+			this.crashWindowStart = now;
+		}
+
+		this.crashCount++;
+
+		if (this.crashCount > 5) {
+			this.gaveUp = true;
+			this.resolveRestartWaiters();
+			console.error(
+				"[emdash:workerd] workerd crashed 5 times in 60 seconds, giving up. " +
+					"Sandboxed plugin hooks and routes now fail with SandboxUnavailableError. " +
+					"Restart the server to retry.",
+			);
+			return;
+		}
+
+		// Exponential backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s
+		const delayMs = Math.min(1000 * 2 ** (this.crashCount - 1), 30_000);
+		console.warn(`[emdash:workerd] restarting in ${delayMs}ms (attempt ${this.crashCount}/5)`);
+
+		this.gaveUp = false;
+		this.restartTimer = setTimeout(() => {
+			this.restartTimer = null;
+			// Just mark as needing restart. The next plugin invocation will
+			// drive the actual restart through ensureRunning(), which serializes
+			// concurrent attempts via startupPromise. We don't call ensureRunning()
+			// here because that would race with plugin-invocation-driven calls
+			// (the finally block clears startupPromise so a second concurrent
+			// caller could enter restart() while the first is still running).
+			//
+			// If no plugin invocations happen after a crash, there's nothing
+			// to recover for, so deferring restart until next use is fine.
+			this.needsRestart = true;
+			this.resolveRestartWaiters();
+		}, delayMs);
+		if (this.hostDraining) this.restartTimer.unref();
+	}
+
+	/**
+	 * Generate a per-plugin auth token.
+	 * Encodes pluginId and capabilities for server-side validation.
+	 */
+	private generatePluginToken(manifest: PluginManifest): string {
+		const payload = JSON.stringify({
+			pluginId: manifest.id,
+			version: manifest.version,
+			nonce: randomBytes(16).toString("base64url"),
+			capabilities: manifest.capabilities || [],
+			allowedHosts: manifest.allowedHosts || [],
+			storageCollections: Object.keys(manifest.storage || {}),
+		});
+		const payloadB64 = Buffer.from(payload).toString("base64url");
+		const hmac = createHmac("sha256", this.masterSecret).update(payload).digest("base64url");
+		return `${payloadB64}.${hmac}`;
+	}
+
+	/**
+	 * Validate a plugin auth token and extract its claims.
+	 * Returns null if invalid.
+	 */
+	validateToken(token: string): PluginTokenClaims | null {
+		const parts = token.split(".");
+		if (parts.length !== 2) return null;
+
+		const [payloadB64, hmacB64] = parts;
+		if (!payloadB64 || !hmacB64) return null;
+
+		const payload = Buffer.from(payloadB64, "base64url").toString();
+		const expectedHmac = createHmac("sha256", this.masterSecret)
+			.update(payload)
+			.digest("base64url");
+
+		// Constant-time comparison to prevent timing side channels
+		const a = Buffer.from(hmacB64);
+		const b = Buffer.from(expectedHmac);
+		if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(payload);
+		} catch {
+			return null;
+		}
+		if (!isTokenClaims(parsed)) return null;
+		const plugin = this.plugins.get(`${parsed.pluginId}:${parsed.version}`);
+		if (!plugin?.active || plugin.token !== token) return null;
+		return parsed;
+	}
+
+	/**
+	 * Start or restart workerd with current plugin configuration.
+	 */
+	private async restart(): Promise<void> {
+		const plugins = new Map<string, LoadedPlugin>();
+		for (const [pluginId, plugin] of this.plugins) {
+			plugins.set(pluginId, { ...plugin });
+		}
+		await this.stopWorkerd();
+		if (this.shuttingDown) return;
+
+		// Ensure backing server is running
+		if (!this.backingServer) {
+			await this.startBackingServer();
+		}
+
+		// Create temp directory for config files
+		if (!this.configDir) {
+			this.configDir = join(
+				tmpdir(),
+				`emdash-workerd-${process.pid}-${randomBytes(8).toString("hex")}`,
+			);
+			await mkdir(this.configDir, { recursive: true });
+		}
+
+		// Write the shared emdash shim once -- every plugin worker references
+		// it as a module so `import { definePlugin } from "emdash"` resolves.
+		await writeFile(join(this.configDir, EMDASH_SHIM_FILE), EMDASH_SHIM);
+
+		// Write plugin code files to disk (workerd needs file paths)
+		for (const [pluginId, plugin] of plugins) {
+			const safeId = pluginId.replace(SAFE_ID_RE, "_");
+			const wrapperCode = generatePluginWrapper(plugin.manifest, {
+				site: this.siteInfo,
+				backingServiceUrl: this.backingServiceUrl,
+				authToken: plugin.token,
+				invokeToken: this.invokeToken,
+			});
+			await writeFile(join(this.configDir, `${safeId}-wrapper.js`), wrapperCode);
+			await writeFile(join(this.configDir, `${safeId}-plugin.js`), plugin.code);
+		}
+
+		// Generate capnp config. Note: cpuMs/memoryMb/subrequests from
+		// this.limits are NOT passed here because standalone workerd doesn't
+		// support per-worker enforcement of those limits (Cloudflare-only).
+		// Wall-time enforcement restarts workerd for unresponsive listeners or
+		// invocations that remain unsettled beyond the grace period.
+		const capnpConfig = generateCapnpConfig({
+			plugins,
+			backingServiceAddress: this.backingServiceAddress,
+			configDir: this.configDir,
+			emdashShimFile: EMDASH_SHIM_FILE,
+		});
+
+		const configPath = join(this.configDir, "workerd.capnp");
+		await writeFile(configPath, capnpConfig);
+		if (this.shuttingDown) return;
+
+		// Spawn workerd using resolved binary (not npx). Capture into a local
+		// `proc` immediately so the exit handler closure can gate on identity
+		// and ignore late exits from a previous workerd if another restart()
+		// has already reassigned this.workerdProcess.
+		const workerdBin = this.resolveWorkerdBinary();
+		if (this.shuttingDown) return;
+		const proc = spawnWorkerd(
+			workerdBin,
+			["serve", configPath, "--control-fd=3"],
+			minimalWorkerdEnv(),
+		);
+		this.workerdProcess = proc;
+		if (this.hostDraining) unrefWorkerd(proc);
+
+		this.epoch++;
+
+		// Drain stdout/stderr to prevent pipe buffer deadlock
+		proc.stdout?.on("data", (chunk: Buffer) => {
+			process.stdout.write(`[emdash:workerd] ${chunk.toString()}`);
+		});
+		proc.stderr?.on("data", (chunk: Buffer) => {
+			process.stderr.write(`[emdash:workerd] ${chunk.toString()}`);
+		});
+
+		// Handle workerd exit with auto-restart on crash. Gate on identity
+		// so a late exit from a prior workerd cannot null out a newer one.
+		// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- runner satisfies ExitHandlerHost structurally; cast bypasses TS's nominal handling of private members
+		proc.on("exit", makeWorkerdExitHandler(this as unknown as ExitHandlerHost, proc));
+
+		const sockets = new Map(Array.from(plugins, ([id, plugin]) => [pluginSocketName(id), plugin]));
+		try {
+			await waitForWorkerdReady(proc, sockets, () =>
+				probeAllReady(plugins.values(), this.invokeToken),
+			);
+		} catch (error) {
+			// A failed spawn emits error/close but never exit.
+			if (proc.pid === undefined && this.workerdProcess === proc) this.workerdProcess = null;
+			await this.stopWorkerd();
+			throw error;
+		}
+		for (const [id, plugin] of plugins) {
+			const current = this.plugins.get(id);
+			if (current?.token === plugin.token) current.port = plugin.port;
+		}
+		this.healthy = true;
+	}
+
+	/** Resolve the current listener after ensureRunning(), including after restarts. */
+	getPluginPort(pluginId: string): number {
+		const port = this.plugins.get(pluginId)?.port;
+		if (!port) throw new SandboxUnavailableError(pluginId, "plugin listener is not running");
+		return port;
+	}
+
+	/**
+	 * Stop the workerd child process.
+	 *
+	 * Marks the stop as intentional so the exit handler in restart() does
+	 * not interpret it as a crash and trigger scheduleRestart(). Without
+	 * this, every intentional reload (plugin install/uninstall) would
+	 * cascade into a phantom crash-restart cycle.
+	 */
+	private stopWorkerd(force = false): Promise<void> {
+		for (const timer of this.timeoutWatchdogs) clearTimeout(timer);
+		this.timeoutWatchdogs.clear();
+		if (this.stoppingPromise) return this.stoppingPromise;
+		if (!this.workerdProcess) return Promise.resolve();
+		this.healthy = false;
+		this.intentionalStop = true;
+
+		const proc = this.workerdProcess;
+		this.workerdProcess = null;
+
+		// A timeout must bypass SIGTERM: a spinning isolate may never handle it.
+		const completion =
+			proc.exitCode === null && proc.signalCode == null
+				? waitForProcessExit(proc, 5000, { force })
+				: Promise.resolve();
+		this.stoppingPromise = completion;
+		return completion.finally(() => {
+			this.intentionalStop = false;
+			if (this.stoppingPromise === completion) this.stoppingPromise = null;
+		});
+	}
+
+	/**
+	 * Start the backing service HTTP server.
+	 */
+	private async startBackingServer(): Promise<void> {
+		this.backingService = createBackingServiceHandler(this);
+
+		return new Promise((resolve, reject) => {
+			this.backingServer = createServer(this.backingService!.handler);
+			this.backingServer.on("connection", (connection) => {
+				this.backingConnections.add(connection);
+				connection.once("close", () => this.backingConnections.delete(connection));
+				if (this.hostDraining) connection.unref();
+			});
+
+			if (USE_UNIX_SOCKET) {
+				const socketPath = join(
+					tmpdir(),
+					`emdash-sandbox-${process.pid}-${randomBytes(8).toString("hex")}.sock`,
+				);
+				this.backingSocketPath = socketPath;
+				this.backingServer.listen(socketPath, () => {
+					if (this.hostDraining) this.backingServer?.unref();
+					resolve();
+				});
+			} else {
+				// Windows fallback: TCP on localhost
+				this.backingServer.listen(0, "127.0.0.1", () => {
+					if (this.hostDraining) this.backingServer?.unref();
+					const addr = this.backingServer!.address();
+					if (addr && typeof addr === "object") {
+						this.backingPort = addr.port;
+					}
+					resolve();
+				});
+			}
+
+			this.backingServer.on("error", reject);
+		});
+	}
+
+	/** Address string for capnp config */
+	get backingServiceAddress(): string {
+		if (USE_UNIX_SOCKET && this.backingSocketPath) {
+			return `unix:${this.backingSocketPath}`;
+		}
+		return `127.0.0.1:${this.backingPort}`;
+	}
+
+	/** URL for wrapper code to use as BACKING_URL.
+	 * With globalOutbound the hostname is just a label — all outbound
+	 * fetch() calls route through the external service regardless. */
+	get backingServiceUrl(): string {
+		if (USE_UNIX_SOCKET && this.backingSocketPath) {
+			return "http://emdash-backing";
+		}
+		return `http://127.0.0.1:${this.backingPort}`;
+	}
+
+	/**
+	 * Stop the backing service HTTP server.
+	 */
+	private async stopBackingServer(): Promise<void> {
+		if (!this.backingServer) return;
+		const socketPath = this.backingSocketPath;
+		return new Promise<void>((resolve) => {
+			this.backingServer!.close(() => {
+				if (socketPath) {
+					unlink(socketPath).catch(() => {});
+					this.backingSocketPath = null;
+				}
+				resolve();
+			});
+			this.backingServer = null;
+		});
+	}
+
+	/** Get the database for backing service operations */
+	get db() {
+		return this.options.db;
+	}
+
+	/** Get the pre-content-write activation guard */
+	get beforeContentWrite() {
+		return this.options.beforeContentWrite;
+	}
+
+	get contentCreate() {
+		return this.contentCreateCallback;
+	}
+
+	get taxonomyWrite() {
+		return this.options.taxonomyWrite;
+	}
+
+	get contentActions() {
+		return this.contentActionsCallback;
+	}
+
+	/** Get the email send callback */
+	get emailSend() {
+		return this.emailSendCallback;
+	}
+
+	get commentModerate() {
+		return this.commentModerateCallback;
+	}
+
+	get cronReschedule() {
+		return this.cronRescheduleCallback;
+	}
+
+	get now() {
+		return this.options.now;
+	}
+
+	get httpFetch() {
+		return this.options.httpFetch;
+	}
+
+	/** Get the media storage adapter */
+	get mediaStorage() {
+		return this.options.mediaStorage ?? null;
+	}
+
+	/** Get the per-startup invoke token (sent on hook/route requests to plugins) */
+	get invokeAuthToken() {
+		return this.invokeToken;
+	}
+
+	/**
+	 * Look up the storage config (with indexes) for a specific plugin version.
+	 * The plugins map is keyed by `${id}:${version}`. Looking up by id alone
+	 * could return a stale version's storage schema after a plugin upgrade,
+	 * so we require both id and version.
+	 */
+	getPluginStorageConfig(pluginId: string, version: string): PluginManifest["storage"] | undefined {
+		const plugin = this.plugins.get(`${pluginId}:${version}`);
+		if (plugin) {
+			return plugin.manifest.storage;
+		}
+		return undefined;
+	}
+
+	getPluginSettingsSchema(
+		pluginId: string,
+		version: string,
+	): PluginManifest["admin"]["settingsSchema"] | undefined {
+		return this.plugins.get(`${pluginId}:${version}`)?.manifest.admin?.settingsSchema;
+	}
+
+	getSiteInfo() {
+		return this.siteInfo;
+	}
+
+	private async stopTimedOutProcess(epoch: number, proc: ChildProcess): Promise<void> {
+		if (epoch !== this.epoch || this.workerdProcess !== proc || this.shuttingDown) return;
+		this.needsRestart = true;
+		await this.stopWorkerd(true);
+	}
+
+	/** Probe responsiveness while allowing one more wall-time interval to settle. */
+	async recoverFromTimeout(
+		pluginId: string,
+		epoch: number,
+		invocation: Promise<unknown>,
+	): Promise<void> {
+		const proc = this.workerdProcess;
+		if (epoch !== this.epoch || !proc || this.shuttingDown) return;
+		const watchdog = setTimeout(() => {
+			this.timeoutWatchdogs.delete(watchdog);
+			void this.stopTimedOutProcess(epoch, proc)
+				.then(() => this.ensureRunning())
+				.catch((error: unknown) => {
+					console.error("[emdash:workerd] timeout recovery failed:", error);
+				});
+		}, this.limits.wallTimeMs);
+		this.timeoutWatchdogs.add(watchdog);
+		if (this.hostDraining) watchdog.unref();
+		const clearWatchdog = () => {
+			clearTimeout(watchdog);
+			this.timeoutWatchdogs.delete(watchdog);
+		};
+		void invocation.then(clearWatchdog, clearWatchdog);
+
+		const port = this.getPluginPort(pluginId);
+		const probe = (async () => {
+			if (await probeAllReady([{ port }], this.invokeToken, 500)) return;
+			await this.stopTimedOutProcess(epoch, proc);
+		})();
+		this.timeoutProbes.add(probe);
+		try {
+			await probe;
+		} finally {
+			this.timeoutProbes.delete(probe);
+		}
+		await this.ensureRunning();
+	}
+
+	/** Get the current epoch (incremented on each workerd restart) */
+	get currentEpoch() {
+		return this.epoch;
+	}
+}
+
+/**
+ * A plugin running in a workerd V8 isolate.
+ */
+class WorkerdSandboxedPlugin implements SandboxedPluginInstance {
+	readonly id: string;
+	private manifest: PluginManifest;
+	private limits: ResolvedLimits;
+	private runner: WorkerdSandboxRunner;
+	constructor(
+		id: string,
+		manifest: PluginManifest,
+		limits: ResolvedLimits,
+		runner: WorkerdSandboxRunner,
+	) {
+		this.id = id;
+		this.manifest = manifest;
+		this.limits = limits;
+		this.runner = runner;
+	}
+
+	/**
+	 * Ensure workerd is running before invoking a hook or route.
+	 * On first call, this triggers deferred workerd startup (batching
+	 * all plugins registered via load() into a single workerd start).
+	 */
+	private async ensureReady(): Promise<void> {
+		try {
+			await this.runner.ensureRunning();
+		} catch {
+			throw new SandboxUnavailableError(this.id, "workerd failed to start");
+		}
+		if (!this.runner.isHealthy()) {
+			throw new SandboxUnavailableError(this.id, this.runner.unavailableReason());
+		}
+	}
+
+	/**
+	 * Invoke a hook in the sandboxed plugin via HTTP.
+	 */
+	async invokeHook(hookName: string, event: unknown): Promise<unknown> {
+		await this.ensureReady();
+		return this.withWallTimeLimit(`hook:${hookName}`, async (invocationId) => {
+			const res = await fetch(
+				`http://127.0.0.1:${this.runner.getPluginPort(this.id)}/hook/${hookName}`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${this.runner.invokeAuthToken}`,
+					},
+					body: JSON.stringify({ event, invocationId }),
+				},
+			).catch((error: unknown) => {
+				throw new SandboxUnavailableError(
+					this.id,
+					error instanceof Error ? error.message : "hook transport failed",
+				);
+			});
+			if (!res.ok) {
+				const text = await res.text();
+				throw new Error(`Plugin ${this.id} hook ${hookName} failed: ${text}`);
+			}
+			const hookResult: unknown = await res.json();
+			if (!isRecord(hookResult)) {
+				throw new Error(`Plugin ${this.id} hook ${hookName} returned a non-object response`);
+			}
+			return hookResult.value;
+		});
+	}
+
+	/**
+	 * Invoke an API route in the sandboxed plugin via HTTP.
+	 */
+	async invokeRoute(
+		routeName: string,
+		input: unknown,
+		request: SerializedRequest,
+		options?: SandboxInvocationOptions,
+	): Promise<unknown> {
+		await this.ensureReady();
+		return this.withWallTimeLimit(
+			`route:${routeName}`,
+			async (invocationId) => {
+				const res = await fetch(
+					`http://127.0.0.1:${this.runner.getPluginPort(this.id)}/route/${routeName}`,
+					{
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${this.runner.invokeAuthToken}`,
+						},
+						body: stringifyRouteTransport({ input, request, invocationId }),
+					},
+				);
+				if (!res.ok) {
+					const text = await res.text();
+					let envelope = null;
+					try {
+						envelope = getSandboxRouteErrorEnvelope(JSON.parse(text));
+					} catch {
+						// The generic route error below preserves non-protocol failures.
+					}
+					if (envelope) {
+						throw createSandboxRouteError(envelope.error.code);
+					}
+					throw new Error(`Plugin ${this.id} route ${routeName} failed: ${text}`);
+				}
+				return parseRouteTransport(await res.text());
+			},
+			options,
+		);
+	}
+
+	/**
+	 * Terminate the sandboxed plugin.
+	 *
+	 * Removes this plugin from the runner's plugins map and marks
+	 * needsRestart so the next load/invocation rebuilds workerd without
+	 * its listener. Without this, marketplace update/uninstall would
+	 * leak old plugin entries (and their ports) until full server restart.
+	 */
+	async terminate(): Promise<void> {
+		this.runner.unloadPlugin(this.id);
+	}
+
+	setActive(active: boolean): void {
+		this.runner.setPluginActive(this.id, active);
+	}
+
+	/**
+	 * Enforce wall-time limit on an operation.
+	 */
+	private async withWallTimeLimit<T>(
+		operation: string,
+		fn: (invocationId: string) => Promise<T>,
+		options?: SandboxInvocationOptions,
+	): Promise<T> {
+		const wallTimeMs = this.limits.wallTimeMs;
+		const epoch = this.runner.currentEpoch;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const invocationId = crypto.randomUUID();
+		this.runner.contentActions?.begin?.(
+			this.manifest.id,
+			invocationId,
+			options?.invalidateContentCache,
+		);
+
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => {
+				void this.runner.contentActions?.flush(this.manifest.id, invocationId, false);
+				reject(
+					new Error(
+						`Plugin ${this.manifest.id} exceeded wall-time limit of ${wallTimeMs}ms during ${operation}`,
+					),
+				);
+				void this.runner.recoverFromTimeout(this.id, epoch, invocation).catch((error: unknown) => {
+					console.error("[emdash:workerd] timeout recovery failed:", error);
+				});
+			}, wallTimeMs);
+		});
+
+		const invocation = fn(invocationId);
+		void invocation.then(
+			() => this.runner.contentActions?.flush(this.manifest.id, invocationId, true),
+			() => this.runner.contentActions?.flush(this.manifest.id, invocationId, true),
+		);
+		try {
+			return await Promise.race([invocation, timeout]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+}
+
+/**
+ * Factory function for creating the workerd sandbox runner.
+ *
+ * Selects MiniflareDevRunner only when explicitly in development mode
+ * (NODE_ENV === "development"). Any other value — including unset for
+ * `node server.js` and `"production"` from `astro preview` — uses the
+ * production WorkerdSandboxRunner.
+ *
+ * The dev runner skips production hardening (wall-time wrapper, child
+ * process supervision, crash/restart with backoff), so falling back to
+ * it silently in production would be a security regression.
+ *
+ * Operators who want the dev runner explicitly should set EMDASH_SANDBOX_DEV=1
+ * or NODE_ENV=development.
+ */
+export const createSandboxRunner: SandboxRunnerFactory = (options) => {
+	const isDev = process.env.EMDASH_SANDBOX_DEV === "1" || process.env.NODE_ENV === "development";
+
+	if (isDev) {
+		// MiniflareDevRunner is statically imported (no miniflare dependency
+		// at this point — dev-runner only imports miniflare dynamically inside
+		// rebuild()). isAvailable() does the actual miniflare resolution check.
+		const devRunner = new MiniflareDevRunner(options);
+		if (devRunner.isAvailable()) {
+			return devRunner;
+		}
+	}
+
+	return new WorkerdSandboxRunner(options);
+};

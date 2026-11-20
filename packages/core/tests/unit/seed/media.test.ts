@@ -1,0 +1,1237 @@
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { Kysely } from "kysely";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ContentRepository } from "../../../src/database/repositories/content.js";
+import type { Database } from "../../../src/database/types.js";
+import { setDefaultDnsResolver } from "../../../src/import/ssrf.js";
+import { SchemaRegistry } from "../../../src/schema/registry.js";
+import { applySeed, applySeedWithinBudget } from "../../../src/seed/apply.js";
+import type { SeedFile } from "../../../src/seed/types.js";
+import type { Storage, UploadOptions } from "../../../src/storage/types.js";
+import { setupTestDatabase, teardownTestDatabase } from "../../utils/test-db.js";
+
+// Regex patterns for file validation
+const PNG_EXTENSION_REGEX = /\.png$/;
+
+// Mock fetch globally
+const mockFetch = vi.fn();
+vi.stubGlobal("fetch", mockFetch);
+
+// Bypass DoH so the fetch mock only sees the calls these tests model.
+let previousResolver: ReturnType<typeof setDefaultDnsResolver> | undefined;
+beforeAll(() => {
+	previousResolver = setDefaultDnsResolver(async () => ["93.184.216.34"]);
+});
+afterAll(() => {
+	setDefaultDnsResolver(previousResolver ?? null);
+});
+
+// Create a mock storage that tracks uploads
+function createMockStorage(): Storage & { uploads: UploadOptions[] } {
+	const uploads: UploadOptions[] = [];
+
+	return {
+		uploads,
+		async upload(options: UploadOptions): Promise<void> {
+			uploads.push(options);
+		},
+		async download(key: string): Promise<{ body: Uint8Array; contentType: string }> {
+			const upload = uploads.find((u) => u.key === key);
+			if (!upload) throw new Error(`Not found: ${key}`);
+			return { body: upload.body, contentType: upload.contentType };
+		},
+		async delete(key: string): Promise<void> {
+			const index = uploads.findIndex((u) => u.key === key);
+			if (index >= 0) uploads.splice(index, 1);
+		},
+		async exists(key: string): Promise<boolean> {
+			return uploads.some((u) => u.key === key);
+		},
+		getPublicUrl(key: string): string {
+			return `https://storage.example.com/${key}`;
+		},
+	};
+}
+
+// Create a mock response for fetch
+function createMockResponse(
+	body: Uint8Array,
+	contentType: string,
+	ok = true,
+	status = 200,
+): Response {
+	return {
+		ok,
+		status,
+		headers: new Headers({ "content-type": contentType }),
+		arrayBuffer: async () => body.buffer,
+	} as Response;
+}
+
+// Simple 1x1 PNG for testing
+const MOCK_PNG = new Uint8Array([
+	0x89,
+	0x50,
+	0x4e,
+	0x47,
+	0x0d,
+	0x0a,
+	0x1a,
+	0x0a, // PNG signature
+	0x00,
+	0x00,
+	0x00,
+	0x0d, // IHDR length
+	0x49,
+	0x48,
+	0x44,
+	0x52, // IHDR chunk type
+	0x00,
+	0x00,
+	0x00,
+	0x01, // width: 1
+	0x00,
+	0x00,
+	0x00,
+	0x01, // height: 1
+	0x08,
+	0x02,
+	0x00,
+	0x00,
+	0x00, // bit depth, color type, etc.
+	0x90,
+	0x77,
+	0x53,
+	0xde, // CRC
+]);
+
+// Simple 1x1 JPEG for testing
+const MOCK_JPEG = new Uint8Array([
+	0xff,
+	0xd8,
+	0xff,
+	0xe0, // SOI + APP0
+	0x00,
+	0x10, // APP0 length
+	0x4a,
+	0x46,
+	0x49,
+	0x46,
+	0x00, // JFIF identifier
+	0x01,
+	0x01, // version
+	0x00, // aspect ratio units
+	0x00,
+	0x01, // X density (1)
+	0x00,
+	0x01, // Y density (1)
+	0x00,
+	0x00, // thumbnail dimensions
+	0xff,
+	0xd9, // EOI
+]);
+
+describe("$media seed resolution", () => {
+	let db: Kysely<Database>;
+	let storage: Storage & { uploads: UploadOptions[] };
+	let testRoot: string;
+	let mediaBasePath: string;
+	let outsidePath: string;
+
+	beforeEach(async () => {
+		db = await setupTestDatabase();
+		testRoot = await mkdtemp(join(tmpdir(), "emdash-seed-media-"));
+		mediaBasePath = join(testRoot, "base");
+		await mkdir(join(mediaBasePath, "assets"), { recursive: true });
+		outsidePath = join(testRoot, "outside.png");
+		await writeFile(join(mediaBasePath, "assets", "photo.png"), MOCK_PNG);
+		await writeFile(join(mediaBasePath, "assets", "custom.jpg"), MOCK_JPEG);
+		await writeFile(outsidePath, MOCK_PNG);
+		storage = createMockStorage();
+		mockFetch.mockReset();
+
+		// Set up a collection with an image field
+		const registry = new SchemaRegistry(db);
+		await registry.createCollection({ slug: "posts", label: "Posts" });
+		await registry.createField("posts", {
+			slug: "title",
+			label: "Title",
+			type: "string",
+		});
+		await registry.createField("posts", {
+			slug: "featured_image",
+			label: "Featured Image",
+			type: "image",
+		});
+	});
+
+	afterEach(async () => {
+		await teardownTestDatabase(db);
+		await rm(testRoot, { recursive: true, force: true });
+		vi.restoreAllMocks();
+	});
+
+	it("should resolve $media references by downloading and uploading", async () => {
+		mockFetch.mockResolvedValueOnce(createMockResponse(MOCK_PNG, "image/png"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello World",
+							featured_image: {
+								$media: {
+									url: "https://example.com/image.png",
+									alt: "Test image",
+									filename: "my-image.png",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		const result = await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "https://mysite.com",
+		});
+
+		expect(result.media.created).toBe(1);
+		expect(result.content.created).toBe(1);
+		expect(storage.uploads).toHaveLength(1);
+
+		// Check the upload
+		expect(storage.uploads[0].contentType).toBe("image/png");
+		expect(storage.uploads[0].key).toMatch(PNG_EXTENSION_REGEX);
+
+		// Check the content has resolved ImageValue
+		const contentRepo = new ContentRepository(db);
+		const entry = await contentRepo.findBySlug("posts", "hello");
+		const media = await db.selectFrom("media").select("id").executeTakeFirstOrThrow();
+
+		// ImageValue stores id (URL is built at runtime by EmDashImage)
+		expect(entry?.data.featured_image).toMatchObject({
+			id: media.id,
+			alt: "Test image",
+		});
+	});
+
+	it("should cache repeated $media URLs", async () => {
+		mockFetch.mockResolvedValueOnce(createMockResponse(MOCK_JPEG, "image/jpeg"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "first",
+						data: {
+							title: "First",
+							featured_image: {
+								$media: {
+									url: "https://example.com/shared.jpg",
+									alt: "Shared image",
+									caption: "First use",
+								},
+							},
+						},
+					},
+					{
+						id: "post-2",
+						slug: "second",
+						data: {
+							title: "Second",
+							featured_image: {
+								$media: {
+									url: "https://example.com/shared.jpg",
+									alt: "Different alt text",
+									caption: "",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		const result = await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "",
+		});
+
+		// Only downloaded/uploaded once
+		expect(result.media.created).toBe(1);
+		expect(result.media.skipped).toBe(1);
+		expect(mockFetch).toHaveBeenCalledTimes(1);
+		expect(storage.uploads).toHaveLength(1);
+
+		// Both entries should have the same src but different alt
+		const contentRepo = new ContentRepository(db);
+		const first = await contentRepo.findBySlug("posts", "first");
+		const second = await contentRepo.findBySlug("posts", "second");
+
+		expect(first?.data.featured_image.src).toBe(second?.data.featured_image.src);
+		expect(first?.data.featured_image.alt).toBe("Shared image");
+		expect(second?.data.featured_image.alt).toBe("Different alt text");
+		expect(first?.data.featured_image.caption).toBe("First use");
+		expect(second?.data.featured_image.caption).toBe("");
+	});
+
+	it("should reuse content-hash matches across URLs with per-use captions", async () => {
+		mockFetch
+			.mockResolvedValueOnce(createMockResponse(MOCK_JPEG, "image/jpeg"))
+			.mockResolvedValueOnce(createMockResponse(MOCK_JPEG, "image/jpeg"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hash-first",
+						data: {
+							title: "First",
+							featured_image: {
+								$media: {
+									url: "https://example.com/first.jpg",
+									caption: "First credit",
+									libraryCaption: "Library default",
+								},
+							},
+						},
+					},
+					{
+						id: "post-2",
+						slug: "hash-second",
+						data: {
+							title: "Second",
+							featured_image: {
+								$media: { url: "https://example.com/second.jpg", caption: "" },
+							},
+						},
+					},
+					{
+						id: "post-3",
+						slug: "hash-third",
+						data: {
+							title: "Third",
+							featured_image: { $media: { url: "https://example.com/second.jpg" } },
+						},
+					},
+				],
+			},
+		};
+
+		const result = await applySeed(db, seed, { includeContent: true, storage, baseUrl: "" });
+
+		expect(result.media.created).toBe(1);
+		expect(result.media.skipped).toBe(2);
+		expect(mockFetch).toHaveBeenCalledTimes(2);
+		expect(storage.uploads).toHaveLength(1);
+
+		const contentRepo = new ContentRepository(db);
+		const first = await contentRepo.findBySlug("posts", "hash-first");
+		const second = await contentRepo.findBySlug("posts", "hash-second");
+		expect(first?.data.featured_image.caption).toBe("First credit");
+		expect(second?.data.featured_image.caption).toBe("");
+		const third = await contentRepo.findBySlug("posts", "hash-third");
+		expect(third?.data.featured_image.caption).toBe("Library default");
+		const media = await db.selectFrom("media").select("caption").executeTakeFirstOrThrow();
+		expect(media.caption).toBe("Library default");
+		expect(first?.data.featured_image.id).toBe(second?.data.featured_image.id);
+	});
+
+	it("should preserve captions for external media references", async () => {
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "external-first",
+						data: {
+							title: "First",
+							featured_image: {
+								$media: { url: "https://example.com/external.jpg", caption: "External credit" },
+							},
+						},
+					},
+					{
+						id: "post-2",
+						slug: "external-empty",
+						data: {
+							title: "Second",
+							featured_image: {
+								$media: { url: "https://example.com/external.jpg", caption: "" },
+							},
+						},
+					},
+					{
+						id: "post-3",
+						slug: "external-unspecified",
+						data: {
+							title: "Third",
+							featured_image: { $media: { url: "https://example.com/external.jpg" } },
+						},
+					},
+				],
+			},
+		};
+
+		await applySeed(db, seed, { includeContent: true, skipMediaDownload: true });
+
+		const contentRepo = new ContentRepository(db);
+		const first = await contentRepo.findBySlug("posts", "external-first");
+		const second = await contentRepo.findBySlug("posts", "external-empty");
+		expect(first?.data.featured_image).toMatchObject({
+			provider: "external",
+			caption: "External credit",
+		});
+		expect(second?.data.featured_image).toMatchObject({ provider: "external", caption: "" });
+		const third = await contentRepo.findBySlug("posts", "external-unspecified");
+		expect(third?.data.featured_image.caption).toBeUndefined();
+	});
+
+	it("preserves explicit empty and null library captions", async () => {
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-empty-default",
+						slug: "empty-default",
+						data: {
+							title: "Empty",
+							featured_image: {
+								$media: {
+									url: "https://example.com/empty-default.jpg",
+									libraryCaption: "",
+								},
+							},
+						},
+					},
+					{
+						id: "post-null-default",
+						slug: "null-default",
+						data: {
+							title: "Null",
+							featured_image: {
+								$media: {
+									url: "https://example.com/null-default.jpg",
+									libraryCaption: null,
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		await applySeed(db, seed, { includeContent: true, skipMediaDownload: true });
+
+		const contentRepo = new ContentRepository(db);
+		expect(
+			(await contentRepo.findBySlug("posts", "empty-default"))?.data.featured_image.caption,
+		).toBe("");
+		expect(
+			(await contentRepo.findBySlug("posts", "null-default"))?.data.featured_image.caption,
+		).toBeUndefined();
+	});
+
+	it("should skip $media when storage is not configured", async () => {
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							featured_image: {
+								$media: {
+									url: "https://example.com/image.png",
+									alt: "Test",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		// No storage provided
+		const result = await applySeed(db, seed, { includeContent: true });
+
+		expect(result.media.skipped).toBe(1);
+		expect(result.media.created).toBe(0);
+		expect(mockFetch).not.toHaveBeenCalled();
+
+		// Image field should be null/undefined (not resolved)
+		const contentRepo = new ContentRepository(db);
+		const entry = await contentRepo.findBySlug("posts", "hello");
+		expect(entry?.data.featured_image).toBeFalsy();
+	});
+
+	it("should handle failed downloads gracefully", async () => {
+		mockFetch.mockResolvedValueOnce(createMockResponse(new Uint8Array(), "", false, 404));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							featured_image: {
+								$media: {
+									url: "https://example.com/missing.png",
+									alt: "Missing",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		const result = await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "",
+		});
+
+		expect(result.media.skipped).toBe(1);
+		expect(result.content.created).toBe(1);
+
+		// Image field should be null/undefined (not resolved)
+		const contentRepo = new ContentRepository(db);
+		const entry = await contentRepo.findBySlug("posts", "hello");
+		expect(entry?.data.featured_image).toBeFalsy();
+	});
+
+	it("should handle fetch errors gracefully", async () => {
+		mockFetch.mockRejectedValueOnce(new Error("Network error"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							featured_image: {
+								$media: {
+									url: "https://example.com/error.png",
+									alt: "Error",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		const result = await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "",
+		});
+
+		expect(result.media.skipped).toBe(1);
+		expect(result.content.created).toBe(1);
+	});
+
+	it("should generate filename from URL when not specified", async () => {
+		mockFetch.mockResolvedValueOnce(createMockResponse(MOCK_PNG, "image/png"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							featured_image: {
+								$media: {
+									url: "https://example.com/path/to/beautiful-sunset.png?size=large",
+									alt: "Sunset",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "",
+		});
+
+		// Check media record in database
+		const media = await db.selectFrom("media").selectAll().executeTakeFirst();
+
+		expect(media?.filename).toBe("beautiful-sunset.png");
+	});
+
+	it("should use specified filename", async () => {
+		mockFetch.mockResolvedValueOnce(createMockResponse(MOCK_PNG, "image/png"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							featured_image: {
+								$media: {
+									url: "https://example.com/random-id-12345.png",
+									alt: "Custom",
+									filename: "my-custom-name.png",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "",
+		});
+
+		const media = await db.selectFrom("media").selectAll().executeTakeFirst();
+
+		expect(media?.filename).toBe("my-custom-name.png");
+	});
+
+	it("should create media record with correct metadata", async () => {
+		mockFetch.mockResolvedValueOnce(createMockResponse(MOCK_PNG, "image/png"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							featured_image: {
+								$media: {
+									url: "https://example.com/test.png",
+									alt: "Test alt text",
+									caption: "Test caption",
+									filename: "test-image.png",
+								},
+							},
+						},
+					},
+				],
+			},
+		};
+
+		await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "",
+		});
+
+		const media = await db.selectFrom("media").selectAll().executeTakeFirst();
+
+		expect(media).toMatchObject({
+			filename: "test-image.png",
+			mime_type: "image/png",
+			alt: "Test alt text",
+			caption: "Test caption",
+			status: "ready",
+		});
+		expect(media?.storage_key).toMatch(PNG_EXTENSION_REGEX);
+	});
+
+	it("should resolve nested $media in arrays", async () => {
+		// Set up a collection with a json field for gallery
+		const registry = new SchemaRegistry(db);
+		await registry.createField("posts", {
+			slug: "gallery",
+			label: "Gallery",
+			type: "json",
+		});
+
+		mockFetch
+			.mockResolvedValueOnce(createMockResponse(MOCK_PNG, "image/png"))
+			.mockResolvedValueOnce(createMockResponse(MOCK_JPEG, "image/jpeg"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							gallery: [
+								{
+									$media: {
+										url: "https://example.com/one.png",
+										alt: "Image one",
+									},
+								},
+								{
+									$media: {
+										url: "https://example.com/two.jpg",
+										alt: "Image two",
+									},
+								},
+							],
+						},
+					},
+				],
+			},
+		};
+
+		const result = await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			baseUrl: "",
+		});
+
+		expect(result.media.created).toBe(2);
+
+		const contentRepo = new ContentRepository(db);
+		const entry = await contentRepo.findBySlug("posts", "hello");
+
+		expect(entry?.data.gallery).toHaveLength(2);
+		// ImageValue stores id (URL is built at runtime by EmDashImage)
+		const gallery = entry?.data.gallery as unknown[] | undefined;
+		expect(gallery?.[0]).toMatchObject({
+			id: expect.any(String),
+			alt: "Image one",
+		});
+		expect(gallery?.[1]).toMatchObject({
+			id: expect.any(String),
+			alt: "Image two",
+		});
+	});
+
+	it("should resolve $media in a gallery block to a media reference", async () => {
+		const registry = new SchemaRegistry(db);
+		await registry.createField("posts", {
+			slug: "body",
+			label: "Body",
+			type: "portableText",
+		});
+
+		mockFetch.mockResolvedValueOnce(createMockResponse(MOCK_JPEG, "image/jpeg"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							body: [
+								{
+									_type: "gallery",
+									_key: "gal1",
+									columns: 3,
+									images: [
+										{
+											_type: "image",
+											_key: "img1",
+											asset: { $media: { url: "https://example.com/photo.jpg", alt: "A photo" } },
+										},
+									],
+								},
+							],
+						},
+					},
+				],
+			},
+		};
+
+		await applySeed(db, seed, { includeContent: true, storage, baseUrl: "" });
+
+		const contentRepo = new ContentRepository(db);
+		const entry = await contentRepo.findBySlug("posts", "hello");
+		const media = await db
+			.selectFrom("media")
+			.select(["id", "storage_key"])
+			.executeTakeFirstOrThrow();
+
+		expect(entry?.data.body).toEqual([
+			{
+				_type: "gallery",
+				_key: "gal1",
+				columns: 3,
+				images: [
+					{
+						_type: "image",
+						_key: "img1",
+						asset: {
+							_type: "reference",
+							_ref: media.id,
+							url: `/_emdash/api/media/file/${media.storage_key}`,
+							provider: "local",
+						},
+						alt: "A photo",
+					},
+				],
+			},
+		]);
+	});
+
+	it("should resolve $media in an image block to a media reference", async () => {
+		const registry = new SchemaRegistry(db);
+		await registry.createField("posts", {
+			slug: "body",
+			label: "Body",
+			type: "portableText",
+		});
+
+		mockFetch.mockResolvedValueOnce(createMockResponse(MOCK_PNG, "image/png"));
+
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "post-1",
+						slug: "hello",
+						data: {
+							title: "Hello",
+							body: [
+								{
+									_type: "image",
+									_key: "img1",
+									asset: { $media: { url: "https://example.com/photo.png", alt: "A photo" } },
+									caption: "A caption",
+									alignment: "wide",
+								},
+							],
+						},
+					},
+				],
+			},
+		};
+
+		await applySeed(db, seed, { includeContent: true, storage, baseUrl: "" });
+
+		const contentRepo = new ContentRepository(db);
+		const entry = await contentRepo.findBySlug("posts", "hello");
+		const media = await db
+			.selectFrom("media")
+			.select(["id", "storage_key"])
+			.executeTakeFirstOrThrow();
+
+		expect(entry?.data.body).toEqual([
+			{
+				_type: "image",
+				_key: "img1",
+				asset: {
+					_type: "reference",
+					_ref: media.id,
+					url: `/_emdash/api/media/file/${media.storage_key}`,
+					provider: "local",
+				},
+				alt: "A photo",
+				caption: "A caption",
+				width: 1,
+				height: 1,
+				alignment: "wide",
+			},
+		]);
+	});
+
+	it("should store an image block without $media as written", async () => {
+		const registry = new SchemaRegistry(db);
+		await registry.createField("posts", {
+			slug: "body",
+			label: "Body",
+			type: "portableText",
+		});
+
+		const block = {
+			_type: "image",
+			_key: "img1",
+			asset: {
+				_ref: "01M2QZRZTZPBJ2WV8A3B61ZZX7",
+				url: "/_emdash/api/media/file/01M2QZRZR8HDNT3039QNQ95B9D.jpg",
+				meta: { blurhash: "LEHV6nWB2yk8pyo0adR*.7kCMdnj" },
+			},
+			alt: "A photo",
+		};
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [{ id: "post-1", slug: "hello", data: { title: "Hello", body: [block] } }],
+			},
+		};
+
+		await applySeed(db, seed, { includeContent: true, storage });
+
+		const contentRepo = new ContentRepository(db);
+		const entry = await contentRepo.findBySlug("posts", "hello");
+		expect(entry?.data.body).toEqual([block]);
+	});
+
+	it("downloads no more files per call than its budget allows", async () => {
+		mockFetch.mockImplementation(async (requestUrl) => {
+			// Vary the response body by URL so content-hash deduplication
+			// does not collapse the three distinct files into one row.
+			const slug = new URL(String(requestUrl)).pathname.slice(1);
+			const body = new Uint8Array(MOCK_PNG.length + slug.length);
+			body.set(MOCK_PNG);
+			body.set(new TextEncoder().encode(slug), MOCK_PNG.length);
+			return createMockResponse(body, "image/png");
+		});
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: ["one", "two", "three"].map((slug) => ({
+					id: slug,
+					slug,
+					data: {
+						title: slug,
+						featured_image: { $media: { url: `https://example.com/${slug}.png` } },
+					},
+				})),
+			},
+		};
+
+		const downloadsPerCall: number[] = [];
+		for (let call = 0; call < 10; call++) {
+			const before = mockFetch.mock.calls.length;
+			const { complete } = await applySeedWithinBudget(
+				db,
+				seed,
+				{ includeContent: true, storage },
+				{ mediaDownloads: 1 },
+			);
+			downloadsPerCall.push(mockFetch.mock.calls.length - before);
+			if (complete) break;
+		}
+
+		expect(Math.max(...downloadsPerCall)).toBe(1);
+		expect(storage.uploads).toHaveLength(3);
+		const contentRepo = new ContentRepository(db);
+		for (const slug of ["one", "two", "three"]) {
+			const entry = await contentRepo.findBySlug("posts", slug);
+			expect(entry?.data.featured_image).toMatchObject({ provider: "local" });
+		}
+	});
+
+	it("should read local files, infer metadata, and persist a usable MediaValue", async () => {
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "local-1",
+						slug: "local-image",
+						data: {
+							title: "Local image",
+							featured_image: {
+								$media: {
+									file: "assets/photo.png",
+									alt: "A local photo",
+									caption: "Per-use caption",
+									libraryCaption: "Library caption",
+								},
+							},
+						},
+					},
+					{
+						id: "local-custom",
+						slug: "local-custom",
+						data: {
+							title: "Custom filename",
+							featured_image: {
+								$media: { file: "assets/custom.jpg", filename: "renamed.jpg" },
+							},
+						},
+					},
+				],
+			},
+		};
+
+		const result = await applySeed(db, seed, {
+			includeContent: true,
+			storage,
+			mediaBasePath,
+		});
+
+		expect(result.media.created).toBe(2);
+		expect(mockFetch).not.toHaveBeenCalled();
+		expect(storage.uploads).toHaveLength(2);
+		expect(storage.uploads[0]).toMatchObject({ body: MOCK_PNG, contentType: "image/png" });
+		expect(storage.uploads[1]).toMatchObject({ body: MOCK_JPEG, contentType: "image/jpeg" });
+
+		const mediaRows = await db.selectFrom("media").selectAll().orderBy("filename").execute();
+		expect(mediaRows.map((media) => media.filename)).toEqual(["photo.png", "renamed.jpg"]);
+		const media = mediaRows.find((row) => row.filename === "photo.png");
+		expect(media).toBeDefined();
+		expect(media).toMatchObject({
+			filename: "photo.png",
+			mime_type: "image/png",
+			alt: "A local photo",
+			caption: "Library caption",
+			width: 1,
+			height: 1,
+			status: "ready",
+		});
+		const entry = await new ContentRepository(db).findBySlug("posts", "local-image");
+		expect(entry?.data.featured_image).toMatchObject({
+			provider: "local",
+			id: media!.id,
+			alt: "A local photo",
+			caption: "Per-use caption",
+			filename: "photo.png",
+			width: 1,
+			height: 1,
+		});
+	});
+
+	it("caches repeated local files and deduplicates them on update", async () => {
+		const seed = (caption: string): SeedFile => ({
+			version: "1",
+			content: {
+				posts: ["first", "second"].map((slug) => ({
+					id: `local-${slug}`,
+					slug: `local-${slug}`,
+					data: {
+						title: slug,
+						featured_image: { $media: { file: "assets/photo.png", caption } },
+					},
+				})),
+			},
+		});
+
+		const first = await applySeed(db, seed("first caption"), {
+			includeContent: true,
+			storage,
+			mediaBasePath,
+		});
+		const updated = await applySeed(db, seed("updated caption"), {
+			includeContent: true,
+			storage,
+			mediaBasePath,
+			onConflict: "update",
+		});
+
+		expect(first.media.created).toBe(1);
+		expect(first.media.skipped).toBe(1);
+		expect(updated.media.created).toBe(0);
+		expect(updated.media.skipped).toBe(2);
+		expect(storage.uploads).toHaveLength(1);
+		expect(await db.selectFrom("media").select("id").execute()).toHaveLength(1);
+		for (const slug of ["local-first", "local-second"]) {
+			const entry = await new ContentRepository(db).findBySlug("posts", slug);
+			expect(entry?.data.featured_image.caption).toBe("updated caption");
+		}
+	});
+
+	it("rejects local files without a base, missing files, escapes, and symlinks", async () => {
+		await symlink(outsidePath, join(mediaBasePath, "assets", "escape.png"));
+		const entries = [
+			["missing", "assets/missing.png"],
+			["traversal", "../outside.png"],
+			["absolute", join(mediaBasePath, "assets/photo.png")],
+			["symlink", "assets/escape.png"],
+		] as const;
+		const seed: SeedFile = {
+			version: "1",
+			content: {
+				posts: entries.map(([slug, file]) => ({
+					id: slug,
+					slug,
+					data: { title: slug, featured_image: { $media: { file } } },
+				})),
+			},
+		};
+
+		const result = await applySeed(db, seed, { includeContent: true, storage, mediaBasePath });
+		const noBase = await applySeed(
+			db,
+			{
+				version: "1",
+				content: {
+					posts: [
+						{
+							id: "no-base-2",
+							slug: "no-base-2",
+							data: { title: "No base", featured_image: { $media: { file: "assets/photo.png" } } },
+						},
+					],
+				},
+			},
+			{ includeContent: true, storage: createMockStorage() },
+		);
+
+		const noStorage = await applySeed(
+			db,
+			{
+				version: "1",
+				content: {
+					posts: [
+						{
+							id: "no-storage",
+							slug: "no-storage",
+							data: {
+								title: "No storage",
+								featured_image: { $media: { file: "assets/photo.png" } },
+							},
+						},
+					],
+				},
+			},
+			{ includeContent: true, mediaBasePath },
+		);
+
+		expect(result.media.skipped).toBe(4);
+		expect(noBase.media.skipped).toBe(1);
+		expect(noStorage.media.skipped).toBe(1);
+		expect(storage.uploads).toHaveLength(0);
+		for (const [slug] of entries) {
+			expect(
+				(await new ContentRepository(db).findBySlug("posts", slug))?.data.featured_image,
+			).toBeFalsy();
+		}
+	});
+
+	it("does not read or store local files when media download is skipped", async () => {
+		const result = await applySeed(
+			db,
+			{
+				version: "1",
+				content: {
+					posts: [
+						{
+							id: "skipped-local",
+							slug: "skipped-local",
+							data: {
+								title: "Skipped",
+								featured_image: { $media: { file: "assets/photo.png" } },
+							},
+						},
+					],
+				},
+			},
+			{ includeContent: true, storage, mediaBasePath, skipMediaDownload: true },
+		);
+
+		expect(result.media.skipped).toBe(1);
+		expect(storage.uploads).toHaveLength(0);
+		expect(mockFetch).not.toHaveBeenCalled();
+		expect(
+			(await new ContentRepository(db).findBySlug("posts", "skipped-local"))?.data.featured_image,
+		).toBeFalsy();
+	});
+
+	it.each([false, true])(
+		"imports URL references with file:null when skipMediaDownload is %s",
+		async (skipMediaDownload) => {
+			const url = "https://example.com/photo.png";
+			mockFetch.mockResolvedValue(createMockResponse(MOCK_PNG, "image/png"));
+			const seed: SeedFile = {
+				version: "1",
+				content: {
+					posts: [null, undefined].map((file, index) => ({
+						id: `nullable-file-${index}`,
+						slug: `nullable-file-${index}`,
+						data: { title: "URL image", featured_image: { $media: { url, file } } },
+					})),
+				},
+			};
+			const result = await applySeed(db, seed, {
+				includeContent: true,
+				storage,
+				skipMediaDownload,
+			});
+			expect(result.media).toEqual(
+				skipMediaDownload ? { created: 0, skipped: 2 } : { created: 1, skipped: 1 },
+			);
+			expect(mockFetch).toHaveBeenCalledTimes(skipMediaDownload ? 0 : 1);
+			expect(storage.uploads).toHaveLength(skipMediaDownload ? 0 : 1);
+			const repo = new ContentRepository(db);
+			const first = await repo.findBySlug("posts", "nullable-file-0");
+			const second = await repo.findBySlug("posts", "nullable-file-1");
+			expect(first?.data.featured_image).toMatchObject({
+				provider: skipMediaDownload ? "external" : "local",
+				...(skipMediaDownload ? { src: url } : { mimeType: "image/png" }),
+			});
+			expect(first?.data.featured_image).toEqual(second?.data.featured_image);
+		},
+	);
+
+	it("still rejects localhost URLs and ambiguous url/file references", async () => {
+		const localhost: SeedFile = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "localhost",
+						slug: "localhost",
+						data: {
+							title: "Localhost",
+							featured_image: { $media: { url: "http://localhost:4321/photo.png" } },
+						},
+					},
+				],
+			},
+		};
+		const ambiguous = {
+			version: "1",
+			content: {
+				posts: [
+					{
+						id: "ambiguous",
+						slug: "ambiguous",
+						data: {
+							title: "Ambiguous",
+							featured_image: {
+								$media: { url: "https://example.com/photo.png", file: "assets/photo.png" },
+							},
+						},
+					},
+				],
+			},
+		} as unknown as SeedFile;
+
+		const first = await applySeed(db, localhost, { includeContent: true, storage });
+		const second = await applySeed(db, ambiguous, { includeContent: true, storage, mediaBasePath });
+		expect(first.media.skipped).toBe(1);
+		expect(second.media.skipped).toBe(1);
+		expect(mockFetch).not.toHaveBeenCalled();
+		expect(storage.uploads).toHaveLength(0);
+	});
+});

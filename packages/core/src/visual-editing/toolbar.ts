@@ -1,0 +1,1637 @@
+import { escapeHtml } from "../api/escape.js";
+import { VISUAL_ACTION_TOKEN_INVALID } from "./action-token.js";
+
+/**
+ * EmDash Visual Editing Toolbar
+ *
+ * A floating pill injected via middleware for authenticated editors.
+ * Renders as a plain HTML string with inline styles and a <script> tag.
+ * No dependencies — works on any page with a </body> tag.
+ */
+
+interface ToolbarConfig {
+	editMode: boolean;
+	isPreview: boolean;
+	actionToken?: string;
+	labels: ToolbarLabels;
+	/** Hide the pill but keep inline editing, for pages that show their own bar. */
+	hidden?: boolean;
+}
+
+export interface ToolbarLabels {
+	publish: string;
+	publishing: string;
+	sessionExpired: string;
+	refreshPage: string;
+	publishFailed: string;
+	editMode: string;
+	openInAdmin: string;
+	hideToolbar: string;
+	draft: string;
+	published: string;
+	unpublishedChanges: string;
+	unsaved: string;
+	saving: string;
+	saved: string;
+	saveFailed: string;
+	image: string;
+	noImageSelected: string;
+	altText: string;
+	altTextPlaceholder: string;
+	replaceImage: string;
+	uploadImage: string;
+	removeImage: string;
+	mediaLibrary: string;
+	back: string;
+	loading: string;
+	noImagesFound: string;
+	mediaLoadFailed: string;
+	uploadingFile: string;
+}
+
+const SCRIPT_LINE_SEPARATOR_RE = /\u2028/g;
+const SCRIPT_PARAGRAPH_SEPARATOR_RE = /\u2029/g;
+
+function inlineScriptJson(value: unknown): string {
+	return JSON.stringify(value)
+		.replaceAll("<", "\\u003c")
+		.replace(SCRIPT_LINE_SEPARATOR_RE, "\\u2028")
+		.replace(SCRIPT_PARAGRAPH_SEPARATOR_RE, "\\u2029");
+}
+
+export function renderToolbar(config: ToolbarConfig): string {
+	const { editMode, isPreview, actionToken = "", labels, hidden = false } = config;
+	const recoveryBadge = `<span class="emdash-tb-badge emdash-tb-badge--error">${escapeHtml(labels.sessionExpired)}</span>`;
+
+	return `
+<!-- EmDash Visual Editing Toolbar -->
+<div id="emdash-toolbar" data-edit-mode="${editMode}" data-preview="${isPreview}"${hidden ? " hidden" : ""}>
+  <div class="emdash-tb-inner">
+    <span class="emdash-tb-logo">EmDash</span>
+
+    <div class="emdash-tb-divider"></div>
+
+    <label class="emdash-tb-toggle" title="${escapeHtml(labels.editMode)}">
+      <input type="checkbox" id="emdash-edit-toggle" ${editMode ? "checked" : ""} />
+      <span class="emdash-tb-toggle-track">
+        <span class="emdash-tb-toggle-thumb"></span>
+      </span>
+      <span class="emdash-tb-toggle-label">${escapeHtml(labels.editMode)}</span>
+    </label>
+
+    <span class="emdash-tb-status" id="emdash-tb-status"></span>
+
+    <span class="emdash-tb-save-status" id="emdash-tb-save-status"></span>
+
+    <a class="emdash-tb-admin" id="emdash-tb-admin" href="#" style="display:none" title="${escapeHtml(labels.openInAdmin)}">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    </a>
+
+    <button class="emdash-tb-publish" id="emdash-tb-publish" style="display:none">${escapeHtml(labels.publish)}</button>
+
+    <button class="emdash-tb-dismiss" id="emdash-tb-dismiss" title="${escapeHtml(labels.hideToolbar)}" aria-label="${escapeHtml(labels.hideToolbar)}">&times;</button>
+  </div>
+</div>
+
+<style>
+  #emdash-toolbar {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 999999;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+    line-height: 1;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .emdash-tb-inner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    background: #1a1a1a;
+    color: #e0e0e0;
+    border-radius: 999px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.08);
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  .emdash-tb-logo {
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    color: #fff;
+    opacity: 0.7;
+  }
+
+  .emdash-tb-divider {
+    width: 1px;
+    height: 16px;
+    background: rgba(255,255,255,0.15);
+  }
+
+  /* Toggle switch */
+  .emdash-tb-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+
+  .emdash-tb-toggle input {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .emdash-tb-toggle-track {
+    position: relative;
+    width: 32px;
+    height: 18px;
+    background: #444;
+    border-radius: 9px;
+    transition: background 0.2s;
+  }
+
+  .emdash-tb-toggle input:checked + .emdash-tb-toggle-track {
+    background: #3b82f6;
+  }
+
+  .emdash-tb-toggle-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.2s;
+  }
+
+  .emdash-tb-toggle input:checked + .emdash-tb-toggle-track .emdash-tb-toggle-thumb {
+    transform: translateX(14px);
+  }
+
+  .emdash-tb-toggle-label {
+    font-size: 12px;
+    color: #aaa;
+  }
+
+  .emdash-tb-toggle input:checked ~ .emdash-tb-toggle-label {
+    color: #fff;
+  }
+
+  /* Status area — flex for multiple badges */
+  .emdash-tb-status {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  /* Badges */
+  .emdash-tb-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+
+  .emdash-tb-badge--preview {
+    background: rgba(139,92,246,0.2);
+    color: #a78bfa;
+  }
+
+  .emdash-tb-badge--draft {
+    background: rgba(245,158,11,0.2);
+    color: #fbbf24;
+  }
+
+  .emdash-tb-badge--published {
+    background: rgba(34,197,94,0.2);
+    color: #4ade80;
+  }
+
+  .emdash-tb-badge--pending {
+    background: rgba(59,130,246,0.2);
+    color: #60a5fa;
+  }
+
+  .emdash-tb-badge--unsaved {
+    background: rgba(245,158,11,0.2);
+    color: #fbbf24;
+  }
+
+  .emdash-tb-badge--saving {
+    background: rgba(148,163,184,0.2);
+    color: #94a3b8;
+  }
+
+  .emdash-tb-badge--saved {
+    background: rgba(34,197,94,0.2);
+    color: #4ade80;
+    transition: opacity 0.3s;
+  }
+
+  .emdash-tb-badge--error {
+    background: rgba(239,68,68,0.2);
+    color: #f87171;
+  }
+
+  /* Admin link */
+  .emdash-tb-admin {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #888;
+    text-decoration: none;
+    padding: 2px;
+    border-radius: 4px;
+    transition: color 0.15s;
+  }
+
+  .emdash-tb-admin:hover {
+    color: #fff;
+  }
+
+  /* Publish button */
+  .emdash-tb-publish {
+    padding: 4px 12px;
+    background: #3b82f6;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+    font-family: inherit;
+  }
+
+  .emdash-tb-publish:hover {
+    background: #2563eb;
+  }
+
+  .emdash-tb-publish:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* Dismiss button */
+  .emdash-tb-dismiss {
+    background: none;
+    border: none;
+    color: #666;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 2px;
+    font-family: inherit;
+    transition: color 0.15s;
+  }
+
+  .emdash-tb-dismiss:hover {
+    color: #fff;
+  }
+
+  /* Edit mode: editable hover styles — uses :has() to check toolbar state */
+  body:has(#emdash-toolbar[data-edit-mode="true"]) [data-emdash-ref] {
+    transition: box-shadow 0.15s, background-color 0.15s;
+  }
+
+  body:has(#emdash-toolbar[data-edit-mode="true"]) [data-emdash-ref]:hover {
+    box-shadow: 0 0 0 2px rgba(59,130,246,0.5);
+    border-radius: 4px;
+    background-color: rgba(59,130,246,0.04);
+    cursor: text;
+  }
+
+  /* Active editing state — override hover pencil cursor */
+  [data-emdash-editing] {
+    box-shadow: 0 0 0 2px #3b82f6 !important;
+    border-radius: 4px !important;
+    background-color: rgba(59,130,246,0.04) !important;
+    cursor: text !important;
+  }
+
+  /* Suppress browser focus ring on contenteditable and tiptap editor */
+  [data-emdash-editing]:focus,
+  [data-emdash-ref] .tiptap:focus,
+  [data-emdash-ref] .ProseMirror:focus {
+    outline: none !important;
+  }
+
+  /* Image editor popover */
+  .emdash-img-popover {
+    position: fixed;
+    z-index: 1000000;
+    background: #1a1a1a;
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.08);
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+    width: 320px;
+    overflow: hidden;
+    animation: emdash-img-fadein 0.15s ease-out;
+  }
+
+  @keyframes emdash-img-fadein {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .emdash-img-popover-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .emdash-img-popover-title {
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #999;
+  }
+
+  .emdash-img-popover-close {
+    background: none;
+    border: none;
+    color: #666;
+    cursor: pointer;
+    padding: 2px;
+    line-height: 1;
+    font-size: 16px;
+    border-radius: 4px;
+    transition: color 0.15s;
+  }
+
+  .emdash-img-popover-close:hover {
+    color: #fff;
+  }
+
+  .emdash-img-popover-body {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .emdash-img-preview {
+    width: 100%;
+    max-height: 160px;
+    object-fit: contain;
+    border-radius: 6px;
+    background: #111;
+  }
+
+  .emdash-img-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 80px;
+    border: 2px dashed rgba(255,255,255,0.15);
+    border-radius: 6px;
+    color: #666;
+    font-size: 12px;
+  }
+
+  .emdash-img-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .emdash-img-field label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .emdash-img-field input[type="text"] {
+    background: #111;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+    color: #e0e0e0;
+    padding: 6px 8px;
+    font-size: 13px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .emdash-img-field input[type="text"]:focus {
+    border-color: #3b82f6;
+  }
+
+  .emdash-img-actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  .emdash-img-btn {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+    background: #222;
+    color: #e0e0e0;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  .emdash-img-btn:hover {
+    background: #333;
+    border-color: rgba(255,255,255,0.2);
+  }
+
+  .emdash-img-btn--primary {
+    background: #3b82f6;
+    border-color: #3b82f6;
+    color: #fff;
+  }
+
+  .emdash-img-btn--primary:hover {
+    background: #2563eb;
+    border-color: #2563eb;
+  }
+
+  .emdash-img-btn--danger {
+    color: #f87171;
+    border-color: rgba(248,113,113,0.3);
+  }
+
+  .emdash-img-btn--danger:hover {
+    background: rgba(248,113,113,0.1);
+    border-color: rgba(248,113,113,0.5);
+  }
+
+  /* Media browser within the popover */
+  .emdash-img-browser {
+    border-top: 1px solid rgba(255,255,255,0.08);
+    padding: 12px;
+  }
+
+  .emdash-img-browser-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+
+  .emdash-img-browser-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #999;
+  }
+
+  .emdash-img-browser-back {
+    background: none;
+    border: none;
+    color: #3b82f6;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+    padding: 2px 4px;
+  }
+
+  .emdash-img-browser-back:hover {
+    text-decoration: underline;
+  }
+
+  .emdash-img-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+
+  .emdash-img-grid-item {
+    aspect-ratio: 1;
+    border-radius: 4px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: border-color 0.15s;
+    background: #111;
+  }
+
+  .emdash-img-grid-item:hover {
+    border-color: rgba(59,130,246,0.5);
+  }
+
+  .emdash-img-grid-item--selected {
+    border-color: #3b82f6;
+  }
+
+  .emdash-img-grid-item img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .emdash-img-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 80px;
+    color: #666;
+    font-size: 12px;
+  }
+
+  .emdash-img-drop {
+    border: 2px dashed #3b82f6;
+    background: rgba(59,130,246,0.05);
+  }
+
+  .emdash-img-uploading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    color: #999;
+    font-size: 12px;
+  }
+
+  .emdash-img-popover-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 999999;
+  }
+</style>
+
+<script>
+(function() {
+  var toolbar = document.getElementById("emdash-toolbar");
+  var toggle = document.getElementById("emdash-edit-toggle");
+  var statusEl = document.getElementById("emdash-tb-status");
+  var saveStatusEl = document.getElementById("emdash-tb-save-status");
+  var publishBtn = document.getElementById("emdash-tb-publish");
+  if (!toolbar || !toggle || !statusEl || !publishBtn || !saveStatusEl) return;
+
+  // Dismissed in this browser (localStorage flag, cleared on the next admin
+  // visit). Remove the toolbar entirely instead of rendering it.
+  try {
+    if (localStorage.getItem("emdash-toolbar-dismissed")) {
+      toolbar.remove();
+      return;
+    }
+  } catch (e) {
+    // localStorage unavailable — render normally
+  }
+
+  var isEditMode = toolbar.getAttribute("data-edit-mode") === "true";
+  var visualActionToken = ${inlineScriptJson(actionToken)};
+  var visualActionTokenErrorCode = ${inlineScriptJson(VISUAL_ACTION_TOKEN_INVALID)};
+  var toolbarLabels = ${inlineScriptJson(labels)};
+  var visualActionRefreshTimer = null;
+
+  function showVisualActionRecovery() {
+    waitingForPublish = false;
+    if (visualActionRefreshTimer !== null) clearTimeout(visualActionRefreshTimer);
+    visualActionRefreshTimer = null;
+    statusEl.innerHTML = ${inlineScriptJson(recoveryBadge)};
+    publishBtn.disabled = true;
+    publishBtn.textContent = toolbarLabels.refreshPage;
+  }
+
+  function showPublishError(message) {
+    waitingForPublish = false;
+    statusEl.textContent = message || toolbarLabels.publishFailed;
+    publishBtn.disabled = false;
+    publishBtn.textContent = toolbarLabels.publish;
+  }
+
+  function scheduleVisualActionTokenRefresh(delay) {
+    if (visualActionRefreshTimer !== null) clearTimeout(visualActionRefreshTimer);
+    visualActionRefreshTimer = setTimeout(function() {
+      visualActionRefreshTimer = null;
+      refreshVisualActionToken();
+    }, delay);
+  }
+
+  function refreshVisualActionToken() {
+    return ecFetch("/_emdash/api/visual-editing/action-token", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "X-EmDash-Visual-Action": visualActionToken },
+    })
+    .then(function(res) {
+      if (res.status === 401 || res.status === 403) {
+        showVisualActionRecovery();
+        return null;
+      }
+      if (!res.ok) throw new Error("Visual action token renewal failed");
+      return res.json();
+    })
+    .then(function(body) {
+      if (!body) return;
+      if (!body.data || !body.data.token) throw new Error("Visual action token renewal returned no token");
+      visualActionToken = body.data.token;
+      scheduleVisualActionTokenRefresh(240000);
+    })
+    .catch(function(error) {
+      console.error("Visual action token renewal failed:", error);
+      scheduleVisualActionTokenRefresh(30000);
+    });
+  }
+
+  if (visualActionToken) scheduleVisualActionTokenRefresh(240000);
+
+  var dismissBtn = document.getElementById("emdash-tb-dismiss");
+  if (dismissBtn) {
+    dismissBtn.addEventListener("click", function() {
+      try { localStorage.setItem("emdash-toolbar-dismissed", "1"); } catch (e) {}
+      // Dismissing while edit mode is on would strand the user in edit mode
+      // with no UI to leave it — clear the cookie too.
+      if (isEditMode) {
+        document.cookie = "emdash-edit-mode=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+        toolbar.remove();
+        location.replace(location.href);
+        return;
+      }
+      toolbar.remove();
+    });
+  }
+
+  // CSRF-protected fetch — adds X-EmDash-Request header to all API calls
+  function ecFetch(url, init) {
+    init = init || {};
+    init.headers = Object.assign({ "X-EmDash-Request": "1" }, init.headers || {});
+    return fetch(url, init);
+  }
+
+  // --- Save status tracking ---
+  var saveState = "idle"; // idle | unsaved | saving | saved | error
+  var saveHideTimer = null;
+  var pendingSaves = [];
+  var waitingForPublish = false;
+
+  function trackSave(save) {
+    var settled = save.then(untrack, untrack);
+    function untrack() {
+      pendingSaves = pendingSaves.filter(function(pending) { return pending !== settled; });
+    }
+    pendingSaves.push(settled);
+  }
+
+  function badgeHtml(kind, label) {
+    return '<span class="emdash-tb-badge emdash-tb-badge--' + kind + '">' + escapeAttr(label) + '</span>';
+  }
+
+  function setSaveState(state) {
+    saveState = state;
+    clearTimeout(saveHideTimer);
+
+    switch (state) {
+      case "unsaved":
+        saveStatusEl.innerHTML = badgeHtml("unsaved", toolbarLabels.unsaved);
+        break;
+      case "saving":
+        saveStatusEl.innerHTML = badgeHtml("saving", toolbarLabels.saving);
+        break;
+      case "saved":
+        saveStatusEl.innerHTML = badgeHtml("saved", toolbarLabels.saved);
+        saveHideTimer = setTimeout(function() {
+          saveStatusEl.innerHTML = "";
+          saveState = "idle";
+        }, 2000);
+        break;
+      case "error":
+        saveStatusEl.innerHTML = badgeHtml("error", toolbarLabels.saveFailed);
+        saveHideTimer = setTimeout(function() {
+          saveStatusEl.innerHTML = "";
+          saveState = "idle";
+        }, 3000);
+        break;
+      default:
+        saveStatusEl.innerHTML = "";
+    }
+  }
+
+  // Listen for save events from inline editors (e.g. PT editor)
+  document.addEventListener("emdash:save", function(e) {
+    var detail = e.detail || {};
+    if (detail.state) {
+      setSaveState(detail.state);
+    }
+  });
+
+  // The inline Portable Text editor sends its own save requests and reports
+  // each one here, so publish() can wait for it.
+  document.addEventListener("emdash:save-pending", function(e) {
+    if (e.detail && e.detail.done) {
+      trackSave(e.detail.done);
+    }
+  });
+
+  document.addEventListener("emdash:content-changed", function(e) {
+    var detail = e.detail || {};
+    if (detail.collection && detail.id) {
+      showUnpublishedChanges(detail.collection, detail.id);
+    }
+  });
+
+  // --- Entry status ---
+  var pendingEntries = new Map();
+
+  function entryKey(collection, id) {
+    return JSON.stringify([collection, id]);
+  }
+
+  function updateStatus() {
+    if (!isEditMode) {
+      statusEl.innerHTML = "";
+      publishBtn.style.display = "none";
+      return;
+    }
+
+    var hasDraft = false;
+    var hasPublished = false;
+    var adminRef = null;
+    document.querySelectorAll("[data-emdash-ref]").forEach(function(element) {
+      try {
+        var ref = JSON.parse(element.getAttribute("data-emdash-ref"));
+        if (!ref || !ref.collection || !ref.id || !ref.status) return;
+        if (!adminRef) adminRef = ref;
+        if (ref.status === "draft" || (ref.status === "published" && ref.hasDraft)) {
+          pendingEntries.set(entryKey(ref.collection, ref.id), ref);
+        }
+        if (ref.status === "draft") hasDraft = true;
+        if (ref.status === "published") hasPublished = true;
+      } catch (e) {
+        // ignore parse errors
+      }
+    });
+
+    var adminLink = document.getElementById("emdash-tb-admin");
+    if (adminLink && adminRef) {
+      adminLink.href = "/_emdash/admin/content/" + encodeURIComponent(adminRef.collection) + "/" + encodeURIComponent(adminRef.id);
+      adminLink.target = adminWindowName(adminRef.collection, adminRef.id);
+      adminLink.style.display = "";
+    }
+
+    if (hasDraft) {
+      statusEl.innerHTML = badgeHtml("draft", toolbarLabels.draft);
+    } else if (pendingEntries.size) {
+      statusEl.innerHTML = badgeHtml("pending", toolbarLabels.unpublishedChanges);
+    } else if (hasPublished) {
+      statusEl.innerHTML = badgeHtml("published", toolbarLabels.published);
+    } else {
+      statusEl.innerHTML = "";
+    }
+    publishBtn.style.display = pendingEntries.size ? "" : "none";
+  }
+
+  publishBtn.onclick = function() { publish(); };
+
+  // Publish action
+  function publish(failedEntries, publishError) {
+    failedEntries = failedEntries || new Set();
+    waitingForPublish = true;
+    publishBtn.disabled = true;
+    publishBtn.textContent = toolbarLabels.publishing;
+
+    if (pendingSaves.length) {
+      Promise.all(pendingSaves).then(function() { publish(failedEntries, publishError); });
+      return;
+    }
+
+    var next = Array.from(pendingEntries.entries()).find(function(entry) {
+      return !failedEntries.has(entry[0]);
+    });
+    if (!next) {
+      if (failedEntries.size) {
+        showPublishError(publishError);
+        return;
+      }
+      if (document.startViewTransition) {
+        document.startViewTransition(function() { location.reload(); });
+      } else {
+        location.reload();
+      }
+      return;
+    }
+
+    var key = next[0];
+    var ref = next[1];
+    ecFetch("/_emdash/api/visual-editing/content/" + encodeURIComponent(ref.collection) + "/" + encodeURIComponent(ref.id) + "/publish", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "X-EmDash-Visual-Action": visualActionToken },
+    })
+    .then(function(res) {
+      if (res.ok) {
+        // A save during the request replaces the ref and still needs publishing.
+        if (pendingEntries.get(key) === ref) pendingEntries.delete(key);
+        publish(failedEntries, publishError);
+      } else {
+        if (res.status === 401) {
+          showVisualActionRecovery();
+          return;
+        }
+        return res.json().catch(function() { return null; }).then(function(body) {
+          if (body && body.error && body.error.code === visualActionTokenErrorCode) {
+            showVisualActionRecovery();
+            return;
+          }
+          failedEntries.add(key);
+          console.error("Publish failed:", res.status);
+          publish(failedEntries, publishError || (body && body.error && body.error.message) || toolbarLabels.publishFailed);
+        });
+      }
+    })
+    .catch(function(err) {
+      failedEntries.add(key);
+      console.error("Publish failed:", err);
+      publish(failedEntries, publishError || toolbarLabels.publishFailed);
+    });
+  }
+
+  // Edit mode toggle
+  toggle.addEventListener("change", function() {
+    if (toggle.checked) {
+      document.cookie = "emdash-edit-mode=true;path=/;samesite=lax";
+    } else {
+      document.cookie = "emdash-edit-mode=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+    }
+
+    if (document.startViewTransition) {
+      document.startViewTransition(function() { location.replace(location.href); });
+    } else {
+      location.replace(location.href);
+    }
+  });
+
+  // --- Inline editing ---
+
+  // Cached manifest (fetched once on first edit click)
+  var manifestCache = null;
+  var manifestPromise = null;
+
+  function fetchManifest() {
+    if (manifestCache) return Promise.resolve(manifestCache);
+    if (manifestPromise) return manifestPromise;
+    manifestPromise = ecFetch("/_emdash/api/manifest", { credentials: "same-origin" })
+      .then(function(r) { return r.json(); })
+      .then(function(m) {
+        // The manifest endpoint wraps the payload in a { success, data } envelope (ApiResponse shape).
+        // Unwrap it so getFieldKind can read manifest.collections directly.
+        manifestCache = m && m.data ? m.data : m;
+        return manifestCache;
+      });
+    return manifestPromise;
+  }
+
+  function getFieldKind(manifest, collection, field) {
+    var col = manifest.collections && manifest.collections[collection];
+    if (!col || !col.fields) return null;
+    var f = col.fields[field];
+    return f ? f.kind : null;
+  }
+
+  // Load manifest early so the first click can resolve field kinds without racing the event.
+  if (isEditMode) {
+    fetchManifest();
+  }
+
+  // Save a single field value. Never rejects: resolves to whether the save
+  // succeeded, after the save badge already shows the outcome.
+  function saveField(collection, id, field, value) {
+    setSaveState("saving");
+    var saved = ecFetch("/_emdash/api/content/" + encodeURIComponent(collection) + "/" + encodeURIComponent(id), {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: { [field]: value } }),
+    })
+    .then(function(res) {
+      if (res.ok) {
+        setSaveState("saved");
+        // A save creates/updates a draft — show unpublished changes
+        showUnpublishedChanges(collection, id);
+        return true;
+      }
+      setSaveState("error");
+      console.error("Save failed:", res.status);
+      return false;
+    })
+    .catch(function(err) {
+      setSaveState("error");
+      console.error("Save failed:", err);
+      return false;
+    });
+    trackSave(saved);
+    return saved;
+  }
+
+  function showUnpublishedChanges(collection, id) {
+    pendingEntries.set(entryKey(collection, id), { collection: collection, id: id });
+    statusEl.innerHTML = badgeHtml("pending", toolbarLabels.unpublishedChanges);
+    publishBtn.style.display = "";
+    if (!waitingForPublish) {
+      publishBtn.disabled = false;
+      publishBtn.textContent = toolbarLabels.publish;
+    }
+  }
+
+  // Plain text inline editing (contenteditable)
+  var currentlyEditing = null;
+
+  // Browsers add line breaks while editing as <br> or <div> elements (Shift+Enter,
+  // pasted lines), which textContent drops.
+  function editableText(element) {
+    var text = "";
+    (function walk(node) {
+      for (var child = node.firstChild; child; child = child.nextSibling) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          text += child.data;
+        } else if (child.nodeName === "BR") {
+          text += "\\n";
+        } else {
+          if (child.nodeName === "DIV" && text && text.slice(-1) !== "\\n") text += "\\n";
+          walk(child);
+        }
+      }
+    })(element);
+    return text;
+  }
+
+  function caretRangeAt(x, y) {
+    if (document.caretPositionFromPoint) {
+      var position = document.caretPositionFromPoint(x, y);
+      // Over a text input the offset counts into its value, which a range can't hold.
+      if (!position || position.offsetNode.nodeType !== Node.TEXT_NODE) return null;
+      var range = document.createRange();
+      range.setStart(position.offsetNode, position.offset);
+      return range;
+    }
+    return document.caretRangeFromPoint ? document.caretRangeFromPoint(x, y) : null;
+  }
+
+  function selectionPoints() {
+    var selection = window.getSelection();
+    return [selection.anchorNode, selection.anchorOffset, selection.focusNode, selection.focusOffset];
+  }
+
+  // A click on text moves the selection to where it landed (a caret, or the
+  // end of a drag), and focusing the field keeps it there. A click on a link
+  // leaves the selection where it was.
+  var selectionAtMousedown = null;
+
+  // Where to put the caret for a click, or null when the click placed it.
+  function caretForClick(e) {
+    var moved = !selectionAtMousedown || selectionPoints().some(function(point, i) {
+      return point !== selectionAtMousedown[i];
+    });
+    return moved ? null : caretRangeAt(e.clientX, e.clientY);
+  }
+
+  function startTextEdit(element, annotation, caret, multiline) {
+    if (currentlyEditing === element) return;
+    if (currentlyEditing) endCurrentEdit();
+
+    // Line breaks only belong in multi-line fields.
+    function readText() {
+      return multiline ? editableText(element) : element.textContent || "";
+    }
+
+    currentlyEditing = element;
+    var originalText = readText();
+
+    element.setAttribute("data-emdash-editing", "");
+    element.contentEditable = "plaintext-only";
+    element.focus();
+    if (caret && element.contains(caret.startContainer)) {
+      window.getSelection().collapse(caret.startContainer, caret.startOffset);
+    }
+
+    // Track dirty state via input events
+    function handleInput() {
+      var current = readText().trim();
+      if (current !== originalText.trim()) {
+        setSaveState("unsaved");
+      } else {
+        setSaveState("idle");
+      }
+    }
+
+    function handleBlur() {
+      element.removeEventListener("blur", handleBlur);
+      element.removeEventListener("keydown", handleKeydown);
+      element.removeEventListener("input", handleInput);
+      element.contentEditable = "false";
+      element.removeAttribute("data-emdash-editing");
+      currentlyEditing = null;
+
+      var newValue = readText().trim();
+      if (newValue !== originalText.trim()) {
+        saveField(annotation.collection, annotation.id, annotation.field, newValue);
+      } else {
+        setSaveState("idle");
+      }
+    }
+
+    function handleKeydown(e) {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        element.blur();
+      }
+      if (e.key === "Escape") {
+        element.textContent = originalText;
+        setSaveState("idle");
+        element.blur();
+      }
+    }
+
+    element.addEventListener("input", handleInput);
+    element.addEventListener("blur", handleBlur);
+    element.addEventListener("keydown", handleKeydown);
+  }
+
+  function endCurrentEdit() {
+    if (currentlyEditing) {
+      currentlyEditing.blur();
+    }
+  }
+
+  // Text fields are often rendered transformed (Markdown to HTML, truncated
+  // excerpts). Saving the page text over the stored value would lose content,
+  // so they are edited in place only when the page shows the stored text.
+  function startTextEditIfShownAsStored(element, annotation, caret) {
+    // Rendered markup means the text was transformed. Open the admin before the
+    // lookup, while the click still lets popup blockers allow window.open().
+    if (element.children.length > 0) {
+      openAdmin(annotation);
+      return;
+    }
+    ecFetch("/_emdash/api/content/" + encodeURIComponent(annotation.collection) + "/" + encodeURIComponent(annotation.id), {
+      credentials: "same-origin"
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(body) {
+      var item = body && body.data && body.data.item;
+      var stored = item && item.data ? item.data[annotation.field] : null;
+      if (typeof stored === "string" && stored.trim() === (element.textContent || "").trim()) {
+        startTextEdit(element, annotation, caret, true);
+      } else {
+        openAdmin(annotation);
+      }
+    })
+    .catch(function() {
+      openAdmin(annotation);
+    });
+  }
+
+  function adminWindowName(collection, id) {
+    return "emdash-admin-" + encodeURIComponent(collection) + "/" + encodeURIComponent(id);
+  }
+
+  // Fallback: open admin
+  function openAdmin(annotation) {
+    var url = "/_emdash/admin/content/" + encodeURIComponent(annotation.collection) + "/" + encodeURIComponent(annotation.id);
+    if (annotation.field) {
+      url += "?field=" + encodeURIComponent(annotation.field);
+    }
+    window.open(url, adminWindowName(annotation.collection, annotation.id));
+  }
+
+  // --- Inline image editing ---
+  var activeImagePopover = null;
+
+  function closeImagePopover() {
+    if (activeImagePopover) {
+      activeImagePopover.backdrop.remove();
+      activeImagePopover.popover.remove();
+      if (activeImagePopover.escapeHandler) {
+        document.removeEventListener("keydown", activeImagePopover.escapeHandler);
+      }
+      activeImagePopover = null;
+    }
+  }
+
+  function startImageEdit(element, annotation) {
+    closeImagePopover();
+
+    // Find the current image value by fetching the entry
+    var collection = annotation.collection;
+    var id = annotation.id;
+    var field = annotation.field;
+
+    // Find img element inside the annotated container (or the element itself if it's an img)
+    var imgEl = element.tagName === "IMG" ? element : element.querySelector("img");
+
+    // Fetch current field value from the content API
+    ecFetch("/_emdash/api/content/" + encodeURIComponent(collection) + "/" + encodeURIComponent(id), {
+      credentials: "same-origin"
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(body) {
+      if (!body || !body.success) throw new Error("Failed to load entry");
+      showImagePopover(element, imgEl, annotation, body.data.item.data[field]);
+    })
+    .catch(function() {
+      // If fetch fails, still show popover with what we can infer from DOM
+      showImagePopover(element, imgEl, annotation, null);
+    });
+  }
+
+  function showImagePopover(element, imgEl, annotation, currentValue) {
+    closeImagePopover();
+
+    var collection = annotation.collection;
+    var id = annotation.id;
+    var field = annotation.field;
+
+    // Position near the element
+    var rect = element.getBoundingClientRect();
+    var viewportH = window.innerHeight;
+    var viewportW = window.innerWidth;
+
+    // Create backdrop for click-outside-to-close
+    var backdrop = document.createElement("div");
+    backdrop.className = "emdash-img-popover-backdrop";
+    backdrop.addEventListener("click", function(e) {
+      if (e.target === backdrop) closeImagePopover();
+    });
+
+    // Create popover
+    var popover = document.createElement("div");
+    popover.className = "emdash-img-popover";
+
+    // Local images are stored without a URL (the site builds it at render
+    // time), so preview what the page shows when the value carries none.
+    var currentSrc = (currentValue && (currentValue.previewUrl || currentValue.src)) || (imgEl ? imgEl.src : null);
+    var currentAlt = currentValue ? (currentValue.alt || "") : (imgEl ? (imgEl.alt || "") : "");
+
+    // Build popover HTML
+    var html = '';
+    html += '<div class="emdash-img-popover-header">';
+    html += '  <span class="emdash-img-popover-title">' + escapeAttr(toolbarLabels.image) + '</span>';
+    html += '  <button class="emdash-img-popover-close" data-action="close">&times;</button>';
+    html += '</div>';
+    html += '<div class="emdash-img-popover-body" id="emdash-img-main">';
+
+    if (currentSrc) {
+      html += '<img class="emdash-img-preview" src="' + escapeAttr(currentSrc) + '" alt="" />';
+    } else {
+      html += '<div class="emdash-img-empty">' + escapeAttr(toolbarLabels.noImageSelected) + '</div>';
+    }
+
+    html += '<div class="emdash-img-field">';
+    html += '  <label for="emdash-img-alt">' + escapeAttr(toolbarLabels.altText) + '</label>';
+    html += '  <input type="text" id="emdash-img-alt" value="' + escapeAttr(currentAlt) + '" placeholder="' + escapeAttr(toolbarLabels.altTextPlaceholder) + '" />';
+    html += '</div>';
+
+    html += '<div class="emdash-img-actions">';
+    html += '  <button class="emdash-img-btn emdash-img-btn--primary" data-action="browse">' + escapeAttr(toolbarLabels.replaceImage) + '</button>';
+    html += '  <label class="emdash-img-btn" style="cursor:pointer">';
+    html += '    ' + escapeAttr(toolbarLabels.uploadImage);
+    html += '    <input type="file" accept="image/*" id="emdash-img-upload" style="display:none" />';
+    html += '  </label>';
+    if (currentSrc) {
+      html += '  <button class="emdash-img-btn emdash-img-btn--danger" data-action="remove">' + escapeAttr(toolbarLabels.removeImage) + '</button>';
+    }
+    html += '</div>';
+    html += '</div>';
+
+    popover.innerHTML = html;
+
+    backdrop.appendChild(popover);
+    document.body.appendChild(backdrop);
+
+    // Position the popover
+    positionPopover(popover, rect, viewportW, viewportH);
+
+    // Escape key handler
+    function handleEscape(e) {
+      if (e.key === "Escape") {
+        closeImagePopover();
+        document.removeEventListener("keydown", handleEscape);
+      }
+    }
+    document.addEventListener("keydown", handleEscape);
+
+    activeImagePopover = {
+      backdrop: backdrop,
+      popover: popover,
+      annotation: annotation,
+      currentValue: currentValue,
+      element: element,
+      imgEl: imgEl,
+      escapeHandler: handleEscape
+    };
+
+    // Event handlers
+    popover.querySelector('[data-action="close"]').addEventListener("click", closeImagePopover);
+
+    popover.querySelector('[data-action="browse"]').addEventListener("click", function() {
+      showMediaBrowser(popover, annotation, currentValue, element, imgEl);
+    });
+
+    var uploadInput = popover.querySelector("#emdash-img-upload");
+    uploadInput.addEventListener("change", function(e) {
+      var file = e.target.files && e.target.files[0];
+      if (file) handleImageUpload(file, popover, annotation, currentValue, element, imgEl);
+    });
+
+    var removeBtn = popover.querySelector('[data-action="remove"]');
+    if (removeBtn) {
+      removeBtn.addEventListener("click", function() {
+        saveField(collection, id, field, null).then(function(saved) {
+          if (saved && imgEl) {
+            imgEl.style.display = "none";
+          }
+          closeImagePopover();
+        });
+      });
+    }
+
+    // Save alt text on change (debounced)
+    var altInput = popover.querySelector("#emdash-img-alt");
+    var altTimer = null;
+    altInput.addEventListener("input", function() {
+      clearTimeout(altTimer);
+      altTimer = setTimeout(function() {
+        var newAlt = altInput.value;
+        if (currentValue) {
+          var updated = Object.assign({}, currentValue, { alt: newAlt });
+          saveField(collection, id, field, updated).then(function(saved) {
+            if (saved && imgEl) imgEl.alt = newAlt;
+          });
+        }
+      }, 500);
+    });
+
+    // Handle drag and drop on the popover body
+    var body = popover.querySelector(".emdash-img-popover-body");
+    body.addEventListener("dragover", function(e) {
+      e.preventDefault();
+      body.classList.add("emdash-img-drop");
+    });
+    body.addEventListener("dragleave", function() {
+      body.classList.remove("emdash-img-drop");
+    });
+    body.addEventListener("drop", function(e) {
+      e.preventDefault();
+      body.classList.remove("emdash-img-drop");
+      var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file && file.type.startsWith("image/")) {
+        handleImageUpload(file, popover, annotation, currentValue, element, imgEl);
+      }
+    });
+  }
+
+  function positionPopover(popover, targetRect, viewportW, viewportH) {
+    var popoverW = 320;
+    var gap = 8;
+
+    // Try to place to the right of the element
+    var left = targetRect.right + gap;
+    var top = targetRect.top;
+
+    // If it overflows right, place to the left
+    if (left + popoverW > viewportW - 16) {
+      left = targetRect.left - popoverW - gap;
+    }
+    // If it still overflows (narrow viewport), center below
+    if (left < 16) {
+      left = Math.max(16, (viewportW - popoverW) / 2);
+      top = targetRect.bottom + gap;
+    }
+    // Clamp vertically
+    if (top + 400 > viewportH - 80) { // 80 for toolbar
+      top = Math.max(16, viewportH - 480);
+    }
+    if (top < 16) top = 16;
+
+    popover.style.left = left + "px";
+    popover.style.top = top + "px";
+  }
+
+  function escapeAttr(str) {
+    return String(str || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function showMediaBrowser(popover, annotation, currentValue, element, imgEl) {
+    var mainBody = popover.querySelector("#emdash-img-main");
+    if (mainBody) mainBody.style.display = "none";
+
+    // Remove existing browser if any
+    var existing = popover.querySelector(".emdash-img-browser");
+    if (existing) existing.remove();
+
+    var browser = document.createElement("div");
+    browser.className = "emdash-img-browser";
+
+    browser.innerHTML = '<div class="emdash-img-browser-header">' +
+      '<span class="emdash-img-browser-title">' + escapeAttr(toolbarLabels.mediaLibrary) + '</span>' +
+      '<button class="emdash-img-browser-back">' + escapeAttr(toolbarLabels.back) + '</button>' +
+      '</div>' +
+      '<div class="emdash-img-loading">' + escapeAttr(toolbarLabels.loading) + '</div>';
+
+    popover.appendChild(browser);
+
+    browser.querySelector(".emdash-img-browser-back").addEventListener("click", function() {
+      browser.remove();
+      if (mainBody) mainBody.style.display = "";
+    });
+
+    // Fetch media
+    ecFetch("/_emdash/api/media?mimeType=image/&limit=30", { credentials: "same-origin" })
+    .then(function(r) { return r.json(); })
+    .then(function(body) {
+      if (!body || !body.success) throw new Error((body && body.error && body.error.message) || "Failed to load media");
+      var items = body.data.items || [];
+      var loadingEl = browser.querySelector(".emdash-img-loading");
+      if (loadingEl) loadingEl.remove();
+
+      if (items.length === 0) {
+        var empty = document.createElement("div");
+        empty.className = "emdash-img-loading";
+        empty.textContent = toolbarLabels.noImagesFound;
+        browser.appendChild(empty);
+        return;
+      }
+
+      var grid = document.createElement("div");
+      grid.className = "emdash-img-grid";
+
+      items.forEach(function(item) {
+        var thumb = document.createElement("div");
+        thumb.className = "emdash-img-grid-item";
+        if (currentValue && currentValue.id === item.id) {
+          thumb.classList.add("emdash-img-grid-item--selected");
+        }
+        var thumbUrl = item.url || item.previewUrl || ("/_emdash/api/media/file/" + item.storageKey);
+        thumb.innerHTML = '<img src="' + escapeAttr(thumbUrl) + '" alt="' + escapeAttr(item.alt || item.filename || "") + '" loading="lazy" />';
+
+        thumb.addEventListener("click", function() {
+          selectMediaItem(item, annotation, currentValue, element, imgEl);
+        });
+
+        grid.appendChild(thumb);
+      });
+
+      browser.appendChild(grid);
+    })
+    .catch(function(err) {
+      var loadingEl = browser.querySelector(".emdash-img-loading");
+      if (loadingEl) loadingEl.textContent = toolbarLabels.mediaLoadFailed;
+      console.error("Media fetch error:", err);
+    });
+  }
+
+  function selectMediaItem(item, annotation, currentValue, element, imgEl) {
+    var collection = annotation.collection;
+    var id = annotation.id;
+    var field = annotation.field;
+
+    var isLocal = !item.provider || item.provider === "local";
+    var itemUrl = item.url || item.previewUrl || ("/_emdash/api/media/file/" + item.storageKey);
+
+    var newValue = {
+      id: item.id,
+      provider: item.provider || "local",
+      src: isLocal ? itemUrl : undefined,
+      previewUrl: isLocal ? undefined : itemUrl,
+      alt: item.alt || "",
+      width: item.width,
+      height: item.height,
+      focalX: item.focalX == null ? undefined : item.focalX,
+      focalY: item.focalY == null ? undefined : item.focalY,
+      meta: item.meta,
+      // The save replaces the whole field, so a dark variant not sent is deleted.
+      darkVariant: currentValue ? currentValue.darkVariant : undefined
+    };
+
+    // Clean undefined fields
+    Object.keys(newValue).forEach(function(k) {
+      if (newValue[k] === undefined) delete newValue[k];
+    });
+
+    saveField(collection, id, field, newValue).then(function(saved) {
+      // Update the image in the DOM
+      if (saved && imgEl) {
+        replacePageImageSource(imgEl, itemUrl);
+        imgEl.alt = item.alt || "";
+        imgEl.style.display = "";
+      }
+      closeImagePopover();
+    });
+  }
+
+  // The rendered srcset/sizes (and any <picture> sources) still describe the
+  // previous media and take precedence over src, so they have to go. The next
+  // server render restores responsive variants for the new image.
+  function replacePageImageSource(img, url) {
+    var picture = img.parentElement;
+    if (picture && picture.tagName === "PICTURE") {
+      Array.prototype.forEach.call(picture.querySelectorAll("source"), function(source) {
+        source.removeAttribute("srcset");
+        source.removeAttribute("sizes");
+      });
+    }
+    img.removeAttribute("srcset");
+    img.removeAttribute("sizes");
+    img.src = url;
+  }
+
+  function handleImageUpload(file, popover, annotation, currentValue, element, imgEl) {
+    var collection = annotation.collection;
+    var id = annotation.id;
+    var field = annotation.field;
+
+    // Show uploading state
+    var mainBody = popover.querySelector("#emdash-img-main");
+    var browserEl = popover.querySelector(".emdash-img-browser");
+    if (browserEl) browserEl.remove();
+    if (mainBody) {
+      mainBody.innerHTML = '<div class="emdash-img-uploading">' +
+        '<span>' + escapeAttr(toolbarLabels.uploadingFile.replace("{filename}", function() { return file.name; })) + '</span>' +
+        '</div>';
+      mainBody.style.display = "";
+    }
+
+    // Detect dimensions before upload
+    var dimPromise = new Promise(function(resolve) {
+      if (!file.type.startsWith("image/")) return resolve({});
+      var img = new Image();
+      img.onload = function() {
+        resolve({ width: img.naturalWidth, height: img.naturalHeight });
+        URL.revokeObjectURL(img.src);
+      };
+      img.onerror = function() {
+        resolve({});
+        URL.revokeObjectURL(img.src);
+      };
+      img.src = URL.createObjectURL(file);
+    });
+
+    dimPromise.then(function(dims) {
+      // Generate a small thumbnail for server-side blurhash generation.
+      // Thumbnail fits within a 64x64 box so extreme aspect ratios do not
+      // create a large canvas client-side.
+      var thumbPromise;
+      if (dims.width && dims.height) {
+        thumbPromise = new Promise(function(resolve) {
+          try {
+            var maxDim = Math.max(dims.width, dims.height);
+            var scale = Math.min(1, 64 / maxDim);
+            var thumbW = Math.max(1, Math.round(dims.width * scale));
+            var thumbH = Math.max(1, Math.round(dims.height * scale));
+            var canvas = document.createElement("canvas");
+            canvas.width = thumbW;
+            canvas.height = thumbH;
+            var ctx = canvas.getContext("2d");
+            if (ctx) {
+              var img = new Image();
+              img.onload = function() {
+                try {
+                  ctx.drawImage(img, 0, 0, thumbW, thumbH);
+                  canvas.toBlob(function(blob) {
+                    URL.revokeObjectURL(img.src);
+                    resolve(blob);
+                  }, "image/png");
+                } catch (e) {
+                  URL.revokeObjectURL(img.src);
+                  resolve(null);
+                }
+              };
+              img.onerror = function() {
+                URL.revokeObjectURL(img.src);
+                resolve(null);
+              };
+              img.src = URL.createObjectURL(file);
+            } else {
+              resolve(null);
+            }
+          } catch (e) {
+            resolve(null);
+          }
+        });
+      } else {
+        thumbPromise = Promise.resolve(null);
+      }
+
+      return thumbPromise.then(function(thumbnail) {
+        var formData = new FormData();
+        formData.append("file", file);
+        if (dims.width) formData.append("width", String(dims.width));
+        if (dims.height) formData.append("height", String(dims.height));
+        if (thumbnail) formData.append("thumbnail", thumbnail, "thumb.png");
+
+        return ecFetch("/_emdash/api/media", {
+          method: "POST",
+          credentials: "same-origin",
+          body: formData
+        });
+      });
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(body) {
+      var item = body && body.success && body.data && body.data.item;
+      if (!item) throw new Error((body && body.error && body.error.message) || "Upload failed");
+      selectMediaItem(item, annotation, currentValue, element, imgEl);
+    })
+    .catch(function(err) {
+      console.error("Upload error:", err);
+      setSaveState("error");
+      closeImagePopover();
+    });
+  }
+
+  // Click handler for edit mode
+  if (isEditMode) {
+    document.addEventListener("mousedown", function() {
+      selectionAtMousedown = selectionPoints();
+    }, true);
+
+    document.addEventListener("click", function(e) {
+      var target = e.target;
+
+      // Clicks inside the field being edited only move the caret; cancel them so
+      // a link wrapping the field isn't followed.
+      if (target.closest && target.closest("[data-emdash-editing]")) {
+        e.preventDefault();
+        return;
+      }
+
+      // Walk up to find annotated element
+      while (target && target !== document.body) {
+        var ref = target.getAttribute && target.getAttribute("data-emdash-ref");
+        if (ref) {
+          try {
+            var annotation = JSON.parse(ref);
+
+            // Entry-level annotation (no field) — keep walking for a field-level ancestor
+            if (!annotation.field) {
+              target = target.parentElement;
+              continue;
+            }
+
+            // Read now: editing may only start once the manifest or the stored
+            // value has loaded, and the page can scroll in the meantime.
+            var caret = caretForClick(e);
+
+            function dispatchInline(kind) {
+              closeImagePopover();
+              // Portable Text is edited in-page by InlinePortableTextEditor — do not open admin
+              if (kind === "portableText") {
+                return;
+              }
+              e.preventDefault();
+              e.stopPropagation();
+              if (kind === "string" || kind === "text") {
+                startTextEdit(target, annotation, caret);
+              } else if (kind === "richText") {
+                startTextEditIfShownAsStored(target, annotation, caret);
+              } else if (kind === "image") {
+                startImageEdit(target, annotation);
+              } else {
+                openAdmin(annotation);
+              }
+            }
+
+            if (manifestCache) {
+              dispatchInline(getFieldKind(manifestCache, annotation.collection, annotation.field));
+            } else {
+              // The click can only be cancelled now, so a link wrapping the field
+              // isn't followed while the manifest loads.
+              e.preventDefault();
+              fetchManifest().then(function(manifest) {
+                dispatchInline(getFieldKind(manifest, annotation.collection, annotation.field));
+              });
+            }
+          } catch (err) {
+            console.error("Failed to parse emdash ref:", err);
+          }
+          return;
+        }
+        target = target.parentElement;
+      }
+    }, true);
+  }
+
+  updateStatus();
+})();
+</script>
+`;
+}

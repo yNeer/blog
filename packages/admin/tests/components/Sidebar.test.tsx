@@ -1,0 +1,505 @@
+/**
+ * Sidebar nav invariants — Phase 5 visibility regression guard for the
+ * "Byline Schema" entry (Discussion #1174).
+ *
+ * AC: "Admin sees the 'Byline Schema' sidebar entry; Editor does not."
+ *
+ * The full SidebarNav component is hard to test against because Kumo's
+ * Sidebar primitive portals its rendered content to `document.body`,
+ * applies collapse-state CSS that hides labels at narrow viewports
+ * (the vitest-browser-react default), and runs Radix-style provider
+ * choreography that doesn't surface anchors via `screen.container`.
+ * Mounting tests against it produced inconsistent results across role
+ * cases that should have been symmetric.
+ *
+ * Instead, the source `Sidebar.tsx` exports two pure artefacts:
+ *
+ *   - `BYLINE_SCHEMA_NAV_ITEM` — the route + minRole pairing used
+ *     verbatim inside the runtime `adminItems` array.
+ *   - `filterNavItemsByRole` — the pure role filter applied to every
+ *     nav group.
+ *
+ * Together they cover the AC without DOM coupling: the constant pins
+ * the contract, the filter pins the gate.
+ */
+
+import { setupI18n } from "@lingui/core";
+import {
+	Plug,
+	Gear,
+	Trophy,
+	ClockCounterClockwise,
+	IdentificationCard,
+	SquaresFour,
+} from "@phosphor-icons/react";
+import * as React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, it, expect, vi } from "vitest";
+
+import {
+	buildNavGroups,
+	BYLINE_SCHEMA_NAV_ITEM,
+	declaredLabelTranslator,
+	filterNavItemsByRole,
+	getSidebarTaxonomies,
+	isItemActive,
+	NavIcon,
+	parseFolderState,
+	resolveItemPath,
+	resolveNavIcon,
+	resolvePluginPageLabel,
+	resolvePluginWidgetTitle,
+	toPhosphorIconName,
+	visibleCollectionEntries,
+	type NavBuildInput,
+	type NavGroup,
+} from "../../src/components/Sidebar";
+import { render } from "../utils/render.tsx";
+
+// Mirror @emdash-cms/auth Role levels. Kept inline (matching Sidebar.tsx)
+// to avoid a runtime dependency just to read two numeric constants.
+const ROLE_SUBSCRIBER = 10;
+const ROLE_CONTRIBUTOR = 20;
+const ROLE_AUTHOR = 30;
+const ROLE_EDITOR = 40;
+const ROLE_ADMIN = 50;
+
+describe("getSidebarTaxonomies", () => {
+	const taxonomies = [
+		{ id: "course-en", name: "course", label: "Courses", locale: "en", translationGroup: "course" },
+		{ id: "course-de", name: "course", label: "Gänge", locale: "de", translationGroup: "course" },
+		{
+			id: "course-fr",
+			name: "course",
+			label: "Types de plats",
+			locale: "fr",
+			translationGroup: "course",
+		},
+	];
+
+	it("renders one logical taxonomy using the active route locale", () => {
+		expect(getSidebarTaxonomies(taxonomies, "de").map((taxonomy) => taxonomy.label)).toEqual([
+			"Gänge",
+		]);
+	});
+
+	it("falls back to the configured default locale, then deterministically", () => {
+		expect(getSidebarTaxonomies(taxonomies, "it", "fr")[0]?.label).toBe("Types de plats");
+		expect(getSidebarTaxonomies(taxonomies, "it")[0]?.label).toBe("Gänge");
+	});
+});
+
+describe("resolveItemPath", () => {
+	it("preserves the active locale on taxonomy-management links", () => {
+		expect(
+			resolveItemPath({
+				to: "/taxonomies/$taxonomy",
+				label: "Gänge",
+				icon: Gear,
+				params: { taxonomy: "course" },
+				search: { locale: "de" },
+			}),
+		).toBe("/taxonomies/course?locale=de");
+	});
+});
+
+describe("isItemActive", () => {
+	it("matches taxonomy links independently of their locale query", () => {
+		expect(isItemActive("/taxonomies/course?locale=de", "/taxonomies/course")).toBe(true);
+	});
+
+	it('matches a plugin page declared with path "/", whose target carries a trailing slash', () => {
+		expect(isItemActive("/plugins/emdash-forms/", "/plugins/emdash-forms")).toBe(true);
+	});
+
+	it("still matches nested routes under a plugin page", () => {
+		expect(isItemActive("/plugins/emdash-forms/", "/plugins/emdash-forms/submissions")).toBe(true);
+	});
+
+	it("does not match a different plugin whose id shares a prefix", () => {
+		expect(isItemActive("/plugins/emdash-forms/", "/plugins/emdash-forms-extra")).toBe(false);
+	});
+
+	it("keeps the admin root exact", () => {
+		expect(isItemActive("/", "/media")).toBe(false);
+		expect(isItemActive("/", "/")).toBe(true);
+	});
+});
+
+describe("NavIcon", () => {
+	it("uses Phosphor's filled variant while its navigation item is active", () => {
+		const inactiveIcon = renderToStaticMarkup(<NavIcon icon={SquaresFour} isActive={false} />);
+		const activeIcon = renderToStaticMarkup(<NavIcon icon={SquaresFour} isActive />);
+
+		expect(inactiveIcon).toBe(
+			renderToStaticMarkup(<SquaresFour weight="regular" aria-hidden="true" />),
+		);
+		expect(activeIcon).toBe(renderToStaticMarkup(<SquaresFour weight="fill" aria-hidden="true" />));
+		expect(activeIcon).not.toBe(inactiveIcon);
+	});
+});
+
+describe("BYLINE_SCHEMA_NAV_ITEM invariants", () => {
+	it("points to the /byline-schema route", () => {
+		expect(BYLINE_SCHEMA_NAV_ITEM.to).toBe("/byline-schema");
+		expect(BYLINE_SCHEMA_NAV_ITEM.icon).toBe(IdentificationCard);
+	});
+
+	it("gates on ROLE_ADMIN — editors and below must not see it", () => {
+		// If anyone drops this to ROLE_EDITOR (40), editors gain
+		// access to admin-only schema management via the sidebar.
+		// Keep this asserting the literal 50 (not the constant) so a
+		// rename like `ROLE_ADMIN = 40` would also fail the test.
+		expect(BYLINE_SCHEMA_NAV_ITEM.minRole).toBe(50);
+	});
+});
+
+describe("filterNavItemsByRole", () => {
+	const items = [
+		{ to: "/", minRole: undefined },
+		{ to: "/bylines", minRole: ROLE_EDITOR },
+		{ to: "/byline-schema", minRole: ROLE_ADMIN },
+	];
+
+	it("passes items without minRole at every role", () => {
+		for (const role of [ROLE_SUBSCRIBER, ROLE_CONTRIBUTOR, ROLE_AUTHOR, ROLE_EDITOR, ROLE_ADMIN]) {
+			expect(filterNavItemsByRole(items, role).map((i) => i.to)).toContain("/");
+		}
+	});
+
+	it("excludes /byline-schema for EDITOR", () => {
+		// Direct check of the AC: an Editor must not see the entry.
+		const visible = filterNavItemsByRole(items, ROLE_EDITOR).map((i) => i.to);
+		expect(visible).not.toContain("/byline-schema");
+	});
+
+	it("excludes /byline-schema for AUTHOR, CONTRIBUTOR, SUBSCRIBER", () => {
+		for (const role of [ROLE_SUBSCRIBER, ROLE_CONTRIBUTOR, ROLE_AUTHOR]) {
+			const visible = filterNavItemsByRole(items, role).map((i) => i.to);
+			expect(visible).not.toContain("/byline-schema");
+		}
+	});
+
+	it("includes /byline-schema for ADMIN", () => {
+		const visible = filterNavItemsByRole(items, ROLE_ADMIN).map((i) => i.to);
+		expect(visible).toContain("/byline-schema");
+	});
+
+	it("treats role=0 (unauthenticated / pre-fetch) as below every gate", () => {
+		// SidebarNav falls back to `userRole ?? 0` during the brief
+		// load window before `useCurrentUser` resolves. The filter
+		// must strip every gated entry at role=0.
+		const visible = filterNavItemsByRole(items, 0).map((i) => i.to);
+		expect(visible).toEqual(["/"]);
+	});
+});
+
+describe("parseFolderState", () => {
+	it("keeps only label → boolean pairs from the stored value", () => {
+		expect(parseFolderState('{"Calendar":false,"Club":true,"x":"yes","y":1}')).toEqual({
+			Calendar: false,
+			Club: true,
+		});
+	});
+
+	it("treats missing, malformed, or non-object storage as no choices", () => {
+		expect(parseFolderState(null)).toEqual({});
+		expect(parseFolderState("{oops")).toEqual({});
+		expect(parseFolderState("[true]")).toEqual({});
+		expect(parseFolderState("null")).toEqual({});
+	});
+});
+
+describe("visibleCollectionEntries", () => {
+	const collections = {
+		posts: { label: "Posts" },
+		contact_submissions: { label: "Contact Submissions", hidden: true },
+		lead_notes: { label: "Lead Notes", hidden: true },
+		pages: { label: "Pages", hidden: false },
+	};
+
+	it("drops collections flagged hidden", () => {
+		expect(visibleCollectionEntries(collections).map(([slug]) => slug)).toEqual(["posts", "pages"]);
+	});
+
+	it("keeps manifest order for visible collections", () => {
+		expect(visibleCollectionEntries({ b: { label: "B" }, a: { label: "A" } })).toEqual([
+			["b", { label: "B" }],
+			["a", { label: "A" }],
+		]);
+	});
+
+	it("treats a missing hidden flag as visible", () => {
+		expect(visibleCollectionEntries({ posts: { label: "Posts" } })).toHaveLength(1);
+	});
+});
+
+describe("resolvePluginPageLabel", () => {
+	// Simulates a plugin that loaded its Lingui catalog into the shared i18n
+	// instance: known msgids translate, unknown ones return the msgid itself
+	// (exactly i18n._'s fallback behavior).
+	const translate = (id: string) => (id === "Orders" ? "Bestellungen" : id);
+
+	it("translates a declared label through the shared i18n instance", () => {
+		expect(resolvePluginPageLabel("Orders", "my-shop", translate)).toBe("Bestellungen");
+	});
+
+	it("falls back to the literal label when no catalog entry exists", () => {
+		// Plugins without a Lingui catalog must render exactly what they
+		// declared — the identity lookup keeps this fully backwards compatible.
+		expect(resolvePluginPageLabel("Products", "my-shop", translate)).toBe("Products");
+	});
+
+	it("prettifies the plugin id when no label is declared (untranslated)", () => {
+		// The fallback is derived from the package id, not author-provided
+		// English — never run it through the catalog.
+		expect(resolvePluginPageLabel(undefined, "my-shop", translate)).toBe("My Shop");
+		expect(resolvePluginPageLabel(undefined, "orders", translate)).toBe("Orders");
+	});
+});
+
+describe("declaredLabelTranslator", () => {
+	it("translates a label the active catalog has", () => {
+		const i18n = setupI18n({ locale: "de", messages: { de: { Orders: "Bestellungen" } } });
+		const translate = declaredLabelTranslator(i18n, (id) => i18n._(id));
+		expect(translate("Orders")).toBe("Bestellungen");
+	});
+
+	it("returns a label the catalog lacks as declared, without a missing-message warning", () => {
+		const i18n = setupI18n({ locale: "en", messages: { en: {} } });
+		// A production build has no message compiler; that is where Lingui warns.
+		i18n.setMessagesCompiler(undefined as never);
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const translate = declaredLabelTranslator(i18n, (id) => i18n._(id));
+			expect(translate("Fuzzy Redirects")).toBe("Fuzzy Redirects");
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+});
+
+describe("toPhosphorIconName", () => {
+	it("converts kebab/snake/space names to PascalCase (the lazy-path key)", () => {
+		// Any Phosphor icon is reachable by its own kebab name.
+		expect(toPhosphorIconName("chart-bar")).toBe("ChartBar");
+		expect(toPhosphorIconName("clock-counter-clockwise")).toBe("ClockCounterClockwise");
+		expect(toPhosphorIconName("magnifying-glass")).toBe("MagnifyingGlass");
+		expect(toPhosphorIconName("heart")).toBe("Heart");
+	});
+});
+
+describe("resolveNavIcon", () => {
+	it("falls back to Plug when no icon is provided", () => {
+		// `icon` is optional on adminPages; an omitted value is the
+		// common case and must resolve synchronously to the default
+		// (no Suspense boundary needed for the icon-less page).
+		expect(resolveNavIcon(undefined)).toBe(Plug);
+		expect(resolveNavIcon("")).toBe(Plug);
+	});
+
+	it("resolves common/documented names synchronously from the static map", () => {
+		// These ship in the main bundle and must NOT be lazy — the
+		// everyday case never loads the full Phosphor set. Includes a
+		// lucide-style alias (`settings` → Gear) and a Phosphor-named one.
+		expect(resolveNavIcon("settings")).toBe(Gear);
+		expect(resolveNavIcon("trophy")).toBe(Trophy);
+		expect(resolveNavIcon("history")).toBe(ClockCounterClockwise);
+	});
+
+	it("returns a stable (memoized) lazy component for a name outside the map", () => {
+		// `heart` isn't in the static map, so it takes the lazy path.
+		// React.lazy identity must be stable across renders, otherwise the
+		// icon remounts and re-suspends — repeated calls return the same ref.
+		const first = resolveNavIcon("heart");
+		const second = resolveNavIcon("heart");
+		expect(first).toBe(second);
+		expect(first).not.toBe(Plug);
+		expect((first as { $$typeof?: symbol }).$$typeof).toBe(Symbol.for("react.lazy"));
+	});
+
+	it("renders the Plug fallback for a name that doesn't exist in Phosphor", async () => {
+		// The lazy path resolves an unknown icon name to Plug. Drive
+		// it through a real render (not the Kumo Sidebar — just the icon) and
+		// confirm the rendered glyph IS Plug by comparing the SVG body
+		// against a directly-rendered reference.
+		const Unknown = resolveNavIcon("definitely-not-a-real-icon-xyz");
+		const screen = await render(
+			<React.Suspense fallback={<span>loading</span>}>
+				<Unknown data-testid="resolved" />
+				<Plug data-testid="expected" />
+			</React.Suspense>,
+		);
+		const resolved = screen.getByTestId("resolved");
+		await expect.element(resolved).toBeInTheDocument();
+		expect(resolved.element().innerHTML).toBe(screen.getByTestId("expected").element().innerHTML);
+	});
+});
+
+describe("resolvePluginWidgetTitle", () => {
+	// Mirrors the page-label test: plugins load catalogs into the shared i18n
+	// instance and dashboard widget titles must resolve the same way.
+	const translate = (id: string) => (id === "Forms" ? "Formularze" : id);
+
+	it("translates a declared title through the shared i18n instance", () => {
+		expect(resolvePluginWidgetTitle("Forms", "overview", translate)).toBe("Formularze");
+	});
+
+	it("falls back to the literal title when no catalog entry exists", () => {
+		expect(resolvePluginWidgetTitle("Orders", "overview", translate)).toBe("Orders");
+	});
+
+	it("falls back to the raw widget id when no title is declared", () => {
+		expect(resolvePluginWidgetTitle(undefined, "overview", translate)).toBe("overview");
+	});
+
+	it("returns an untranslated title as declared, without a missing-message warning, through the dashboard's translator", () => {
+		const i18n = setupI18n({ locale: "en", messages: { en: {} } });
+		i18n.setMessagesCompiler(undefined as never);
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const dashboardTranslate = declaredLabelTranslator(i18n, (id) => i18n._(id));
+			expect(resolvePluginWidgetTitle("Orders", "overview", dashboardTranslate)).toBe("Orders");
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+});
+
+describe("buildNavGroups", () => {
+	const i18n = setupI18n({ locale: "en", messages: { en: {} } });
+	type Manifest = NavBuildInput["manifest"];
+
+	function build({
+		manifest,
+		...input
+	}: Partial<Omit<NavBuildInput, "manifest">> & { manifest?: Partial<Manifest> }) {
+		return buildNavGroups({
+			manifest: { collections: {}, plugins: {}, taxonomies: [], ...manifest },
+			pluginAdmins: {},
+			role: ROLE_ADMIN,
+			i18n,
+			translate: i18n._.bind(i18n),
+			...input,
+		});
+	}
+
+	function group(groups: NavGroup[], key: NavGroup["key"]) {
+		return groups.find((candidate) => candidate.key === key);
+	}
+
+	function itemIds(navGroup: NavGroup | undefined) {
+		return navGroup?.entries.flatMap((entry) =>
+			entry.kind === "item" ? [entry.item.id] : entry.items.map((item) => item.id),
+		);
+	}
+
+	const posts = { posts: { label: "Posts" } };
+
+	it("gives a taxonomy link that carries the route locale an ID without it", () => {
+		const groups = build({
+			manifest: { collections: posts, taxonomies: [{ name: "genre", label: "Genres" }] },
+			routeLocale: "de",
+		});
+		const genre = group(groups, "manage")?.entries.find(
+			(entry) => entry.kind === "item" && entry.item.label === "Genres",
+		);
+		expect(genre?.kind === "item" && resolveItemPath(genre.item)).toBe(
+			"/taxonomies/genre?locale=de",
+		);
+		expect(genre?.kind === "item" && genre.item.id).toBe("/taxonomies/genre");
+	});
+
+	it("gives a root plugin page an ID without the trailing slash", () => {
+		const groups = build({
+			manifest: {
+				plugins: { forms: { adminMode: "blocks", adminPages: [{ path: "/", label: "Forms" }] } },
+			},
+		});
+		expect(itemIds(group(groups, "plugins"))).toEqual(["/plugins/forms"]);
+	});
+
+	it("forms content folders with members in collection, taxonomy, plugin page order", () => {
+		const groups = build({
+			manifest: {
+				collections: { posts: { label: "Posts", group: "Blog" }, pages: { label: "Pages" } },
+				taxonomies: [{ name: "tag", label: "Tags", collections: ["posts"] }],
+				plugins: {
+					digest: {
+						adminMode: "blocks",
+						adminPages: [{ path: "/digest", label: "Digest", group: "Blog" }],
+					},
+				},
+			},
+		});
+		const content = group(groups, "content");
+		expect(content?.entries.map((entry) => entry.kind)).toEqual(["folder", "item", "item"]);
+		const folder = content?.entries[0];
+		expect(folder?.kind === "folder" && folder.label).toBe("Blog");
+		expect(folder?.kind === "folder" && folder.items.map((item) => item.id)).toEqual([
+			"/content/posts",
+			"/taxonomies/tag",
+			"/plugins/digest/digest",
+		]);
+		expect(itemIds(content)).toEqual([
+			"/content/posts",
+			"/taxonomies/tag",
+			"/plugins/digest/digest",
+			"/content/pages",
+			"/media",
+		]);
+	});
+
+	it("puts Dashboard and Calendar in the top group, Calendar behind its role and hiddenNavItems", () => {
+		expect(itemIds(group(build({ role: ROLE_SUBSCRIBER }), "top"))).toEqual(["/"]);
+		expect(itemIds(group(build({ role: ROLE_CONTRIBUTOR }), "top"))).toEqual(["/", "/calendar"]);
+		expect(
+			itemIds(group(build({ manifest: { admin: { hiddenNavItems: ["calendar"] } } }), "top")),
+		).toEqual(["/"]);
+	});
+
+	it("has no content group, Media included, without a visible collection", () => {
+		const hiddenOnly = build({
+			manifest: { collections: { notes: { label: "Notes", hidden: true } } },
+		});
+		expect(hiddenOnly.map((navGroup) => navGroup.key)).toEqual(["top", "manage", "admin"]);
+		expect(hiddenOnly.flatMap(itemIds)).not.toContain("/media");
+
+		const withPosts = build({ manifest: { collections: posts } });
+		expect(withPosts.map((navGroup) => navGroup.key)).toEqual([
+			"top",
+			"content",
+			"manage",
+			"admin",
+		]);
+		expect(group(withPosts, "content")?.label).toBe("Content");
+		expect(group(withPosts, "top")?.label).toBeNull();
+	});
+
+	it("keeps only the first of two entries that share an ID", () => {
+		const groups = build({
+			manifest: {
+				registry: { aggregatorUrl: "https://registry.example" },
+				plugins: {
+					registry: { adminMode: "blocks", adminPages: [{ path: "/", label: "Shadow" }] },
+					shop: {
+						adminMode: "blocks",
+						adminPages: [
+							{ path: "/orders", label: "Orders" },
+							{ path: "/orders/", label: "Orders again" },
+						],
+					},
+				},
+			},
+		});
+		const labels = groups.flatMap((navGroup) =>
+			navGroup.entries.flatMap((entry) => (entry.kind === "item" ? [entry.item.label] : [])),
+		);
+		expect(labels).toContain("Registry");
+		expect(labels).not.toContain("Shadow");
+		expect(itemIds(group(groups, "plugins"))).toEqual(["/plugins/shop/orders"]);
+		expect(labels).not.toContain("Orders again");
+	});
+});

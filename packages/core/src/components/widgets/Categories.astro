@@ -1,0 +1,40 @@
+---
+/**
+ * Categories widget component
+ * Displays a list of categories with optional post counts
+ */
+import { localePathPrefix } from "../../i18n/resolve.js";
+import { getTaxonomyTerms } from "../../taxonomies/index.js";
+
+interface Props {
+	showCount?: boolean;
+	hierarchical?: boolean;
+}
+
+const { showCount = true, hierarchical = true } = Astro.props;
+
+const locale = Astro.currentLocale;
+const categories = await getTaxonomyTerms("category", { includeCounts: showCount, locale });
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const localePrefix = await localePathPrefix(locale);
+
+---
+
+<ul class="widget-categories">
+	{
+		categories.length > 0 ? (
+			categories.map((category) => (
+				<li>
+					<a href={`${base}${localePrefix}/category/${category.slug}`} class="widget-categories__link">
+						{category.label}
+					</a>
+					{showCount && category.count !== undefined && (
+						<span class="widget-categories__count">({category.count})</span>
+					)}
+				</li>
+			))
+		) : (
+			<li class="widget-categories__empty">No categories yet</li>
+		)
+	}
+</ul>

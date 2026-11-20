@@ -1,0 +1,16 @@
+{
+	"useTabs": true,
+	"experimentalSortImports": {},
+	"ignorePatterns": [
+		"**/dist/**",
+		"**/node_modules/**",
+		"**/*.mdx",
+		"**/CHANGELOG.md",
+		"packages/*/changelog/*.md",
+		"**/package.json",
+		"**/emdash-env.d.ts",
+		"**/worker-configuration.d.ts",
+		"packages/registry-lexicons/src/generated/**",
+		"packages/plugin-cli/schemas/**"
+	]
+}

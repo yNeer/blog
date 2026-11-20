@@ -1,0 +1,915 @@
+/**
+ * WordPress WXR execute import endpoint
+ *
+ * POST /_emdash/api/import/wordpress/execute
+ *
+ * Accepts WXR file and import configuration, imports content into the database.
+ */
+
+import { gutenbergToPortableText } from "@emdash-cms/gutenberg-to-portable-text";
+import type { APIRoute } from "astro";
+import {
+	parseWxrString,
+	ContentRepository,
+	importReusableBlocksAsSections,
+	type WxrPost,
+	parseWxrDate,
+} from "emdash";
+
+import { requirePerm } from "#api/authorize.js";
+import { apiError, apiSuccess, handleError } from "#api/error.js";
+import { wxrChunkCursor, wxrChunkState, wxrImportConfig } from "#api/schemas.js";
+import { BylineRepository } from "#db/repositories/byline.js";
+import { importMenusFromWxr, type WxrMenuArchive, type WxrMenuTarget } from "#import/menus.js";
+import { relativizeContentLinks, resolveImportByline } from "#import/utils.js";
+import {
+	attachPostTaxonomies,
+	isWxrTaxonomyConflictError,
+	loadTaxonomyPlanFromDb,
+	mirrorTermsToLocales,
+	preImportWxrTaxonomies,
+	setPostTermAssignmentsReplacing,
+	type TaxonomyImportPlan,
+} from "#import/wxr-taxonomies.js";
+import type { EmDashHandlers, EmDashManifest } from "#types";
+import { slugify } from "#utils/slugify.js";
+
+import { resolveContentCreateLocale } from "../../../../../i18n/config.js";
+import { sanitizeSlug } from "./analyze.js";
+
+export const prerender = false;
+
+/** Posts processed per Worker invocation in chunked WXR imports. */
+const WXR_CONTENT_CHUNK_SIZE = 30;
+
+/** Phase/cursor payload for chunked WXR imports. */
+interface WxrChunkCursor {
+	offset: number;
+	source: string;
+	taxonomiesReady: true;
+}
+
+/** Cross-chunk state carried by the client. */
+interface WxrChunkState {
+	translationGroups: Record<string, string>;
+	bylines?: Record<string, string>;
+}
+
+/** Chunked response shape mirrors the wordpress-plugin execute endpoint. */
+interface WxrChunkResponse {
+	success: boolean;
+	result: ImportResult;
+	done: boolean;
+	cursor?: WxrChunkCursor;
+	chunk?: WxrChunkState;
+}
+
+export interface ImportConfig {
+	/** Map WordPress post types to EmDash collections */
+	postTypeMappings: Record<
+		string,
+		{
+			collection: string;
+			enabled: boolean;
+		}
+	>;
+	/** Whether to skip items that already exist (by slug) */
+	skipExisting: boolean;
+	/** Whether to import reusable blocks (wp_block) as sections */
+	importSections?: boolean;
+	/** Author mappings (WP author login -> EmDash user ID) */
+	authorMappings?: Record<string, string | null>;
+	/** BCP 47 locale for all imported items. When omitted, defaults to defaultLocale. */
+	locale?: string;
+	/** Whether to import the export's menus. Defaults to true. */
+	importMenus?: boolean;
+}
+
+export interface ImportResult {
+	success: boolean;
+	imported: number;
+	/** Entries not imported because the slug already exists in the collection and locale. */
+	skipped: number;
+	errors: Array<{ title: string; error: string }>;
+	byCollection: Record<string, number>;
+	/** Entries imported as drafts because they had a password in WordPress */
+	passwordProtected?: Array<{ id: string; collection: string; title: string }>;
+	/** Sections import results (if enabled) */
+	sections?: {
+		created: number;
+		skipped: number;
+	};
+	/** Menu import results (if the export has menus) */
+	menus?: {
+		created: number;
+		items: number;
+		/** Menus left as they were because the site has one with the same name in that locale */
+		skipped: number;
+		/** Items left out because what they link to wasn't imported */
+		itemsSkipped: number;
+	};
+	/** Taxonomy import results (categories, tags, custom taxonomies). */
+	taxonomies?: {
+		/** Terms newly created during this import, keyed by taxonomy name. */
+		termsCreated: Record<string, number>;
+		/** Existing terms that were re-used, keyed by taxonomy name. */
+		termsReused: Record<string, number>;
+		/** Total pivot rows (post <-> term) written to `content_taxonomies`. */
+		assignments: number;
+		/**
+		 * Custom taxonomy names from the WXR file that had no matching EmDash
+		 * definition and were therefore skipped. Lets the admin UI surface a
+		 * "create taxonomy X first" hint without re-running the import.
+		 */
+		missingTaxonomies: string[];
+	};
+}
+
+export const POST: APIRoute = async ({ request, locals }) => {
+	const { emdash, user } = locals;
+
+	const denied = requirePerm(user, "import:execute");
+	if (denied) return denied;
+
+	if (!emdash?.handleContentCreate) {
+		return apiError("NOT_CONFIGURED", "EmDash not configured", 500);
+	}
+
+	try {
+		const emdashManifest = await emdash.getManifest();
+
+		const formData = await request.formData();
+		const fileEntry = formData.get("file");
+		const file = fileEntry instanceof File ? fileEntry : null;
+		const configEntry = formData.get("config");
+		const configJson = typeof configEntry === "string" ? configEntry : null;
+
+		if (!file) {
+			return apiError("VALIDATION_ERROR", "No file provided", 400);
+		}
+
+		if (!configJson) {
+			return apiError("VALIDATION_ERROR", "No config provided", 400);
+		}
+
+		const parsedConfig = parseJsonField(configJson, "config");
+		if ("response" in parsedConfig) return parsedConfig.response;
+		const configResult = wxrImportConfig.safeParse(parsedConfig.value);
+		if (!configResult.success) {
+			return apiError("VALIDATION_ERROR", "Invalid import config", 400);
+		}
+		const config: ImportConfig = configResult.data;
+
+		const phaseEntry = formData.get("phase");
+		if (
+			phaseEntry !== null &&
+			phaseEntry !== "taxonomy" &&
+			phaseEntry !== "content" &&
+			phaseEntry !== "finalize"
+		) {
+			return apiError("VALIDATION_ERROR", "Invalid import phase", 400);
+		}
+		const phase = phaseEntry;
+
+		const cursorEntry = formData.get("cursor");
+		let cursor: WxrChunkCursor | undefined;
+		if (typeof cursorEntry === "string" && cursorEntry.length > 0) {
+			const parsedCursor = parseJsonField(cursorEntry, "cursor");
+			if ("response" in parsedCursor) return parsedCursor.response;
+			const cursorResult = wxrChunkCursor.safeParse(parsedCursor.value);
+			if (!cursorResult.success) {
+				return apiError("VALIDATION_ERROR", "Invalid import cursor", 400);
+			}
+			cursor = cursorResult.data;
+		}
+
+		const chunkEntry = formData.get("chunk");
+		let incomingChunk: WxrChunkState | undefined;
+		if (typeof chunkEntry === "string" && chunkEntry.length > 0) {
+			const parsedChunk = parseJsonField(chunkEntry, "chunk");
+			if ("response" in parsedChunk) return parsedChunk.response;
+			const chunkResult = wxrChunkState.safeParse(parsedChunk.value);
+			if (!chunkResult.success) {
+				return apiError("VALIDATION_ERROR", "Invalid import chunk state", 400);
+			}
+			incomingChunk = chunkResult.data;
+		}
+
+		// Parse WXR
+		const text = await file.text();
+		const wxr = await parseWxrString(text);
+		const source = await importFingerprint(text, configJson);
+
+		if (cursor && cursor.source !== source) {
+			return apiError(
+				"WXR_IMPORT_SOURCE_CHANGED",
+				"The WXR file or import configuration changed after this import started",
+				409,
+			);
+		}
+
+		// Build attachment ID -> URL map for featured images
+		const attachmentMap = new Map<string, string>();
+		for (const att of wxr.attachments) {
+			if (att.id && att.url) {
+				attachmentMap.set(String(att.id), att.url);
+			}
+		}
+
+		// Build author login -> display name map
+		const authorDisplayNames = new Map<string, string>();
+		for (const author of wxr.authors) {
+			if (!author.login) continue;
+			authorDisplayNames.set(author.login, author.displayName || author.login);
+		}
+
+		if (phase === "content") {
+			if (!cursor?.taxonomiesReady) {
+				return apiError("VALIDATION_ERROR", "Taxonomy preparation is not complete", 400);
+			}
+			const chunkResponse = await runContentChunk(
+				wxr,
+				config,
+				emdash,
+				emdashManifest,
+				attachmentMap,
+				authorDisplayNames,
+				cursor,
+				incomingChunk,
+				source,
+			);
+			if (chunkResponse instanceof Response) return chunkResponse;
+			return apiSuccess(chunkResponse);
+		}
+
+		if (phase === "taxonomy") {
+			if (cursor || incomingChunk) {
+				return apiError("VALIDATION_ERROR", "Taxonomy preparation cannot be resumed", 400);
+			}
+			let taxonomyPlan: TaxonomyImportPlan;
+			try {
+				taxonomyPlan = await prepareTaxonomies(wxr, emdash, config.locale);
+			} catch (error) {
+				if (isWxrTaxonomyConflictError(error)) {
+					console.error("[WXR_IMPORT_TAXONOMY_CONFLICT]", error);
+					return apiError("WXR_IMPORT_TAXONOMY_CONFLICT", error.publicMessage, 409);
+				}
+				throw error;
+			}
+			const result = emptyImportResult();
+			result.taxonomies = {
+				termsCreated: taxonomyPlan.termsCreated,
+				termsReused: taxonomyPlan.termsReused,
+				assignments: 0,
+				missingTaxonomies: taxonomyPlan.missingTaxonomies,
+			};
+			return apiSuccess({
+				success: true,
+				result,
+				done: true,
+				cursor: { offset: 0, source, taxonomiesReady: true as const },
+				chunk: { translationGroups: {} },
+			});
+		}
+
+		if (phase === "finalize") {
+			if (!cursor || cursor.offset !== wxr.posts.length) {
+				return apiError("VALIDATION_ERROR", "Content import is not complete", 400);
+			}
+			const result = emptyImportResult();
+			if (config.importSections !== false) {
+				const sectionsResult = await importReusableBlocksAsSections(wxr.posts, emdash.db);
+				result.sections = {
+					created: sectionsResult.sectionsCreated,
+					skipped: sectionsResult.sectionsSkipped,
+				};
+				result.errors.push(...sectionsResult.errors);
+				result.success = result.errors.length === 0;
+			}
+			await importWxrMenus(wxr, config, emdash.db, emdashManifest, result);
+			return apiSuccess({ success: result.success, result, done: true });
+		}
+
+		if (wxr.posts.length > WXR_CONTENT_CHUNK_SIZE) {
+			return apiError(
+				"WXR_IMPORT_TOO_LARGE",
+				`This WXR contains ${wxr.posts.length} posts, which exceeds the ${WXR_CONTENT_CHUNK_SIZE}-post limit for a single import request. ` +
+					`Run the import in chunked mode or split the file into smaller exports.`,
+				413,
+			);
+		}
+
+		// Pre-create taxonomy terms (categories, tags, custom taxonomies) so
+		// per-post assignments can resolve to existing rows. Done before any
+		// content insert because WXR exports list terms at the top of the
+		// file but per-item assignments only reference them by slug.
+		const taxonomyPlan = await preImportWxrTaxonomies(
+			emdash.db,
+			wxr.posts,
+			wxr.categories,
+			wxr.tags,
+			wxr.terms,
+			config.locale,
+		);
+
+		// Multilingual imports (WPML / Polylang -- see #1080) need a term
+		// row at each per-post locale, all sharing the canonical term's
+		// `translation_group`. Without this, `getTermsForEntry(..., locale)`
+		// on non-canonical translations comes back empty.
+		//
+		// The mirror raises `WxrTaxonomyConflictError` with an operator-
+		// actionable message when an existing locale row has an
+		// incompatible group. Surface its `publicMessage` directly so the
+		// admin UI can tell the user which (taxonomy, slug, locale) needs
+		// reconciliation. Other errors (DB connectivity, unexpected
+		// repository failures) re-throw to the outer catch where
+		// `handleError` masks them with the generic "Failed to import
+		// content" -- exposing raw DB errors to clients would leak schema
+		// names and bypass the AGENTS.md "never expose error.message" rule.
+		const postLocales = new Set<string>();
+		for (const post of wxr.posts) {
+			if (post.locale) postLocales.add(post.locale);
+		}
+		if (postLocales.size > 0) {
+			try {
+				await mirrorTermsToLocales(emdash.db, taxonomyPlan, postLocales, config.locale);
+			} catch (mirrorError) {
+				if (isWxrTaxonomyConflictError(mirrorError)) {
+					console.error("[WXR_IMPORT_TAXONOMY_CONFLICT]", mirrorError);
+					return apiError("WXR_IMPORT_TAXONOMY_CONFLICT", mirrorError.publicMessage, 409);
+				}
+				throw mirrorError;
+			}
+		}
+
+		// Import content (locale from config scopes all items)
+		const result = await importContent(
+			wxr.posts,
+			config,
+			emdash,
+			emdashManifest,
+			attachmentMap,
+			config.locale,
+			authorDisplayNames,
+			taxonomyPlan,
+			new Map(),
+			wxr.site.link,
+		);
+
+		// Import reusable blocks as sections (if enabled)
+		if (config.importSections !== false) {
+			const sectionsResult = await importReusableBlocksAsSections(wxr.posts, emdash.db);
+			result.sections = {
+				created: sectionsResult.sectionsCreated,
+				skipped: sectionsResult.sectionsSkipped,
+			};
+			// Add section errors to main errors array
+			result.errors.push(...sectionsResult.errors);
+			if (sectionsResult.errors.length > 0) {
+				result.success = false;
+			}
+		}
+
+		await importWxrMenus(wxr, config, emdash.db, emdashManifest, result);
+
+		return apiSuccess(result);
+	} catch (error) {
+		return handleError(error, "Failed to import content", "WXR_IMPORT_ERROR");
+	}
+};
+
+function parseJsonField(
+	value: string,
+	fieldName: string,
+): { value: unknown } | { response: Response } {
+	try {
+		return { value: JSON.parse(value) };
+	} catch {
+		return { response: apiError("VALIDATION_ERROR", `Invalid JSON in ${fieldName}`, 400) };
+	}
+}
+
+async function importFingerprint(text: string, configJson: string): Promise<string> {
+	const bytes = new TextEncoder().encode(`${configJson}\u0000${text}`);
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function emptyImportResult(): ImportResult {
+	return {
+		success: true,
+		imported: 0,
+		skipped: 0,
+		errors: [],
+		byCollection: {},
+	};
+}
+
+/** Import a bounded WXR post chunk using taxonomy rows prepared in the prior phase. */
+async function runContentChunk(
+	wxr: Awaited<ReturnType<typeof parseWxrString>>,
+	config: ImportConfig,
+	emdash: EmDashHandlers,
+	manifest: EmDashManifest,
+	attachmentMap: Map<string, string>,
+	authorDisplayNames: Map<string, string>,
+	cursor: WxrChunkCursor | undefined,
+	incomingChunk: WxrChunkState | undefined,
+	source: string,
+): Promise<WxrChunkResponse | Response> {
+	const offset = cursor?.offset ?? 0;
+	if (offset > wxr.posts.length || (offset > 0 && offset % WXR_CONTENT_CHUNK_SIZE !== 0)) {
+		return apiError("VALIDATION_ERROR", "Invalid import cursor offset", 400);
+	}
+	const posts = wxr.posts.slice(offset, offset + WXR_CONTENT_CHUNK_SIZE);
+	const taxonomyPlan = await loadTaxonomyPlanFromDb(emdash.db);
+
+	// Seed translation-group state from earlier chunks so a translation that
+	// appears on chunk N can link to its sibling imported on chunk N-1.
+	const translationGroupMap = new Map<string, string>(
+		Object.entries(incomingChunk?.translationGroups ?? {}),
+	);
+	// Likewise for bylines: an author without a user mapping is matched only
+	// through this map, so a fresh one per chunk gives them a new byline each time.
+	const bylineCache = new Map<string, string>(Object.entries(incomingChunk?.bylines ?? {}));
+
+	const result = await importContent(
+		posts,
+		config,
+		emdash,
+		manifest,
+		attachmentMap,
+		config.locale,
+		authorDisplayNames,
+		taxonomyPlan,
+		translationGroupMap,
+		wxr.site.link,
+		bylineCache,
+	);
+
+	const nextOffset = offset + posts.length;
+	const done = nextOffset >= wxr.posts.length;
+
+	return {
+		success: result.errors.length === 0,
+		result,
+		done,
+		cursor: { offset: nextOffset, source, taxonomiesReady: true },
+		chunk: {
+			translationGroups: Object.fromEntries(translationGroupMap),
+			bylines: Object.fromEntries(bylineCache),
+		},
+	};
+}
+
+async function prepareTaxonomies(
+	wxr: Awaited<ReturnType<typeof parseWxrString>>,
+	emdash: EmDashHandlers,
+	locale: string | undefined,
+): Promise<TaxonomyImportPlan> {
+	const taxonomyPlan = await preImportWxrTaxonomies(
+		emdash.db,
+		wxr.posts,
+		wxr.categories,
+		wxr.tags,
+		wxr.terms,
+		locale,
+	);
+	const postLocales = new Set<string>();
+	for (const post of wxr.posts) {
+		if (post.locale) postLocales.add(post.locale);
+	}
+	if (postLocales.size > 0) {
+		await mirrorTermsToLocales(emdash.db, taxonomyPlan, postLocales, locale);
+	}
+	return taxonomyPlan;
+}
+
+export async function importContent(
+	posts: WxrPost[],
+	config: ImportConfig,
+	emdash: EmDashHandlers,
+	manifest: EmDashManifest,
+	attachmentMap: Map<string, string>,
+	locale: string | undefined,
+	authorDisplayNames: Map<string, string> | undefined,
+	taxonomyPlan: TaxonomyImportPlan,
+	translationGroupMap = new Map<string, string>(),
+	siteUrl = "",
+	bylineCache = new Map<string, string>(),
+): Promise<ImportResult> {
+	const result: ImportResult = {
+		success: true,
+		imported: 0,
+		skipped: 0,
+		errors: [],
+		byCollection: {},
+		taxonomies: {
+			termsCreated: taxonomyPlan.termsCreated,
+			termsReused: taxonomyPlan.termsReused,
+			assignments: 0,
+			missingTaxonomies: taxonomyPlan.missingTaxonomies,
+		},
+	};
+
+	// Create content repository for checking existing items
+	const contentRepo = new ContentRepository(emdash.db);
+	const bylineRepo = new BylineRepository(emdash.db);
+
+	for (const post of posts) {
+		const postType = post.postType || "post";
+		const mapping = config.postTypeMappings[postType];
+
+		// Not part of the import: internal post types, or ones left disabled.
+		if (!mapping || !mapping.enabled) {
+			continue;
+		}
+
+		// Defensive: mapping.collection is already sanitized by prepare, but the user
+		// could manually edit the import config between prepare and execute.
+		const collection = sanitizeSlug(mapping.collection);
+
+		// Check if collection exists in manifest
+		if (!manifest?.collections[collection]) {
+			result.errors.push({
+				title: post.title || "Untitled",
+				error: `Collection "${collection}" does not exist`,
+			});
+			continue;
+		}
+
+		try {
+			// Convert content to Portable Text
+			const content = post.content ? gutenbergToPortableText(post.content) : [];
+			if (siteUrl) relativizeContentLinks(content, siteUrl);
+
+			const slug = wxrPostSlug(post);
+
+			// Per-post locale: prefer the value extracted from WPML/Polylang
+			// metadata; fall back to the upload-wide locale. Two translations
+			// sharing `post_name` (e.g. /en/hello + /ar/hello) collide on the
+			// `UNIQUE(slug, locale)` constraint when they share a locale, so
+			// honouring the per-post value is what makes multilingual imports
+			// land correctly. See issue #1080.
+			const postLocale = post.locale ?? locale;
+
+			// Check if already exists (idempotency). Match against the
+			// per-post locale so the same slug in different locales doesn't
+			// false-positive as duplicate.
+			if (config.skipExisting) {
+				const existing = await contentRepo.findBySlug(collection, slug, postLocale);
+				if (existing) {
+					// Record the translation group mapping so later
+					// translations in this WXR can link to the existing
+					// item. We deliberately trust the WXR's grouping over
+					// the existing row's `translation_group`: a singleton
+					// existing row gets folded into the WXR's group when
+					// `handleContentCreate` resolves the new translation's
+					// `translationOf`. Pre-existing translations that
+					// already belong to a different group are left alone --
+					// the user is responsible for reconciling those through
+					// the admin if they don't match the WXR.
+					if (post.translationGroup) {
+						translationGroupMap.set(post.translationGroup, existing.id);
+					}
+					result.skipped++;
+					continue;
+				}
+			}
+
+			// Resolve translation group: if this post belongs to a group and
+			// we've already imported one of its translations, link to it.
+			let translationOf: string | undefined;
+			if (post.translationGroup) {
+				translationOf = translationGroupMap.get(post.translationGroup);
+			}
+
+			const passwordProtected = Boolean(post.postPassword);
+			const status = passwordProtected ? "draft" : mapStatus(post.status);
+
+			// Build data object with required fields
+			const data: Record<string, unknown> = {
+				title: post.title || "Untitled",
+				content,
+				excerpt: post.excerpt || undefined,
+			};
+
+			// Only add featured_image if the collection has this field and we have a value
+			const collectionSchema = manifest.collections[collection];
+			const hasFeaturedImageField = collectionSchema?.fields
+				? "featured_image" in collectionSchema.fields
+				: false;
+			if (hasFeaturedImageField) {
+				const thumbnailId = post.meta.get("_thumbnail_id");
+				const featuredImage = thumbnailId ? attachmentMap.get(String(thumbnailId)) : undefined;
+				if (featuredImage) {
+					data.featured_image = featuredImage;
+				}
+			}
+
+			// Resolve author ID from mappings
+			let authorId: string | undefined;
+			if (config.authorMappings && post.creator) {
+				const mappedUserId = config.authorMappings[post.creator];
+				if (mappedUserId !== undefined && mappedUserId !== null) {
+					authorId = mappedUserId;
+				}
+			}
+
+			const bylineId = await resolveImportByline(
+				post.creator,
+				authorDisplayNames?.get(post.creator ?? "") ?? post.creator,
+				authorId,
+				bylineRepo,
+				bylineCache,
+			);
+
+			// Preserve original WordPress dates using the shared WXR date parser.
+			// Fallback chain: postDateGmt (UTC) → pubDate (RFC 2822) → postDate (site-local).
+			const parsedDate = parseWxrDate(post.postDateGmt, post.pubDate, post.postDate);
+			const createdAt = parsedDate ? parsedDate.toISOString() : undefined;
+			const futureDated =
+				post.status === "future" && createdAt !== undefined && Date.parse(createdAt) > Date.now();
+			const scheduledAt = futureDated && !passwordProtected ? createdAt : undefined;
+
+			// Create the content item
+			const createResult = await emdash.handleContentCreate(collection, {
+				data,
+				slug,
+				status,
+				authorId,
+				bylines: bylineId ? [{ bylineId }] : undefined,
+				locale: postLocale,
+				translationOf,
+				createdAt,
+				// Future-dated posts get their publication date when they are published.
+				publishedAt: futureDated ? undefined : createdAt,
+			});
+
+			if (createResult.success) {
+				result.imported++;
+				result.byCollection[collection] = (result.byCollection[collection] || 0) + 1;
+
+				// `handleContentCreate` returns `data: { item, _rev? }` on
+				// success (see `ApiResult<ContentResponse>` in
+				// `api/handlers/content.ts`). `HandlerResponse.data` is
+				// typed as `unknown` to avoid coupling the route surface to
+				// internal handler types, so we narrow here.
+				// eslint-disable-next-line typescript/no-unsafe-type-assertion -- handler contract documented at handleContentCreate
+				const createdItem = (createResult.data as { item: { id: string } } | undefined)?.item;
+
+				// Track translation group: the first imported post in a group
+				// becomes the anchor that later translations link to.
+				if (
+					createdItem &&
+					post.translationGroup &&
+					!translationGroupMap.has(post.translationGroup)
+				) {
+					translationGroupMap.set(post.translationGroup, createdItem.id);
+				}
+
+				if (createdItem && passwordProtected) {
+					(result.passwordProtected ??= []).push({
+						id: createdItem.id,
+						collection,
+						title: post.title || "Untitled",
+					});
+				}
+
+				// Attach taxonomy assignments parsed from the WXR's per-item
+				// <category> elements.
+				//
+				// Anchors (no `translationOf`) get an additive attach -- the
+				// row is fresh, no inherited pivots to consider.
+				//
+				// Translations replace only taxonomies they explicitly carry.
+				// Since assignments belong to the content translation_group,
+				// that replacement is reflected in every sibling locale.
+				if (createdItem) {
+					try {
+						const written = translationOf
+							? await setPostTermAssignmentsReplacing(
+									emdash.db,
+									collection,
+									createdItem.id,
+									post,
+									taxonomyPlan,
+								)
+							: await attachPostTaxonomies(
+									emdash.db,
+									collection,
+									createdItem.id,
+									post,
+									taxonomyPlan,
+								);
+						if (result.taxonomies) {
+							result.taxonomies.assignments += written;
+						}
+					} catch (taxError) {
+						console.error(
+							`Failed to attach taxonomies for "${post.title || "Untitled"}":`,
+							taxError,
+						);
+						result.errors.push({
+							title: post.title || "Untitled",
+							error:
+								taxError instanceof Error && taxError.message
+									? `Imported but failed to attach taxonomies: ${taxError.message}`
+									: "Imported but failed to attach taxonomies",
+						});
+					}
+				}
+
+				if (createdItem && scheduledAt) {
+					const scheduled = await emdash.handleContentSchedule(
+						collection,
+						createdItem.id,
+						scheduledAt,
+					);
+					if (!scheduled.success) {
+						result.errors.push({
+							title: post.title || "Untitled",
+							error: `Imported as draft but failed to schedule: ${scheduled.error?.message ?? "Unknown error"}`,
+						});
+					}
+				}
+			} else {
+				result.errors.push({
+					title: post.title || "Untitled",
+					error: createResult.error.message || "Unknown error",
+				});
+			}
+		} catch (error) {
+			console.error(`Import error for "${post.title || "Untitled"}":`, error);
+			result.errors.push({
+				title: post.title || "Untitled",
+				error: error instanceof Error && error.message ? error.message : "Failed to import item",
+			});
+		}
+	}
+
+	result.success = result.errors.length === 0;
+	return result;
+}
+
+/** The slug the content import gives a post: its post name, or one made from its title. */
+function wxrPostSlug(post: WxrPost): string {
+	return post.postName || slugify(post.title || `post-${post.id || Date.now()}`);
+}
+
+/**
+ * Import the export's menus once its content is in, linking their items to the
+ * entries the content import created.
+ */
+async function importWxrMenus(
+	wxr: Awaited<ReturnType<typeof parseWxrString>>,
+	config: ImportConfig,
+	db: EmDashHandlers["db"],
+	manifest: EmDashManifest,
+	result: ImportResult,
+): Promise<void> {
+	if (config.importMenus === false || wxr.navMenus.length === 0) return;
+
+	let menuResult: Awaited<ReturnType<typeof importMenusFromWxr>>;
+	try {
+		menuResult = await importMenusFromWxr(
+			wxr.navMenus,
+			db,
+			await findWxrMenuTargets(wxr, config, db, manifest),
+			resolveContentCreateLocale(config.locale),
+			wxrMenuArchives(config, manifest),
+		);
+	} catch (error) {
+		// The content is in by now, so report the failure with the rest of the result
+		console.error("[WXR_IMPORT_MENUS]", error);
+		result.errors.push({ title: "Menus", error: "Failed to import menus" });
+		result.success = false;
+		return;
+	}
+	result.menus = {
+		created: menuResult.menusCreated,
+		items: menuResult.itemsCreated,
+		skipped: menuResult.menusSkipped,
+		itemsSkipped: menuResult.itemsSkipped,
+	};
+	for (const menuError of menuResult.errors) {
+		// The detail can carry database and adapter messages, so it stays in the log
+		console.error("[WXR_IMPORT_MENUS]", menuError.menu, menuError.error);
+		result.errors.push({ title: `Menu: ${menuError.menu}`, error: "Failed to import menu" });
+	}
+	if (menuResult.errors.length > 0) result.success = false;
+}
+
+/**
+ * Find the entries that menu items link to: the ones the content import made
+ * from those posts, looked up by the collection, slug and locale it gave them.
+ * This also finds entries an earlier import created and this one skipped.
+ *
+ * Posts that share a slug in a collection and locale are left out: the content
+ * import creates the first and skips the others, so the one entry with that
+ * slug can't be matched to the right post.
+ */
+async function findWxrMenuTargets(
+	wxr: Awaited<ReturnType<typeof parseWxrString>>,
+	config: ImportConfig,
+	db: EmDashHandlers["db"],
+	manifest: EmDashManifest,
+): Promise<Map<number, WxrMenuTarget>> {
+	const linked = new Set<number>();
+	for (const menu of wxr.navMenus) {
+		for (const item of menu.items) {
+			if (item.type === "post_type" && item.objectId) linked.add(item.objectId);
+		}
+	}
+
+	// Every post the content import takes, by collection and locale, then by slug
+	const groups = new Map<
+		string,
+		{ collection: string; locale: string; postsBySlug: Map<string, WxrPost[]> }
+	>();
+	for (const post of wxr.posts) {
+		const mapping = config.postTypeMappings[post.postType || "post"];
+		if (!mapping?.enabled) continue;
+		const collection = sanitizeSlug(mapping.collection);
+		if (!manifest.collections[collection]) continue;
+		let locale: string;
+		try {
+			locale = resolveContentCreateLocale(post.locale ?? config.locale);
+		} catch {
+			// The content import couldn't create the entry in this locale either
+			continue;
+		}
+		const key = `${collection}\u0000${locale}`;
+		let group = groups.get(key);
+		if (!group) {
+			group = { collection, locale, postsBySlug: new Map() };
+			groups.set(key, group);
+		}
+		const slug = wxrPostSlug(post);
+		const posts = group.postsBySlug.get(slug);
+		if (posts) posts.push(post);
+		else group.postsBySlug.set(slug, [post]);
+	}
+
+	const contentRepo = new ContentRepository(db);
+	const targets = new Map<number, WxrMenuTarget>();
+	for (const { collection, locale, postsBySlug } of groups.values()) {
+		// The linked posts that have their slug to themselves
+		const linkedBySlug = new Map<string, { id: number; title: string }>();
+		for (const [slug, [post, ...others]] of postsBySlug) {
+			if (post?.id && others.length === 0 && linked.has(post.id)) {
+				linkedBySlug.set(slug, { id: post.id, title: post.title ?? "" });
+			}
+		}
+		if (linkedBySlug.size === 0) continue;
+		const entries = await contentRepo.findManyBySlugsInLocale(
+			collection,
+			[...linkedBySlug.keys()],
+			locale,
+		);
+		for (const [slug, post] of linkedBySlug) {
+			const entry = entries.get(slug);
+			if (!entry) continue;
+			targets.set(post.id, {
+				collection,
+				translationGroup: entry.translationGroup ?? entry.id,
+				locale: entry.locale ?? locale,
+				title: typeof entry.data.title === "string" ? entry.data.title : post.title,
+			});
+		}
+	}
+	return targets;
+}
+
+/**
+ * The collections that menu items for post type archives link to: each imported
+ * post type's collection, by WordPress post type.
+ */
+function wxrMenuArchives(
+	config: ImportConfig,
+	manifest: EmDashManifest,
+): Map<string, WxrMenuArchive> {
+	const archives = new Map<string, WxrMenuArchive>();
+	for (const [postType, mapping] of Object.entries(config.postTypeMappings)) {
+		if (!mapping.enabled) continue;
+		const collection = sanitizeSlug(mapping.collection);
+		const definition = manifest.collections[collection];
+		if (definition) archives.set(postType, { collection, label: definition.label });
+	}
+	return archives;
+}
+
+function mapStatus(wpStatus: string | undefined): string {
+	switch (wpStatus) {
+		case "publish":
+			return "published";
+		case "draft":
+			return "draft";
+		case "pending":
+			return "draft";
+		case "private":
+			return "draft";
+		default:
+			return "draft";
+	}
+}

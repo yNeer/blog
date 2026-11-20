@@ -1,0 +1,392 @@
+import { describe, it, expect } from "vitest";
+
+import {
+	canonicalTransformSearch,
+	matchInternalMediaKey,
+	isSafeTransformKey,
+	parseTransformParams,
+	resolveTransformQuality,
+	isTransformFormat,
+	originalMediaHeaders,
+	DEFAULT_TRANSFORM_QUALITY,
+	MAX_TRANSFORM_DIMENSION,
+	formatHttpDate,
+	makeWeakEtag,
+	getTransformFingerprint,
+	isNotModified,
+	validatorHeaders,
+} from "../../../src/media/image-endpoint.js";
+
+describe("matchInternalMediaKey", () => {
+	it("extracts the key from a relative internal media URL", () => {
+		expect(matchInternalMediaKey("/_emdash/api/media/file/01J5ABC.webp")).toBe("01J5ABC.webp");
+	});
+
+	it("extracts the key from an absolute internal media URL (the component absolutizes)", () => {
+		expect(matchInternalMediaKey("https://example.com/_emdash/api/media/file/01J5ABC.webp")).toBe(
+			"01J5ABC.webp",
+		);
+		// Host-agnostic: the key is read from our own storage, href is never fetched.
+		expect(matchInternalMediaKey("http://localhost:4444/_emdash/api/media/file/a-b_c.png")).toBe(
+			"a-b_c.png",
+		);
+	});
+
+	it("ignores any query string or fragment on the URL", () => {
+		expect(matchInternalMediaKey("/_emdash/api/media/file/x.jpg?foo=1")).toBe("x.jpg");
+		expect(matchInternalMediaKey("https://example.com/_emdash/api/media/file/x.jpg#f")).toBe(
+			"x.jpg",
+		);
+	});
+
+	it("returns null for non-internal URLs", () => {
+		expect(matchInternalMediaKey("/_astro/bundled.abc.png")).toBeNull();
+		expect(matchInternalMediaKey("https://cdn.example.com/x.jpg")).toBeNull();
+		expect(matchInternalMediaKey("/images/foo.jpg")).toBeNull();
+	});
+
+	it("returns null for empty/missing href", () => {
+		expect(matchInternalMediaKey(null)).toBeNull();
+		expect(matchInternalMediaKey(undefined)).toBeNull();
+		expect(matchInternalMediaKey("")).toBeNull();
+		expect(matchInternalMediaKey("/_emdash/api/media/file/")).toBeNull();
+	});
+
+	it("rejects traversal and unsafe key characters", () => {
+		// ".." collapses the path back out of the media prefix
+		expect(matchInternalMediaKey("/_emdash/api/media/file/../secret")).toBeNull();
+		// a slash in the key (sub-path) is not the flat storage-key shape
+		expect(matchInternalMediaKey("/_emdash/api/media/file/a/b.jpg")).toBeNull();
+		// percent-encoding is rejected by the safe-key charset
+		expect(matchInternalMediaKey("/_emdash/api/media/file/x%2e%2e")).toBeNull();
+	});
+});
+
+describe("isSafeTransformKey", () => {
+	it("accepts flat ulid+ext keys", () => {
+		expect(isSafeTransformKey("01J5ABC.webp")).toBe(true);
+		expect(isSafeTransformKey("a-b_c.1.png")).toBe(true);
+	});
+
+	it("rejects slashes, query chars, and whitespace", () => {
+		expect(isSafeTransformKey("a/b")).toBe(false);
+		expect(isSafeTransformKey("../secret")).toBe(false);
+		expect(isSafeTransformKey("x?y")).toBe(false);
+		expect(isSafeTransformKey("x y")).toBe(false);
+	});
+});
+
+describe("isTransformFormat", () => {
+	it("accepts supported formats and rejects others", () => {
+		expect(isTransformFormat("webp")).toBe(true);
+		expect(isTransformFormat("avif")).toBe(true);
+		expect(isTransformFormat("gif")).toBe(false);
+		expect(isTransformFormat("svg")).toBe(false);
+	});
+});
+
+describe("parseTransformParams", () => {
+	const parse = (qs: string) => parseTransformParams(new URLSearchParams(qs));
+
+	it("requires a width", () => {
+		const r = parse("h=200");
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.message).toMatch(/width/i);
+	});
+
+	it("parses width, height, format, quality", () => {
+		const r = parse("w=640&h=480&f=avif&q=80");
+		expect(r).toEqual({
+			ok: true,
+			options: { width: 640, height: 480, format: "avif", quality: 80 },
+		});
+	});
+
+	it("defaults format to webp, leaves quality and height undefined when not requested", () => {
+		// Quality stays undefined when no `q` is requested: the Cloudflare
+		// endpoint applies DEFAULT_TRANSFORM_QUALITY for lossy formats itself,
+		// while lossless PNG must get none (explicit PNG quality → lossy PNG8).
+		const r = parse("w=800");
+		expect(r).toEqual({
+			ok: true,
+			options: { width: 800, format: "webp", quality: undefined },
+		});
+	});
+
+	it("rejects out-of-range and non-integer dimensions", () => {
+		expect(parse("w=0").ok).toBe(false);
+		expect(parse(`w=${MAX_TRANSFORM_DIMENSION + 1}`).ok).toBe(false);
+		expect(parse("w=12.5").ok).toBe(false);
+		expect(parse("w=640&h=-1").ok).toBe(false);
+	});
+
+	it.each([
+		["low", 25],
+		["mid", 50],
+		["high", 80],
+		["max", 100],
+		["70.6", 71],
+		["80.5", 81],
+		["0", 1],
+		["101", 100],
+		["150", 100],
+		["-5", 1],
+		["1e-7", 1],
+		["1e+21", 100],
+		["1", 1],
+		["100", 100],
+	])("parses quality %s as %s", (quality, expected) => {
+		const result = parse(`w=640&q=${encodeURIComponent(quality)}`);
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.options.quality).toBe(expected);
+	});
+
+	it.each([
+		"",
+		"   ",
+		" 70 ",
+		"0x10",
+		"0b10",
+		"1e309",
+		"NaN",
+		"Infinity",
+		"-Infinity",
+		"unknown",
+		"constructor",
+		"toString",
+		"__proto__",
+	])("rejects invalid quality %s", (quality) => {
+		const result = parse(`w=640&q=${encodeURIComponent(quality)}`);
+		expect(result.ok).toBe(false);
+	});
+
+	it("rejects unsupported format", () => {
+		expect(parse("w=640&f=gif").ok).toBe(false);
+	});
+
+	it("rejects exotic numeric encodings for dimensions", () => {
+		expect(parse("w=1e3").ok).toBe(false);
+		expect(parse("w=0x10").ok).toBe(false);
+		expect(parse("w=+5").ok).toBe(false);
+		expect(parse("w= 5 ").ok).toBe(false);
+	});
+});
+
+describe("resolveTransformQuality", () => {
+	it("applies the default quality to lossy formats when none is requested", () => {
+		expect(resolveTransformQuality("webp", undefined)).toBe(DEFAULT_TRANSFORM_QUALITY);
+		expect(resolveTransformQuality("avif", undefined)).toBe(DEFAULT_TRANSFORM_QUALITY);
+		expect(resolveTransformQuality("jpeg", undefined)).toBe(DEFAULT_TRANSFORM_QUALITY);
+	});
+
+	it("sends no quality for lossless PNG when none is requested (avoids PNG8)", () => {
+		expect(resolveTransformQuality("png", undefined)).toBeUndefined();
+	});
+
+	it("honors an explicitly requested quality for every format, including PNG", () => {
+		expect(resolveTransformQuality("webp", 70)).toBe(70);
+		expect(resolveTransformQuality("png", 70)).toBe(70);
+	});
+});
+
+describe("originalMediaHeaders", () => {
+	it("renders safe raster types inline with a sandbox CSP", () => {
+		const h = originalMediaHeaders("image/png");
+		expect(h["Content-Type"]).toBe("image/png");
+		expect(h["Cache-Control"]).toBe("public, max-age=0, must-revalidate");
+		expect(h["Content-Disposition"]).toBe("inline");
+		expect(h["X-Content-Type-Options"]).toBe("nosniff");
+		expect(h["Content-Security-Policy"]).toContain("sandbox");
+	});
+
+	it("renders image/bmp inline, same as the other safe raster types", () => {
+		expect(originalMediaHeaders("image/bmp")["Content-Disposition"]).toBe("inline");
+	});
+
+	it("forces attachment + sandbox for SVG and other active types", () => {
+		expect(originalMediaHeaders("image/svg+xml")["Content-Disposition"]).toBe("attachment");
+		expect(originalMediaHeaders("application/pdf")["Content-Disposition"]).toBe("attachment");
+		expect(originalMediaHeaders("image/svg+xml")["Content-Security-Policy"]).toContain("sandbox");
+	});
+
+	it("includes weak ETag and Last-Modified when size and modification time are provided", () => {
+		const lastModified = new Date("2026-01-15T12:00:00.000Z");
+		const h = originalMediaHeaders("image/png", 1234, lastModified);
+		expect(h.ETag).toBe(`W/"1234-${lastModified.getTime()}"`);
+		expect(h["Last-Modified"]).toBe(formatHttpDate(lastModified));
+	});
+
+	it("falls back to an ETag with only size when no modification time is provided", () => {
+		const h = originalMediaHeaders("image/png", 1234);
+		expect(h.ETag).toBe(`W/"1234"`);
+		expect(h["Last-Modified"]).toBeUndefined();
+	});
+});
+
+describe("formatHttpDate", () => {
+	it("returns an RFC 7231 HTTP-date in GMT", () => {
+		const date = new Date("2026-01-15T12:00:00.000Z");
+		expect(formatHttpDate(date)).toMatch(/, 15 Jan 2026 12:00:00 GMT/);
+	});
+});
+
+describe("makeWeakEtag", () => {
+	it("includes size and modification time when available", () => {
+		const lastModified = new Date("2026-01-15T12:00:00.000Z");
+		expect(makeWeakEtag(1234, lastModified)).toBe(`W/"1234-${lastModified.getTime()}"`);
+	});
+
+	it("falls back to size only when no modification time is available", () => {
+		expect(makeWeakEtag(1234)).toBe(`W/"1234"`);
+	});
+
+	it("appends a suffix for derived representations", () => {
+		const lastModified = new Date("2026-01-15T12:00:00.000Z");
+		expect(makeWeakEtag(1234, lastModified, "w=150")).toBe(
+			`W/"1234-${lastModified.getTime()}-w=150"`,
+		);
+	});
+});
+
+describe("getTransformFingerprint", () => {
+	it("serializes the relevant query params in a stable order", () => {
+		const params = new URLSearchParams("h=150&f=webp&q=85&w=100&fit=cover&extra=ignored");
+		expect(getTransformFingerprint(params)).toBe("w=100&h=150&f=webp&q=85&fit=cover");
+	});
+
+	it("returns an empty string when no transform params are present", () => {
+		expect(getTransformFingerprint(new URLSearchParams())).toBe("");
+	});
+});
+
+describe("validatorHeaders", () => {
+	it("returns ETag and Last-Modified when a modification time is given", () => {
+		const lastModified = new Date("2026-01-15T12:00:00.000Z");
+		const headers = validatorHeaders(1234, lastModified);
+		expect(headers.ETag).toBe(makeWeakEtag(1234, lastModified));
+		expect(headers["Last-Modified"]).toBe(formatHttpDate(lastModified));
+	});
+
+	it("returns only an ETag when no modification time is given", () => {
+		const headers = validatorHeaders(1234);
+		expect(headers.ETag).toBe(makeWeakEtag(1234));
+		expect(headers["Last-Modified"]).toBeUndefined();
+	});
+});
+
+describe("isNotModified", () => {
+	const lastModified = new Date("2026-01-15T12:00:00.000Z");
+	const etag = makeWeakEtag(1234, lastModified);
+
+	it("matches a request with the exact ETag", () => {
+		const request = new Request("http://localhost/test", {
+			headers: { "If-None-Match": etag },
+		});
+		expect(isNotModified(request, 1234, lastModified)).toBe(true);
+	});
+
+	it("matches a request with a weak-comparison equivalent ETag", () => {
+		const request = new Request("http://localhost/test", {
+			headers: { "If-None-Match": etag.replace("W/", "") },
+		});
+		expect(isNotModified(request, 1234, lastModified)).toBe(true);
+	});
+
+	it("matches If-None-Match: *", () => {
+		const request = new Request("http://localhost/test", {
+			headers: { "If-None-Match": "*" },
+		});
+		expect(isNotModified(request, 1234, lastModified)).toBe(true);
+	});
+
+	it("matches If-Modified-Since when the resource is not newer", () => {
+		const request = new Request("http://localhost/test", {
+			headers: { "If-Modified-Since": formatHttpDate(lastModified) },
+		});
+		expect(isNotModified(request, 1234, lastModified)).toBe(true);
+	});
+
+	it("does not match If-Modified-Since when the resource is newer", () => {
+		const earlier = new Date(lastModified.getTime() - 60_000);
+		const request = new Request("http://localhost/test", {
+			headers: { "If-Modified-Since": formatHttpDate(earlier) },
+		});
+		expect(isNotModified(request, 1234, lastModified)).toBe(false);
+	});
+
+	it("does not match a stale ETag", () => {
+		const request = new Request("http://localhost/test", {
+			headers: { "If-None-Match": `W/"stale"` },
+		});
+		expect(isNotModified(request, 1234, lastModified)).toBe(false);
+	});
+
+	it("prioritizes If-None-Match over If-Modified-Since", () => {
+		const request = new Request("http://localhost/test", {
+			headers: {
+				"If-None-Match": `W/"stale"`,
+				"If-Modified-Since": formatHttpDate(lastModified),
+			},
+		});
+		expect(isNotModified(request, 1234, lastModified)).toBe(false);
+	});
+
+	it("matches a transform suffix", () => {
+		const suffix = "w=150";
+		const request = new Request("http://localhost/test", {
+			headers: { "If-None-Match": makeWeakEtag(1234, lastModified, suffix) },
+		});
+		expect(isNotModified(request, 1234, lastModified, suffix)).toBe(true);
+	});
+});
+
+describe("canonicalTransformSearch", () => {
+	const href = "https://example.com/_emdash/api/media/file/01ABC.png";
+	const encodedHref = encodeURIComponent(href);
+
+	function canonicalOf(search: string, assetQueryParams?: URLSearchParams): string | null {
+		return canonicalTransformSearch(new URL(`http://localhost/_image?${search}`), assetQueryParams);
+	}
+
+	it("accepts the query Astro's getURL writes for a cover image", () => {
+		const search = `href=${encodedHref}&w=1200&h=536&q=80&f=webp&fit=cover&position=center&background=%23fff`;
+		expect(canonicalOf(search)).toBeNull();
+	});
+
+	it("accepts a query with only some parameters", () => {
+		expect(canonicalOf(`href=${encodedHref}&w=150&f=webp`)).toBeNull();
+	});
+
+	it("reorders parameters into Astro's order", () => {
+		expect(canonicalOf(`f=webp&w=150&href=${encodedHref}`)).toBe(
+			`href=${encodedHref}&w=150&f=webp`,
+		);
+	});
+
+	it("drops unknown parameters", () => {
+		expect(canonicalOf(`href=${encodedHref}&w=150&cachebust=123`)).toBe(
+			`href=${encodedHref}&w=150`,
+		);
+	});
+
+	it("keeps the first value of a repeated parameter", () => {
+		expect(canonicalOf(`href=${encodedHref}&w=150&w=9000`)).toBe(`href=${encodedHref}&w=150`);
+	});
+
+	it("keeps the adapter's asset query parameters after the transform parameters", () => {
+		const assetQueryParams = new URLSearchParams("dpl=abc");
+		expect(canonicalOf(`href=${encodedHref}&w=150&dpl=abc`, assetQueryParams)).toBeNull();
+		expect(canonicalOf(`dpl=abc&href=${encodedHref}&w=150`, assetQueryParams)).toBe(
+			`href=${encodedHref}&w=150&dpl=abc`,
+		);
+	});
+
+	it("re-encodes a query whose values match but whose encoding differs", () => {
+		expect(canonicalOf(`href=${href}&w=150`)).toBe(`href=${encodedHref}&w=150`);
+	});
+
+	it("accepts its own output, so a redirect never loops", () => {
+		const target = canonicalOf(`w=150&href=${href}&x=1`)!;
+		expect(canonicalOf(target)).toBeNull();
+	});
+});

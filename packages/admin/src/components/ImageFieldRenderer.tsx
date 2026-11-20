@@ -1,0 +1,981 @@
+/**
+ * Image field with media picker
+ *
+ * Stores full image metadata including dimensions for responsive images.
+ * Handles backwards compatibility with legacy string URLs.
+ *
+ * Extracted from ContentEditor so non-top-level field UIs (e.g. repeater
+ * sub-fields) can reuse the same picker without a circular import.
+ */
+
+import { Button, DropdownMenu, Label, LayerCard, Text, Tooltip } from "@cloudflare/kumo";
+import { useLingui } from "@lingui/react/macro";
+import {
+	Image as ImageIcon,
+	ImageBroken,
+	ImageSquare,
+	DotsThree,
+	Moon,
+	PencilSimple,
+	X,
+} from "@phosphor-icons/react";
+import { useQuery } from "@tanstack/react-query";
+import * as React from "react";
+
+import { fetchMediaItem, type MediaItem, type MediaUpdateInput } from "../lib/api";
+import {
+	canonicalMediaProviderId,
+	getMediaObjectPosition,
+	getMediaPreviewUrl,
+	localMediaFileUrl,
+	metaString,
+	syncMediaCaption,
+} from "../lib/media-utils.js";
+import { cn } from "../lib/utils.js";
+import { DISCLOSURE_EASE, DISCLOSURE_MS, IMAGE_EDGE, ROW_BUTTON } from "./block-field-styles.js";
+import { FieldHelpLabel } from "./FieldHelpLabel.js";
+import { ImageDropTarget } from "./media/ImageDropTarget.js";
+import { useMediaAssetEditor } from "./media/useMediaAssetEditor.js";
+import { MediaPickerModal } from "./MediaPickerModal";
+import { OptionalLabel } from "./OptionalLabel.js";
+import { RequiredFieldMessage, useShowRequiredError } from "./RequiredFieldError.js";
+import { useQuietReturnFocus } from "./useQuietReturnFocus.js";
+
+/**
+ * Image field value - matches emdash's MediaValue type
+ */
+export interface ImageFieldValue {
+	id: string;
+	/** Provider ID (e.g., "local", "cloudflare-images") */
+	provider?: string;
+	/** Direct URL for local media or legacy data */
+	src?: string;
+	/** Preview URL for admin display (separate from src used for rendering) */
+	previewUrl?: string;
+	filename?: string;
+	mimeType?: string;
+	alt?: string;
+	caption?: string;
+	width?: number;
+	height?: number;
+	focalX?: number;
+	focalY?: number;
+	/** LQIP blurhash placeholder (images only) */
+	blurhash?: string;
+	/** LQIP dominant-color placeholder, as a CSS color (images only) */
+	dominantColor?: string;
+	/** Provider-specific metadata */
+	meta?: Record<string, unknown>;
+	/** Image the site shows instead of this one in a dark color scheme */
+	darkVariant?: ImageFieldValue;
+}
+
+/**
+ * Admin preview URL for a stored value: `previewUrl` for external providers,
+ * `src` for legacy data, otherwise the local media file route.
+ */
+export function mediaDisplayUrl(value: ImageFieldValue | string | undefined): string | undefined {
+	if (typeof value === "string") return value;
+	if (!value) return undefined;
+	if (value.previewUrl || value.src) return value.previewUrl || value.src;
+	if (!value.provider || value.provider === "local") {
+		return localMediaFileUrl(
+			typeof value.meta?.storageKey === "string" ? value.meta.storageKey : value.id,
+		);
+	}
+	return undefined;
+}
+
+function mediaItemToImageFieldValue(item: MediaItem): ImageFieldValue {
+	const provider = canonicalMediaProviderId(item.provider);
+	const isLocalProvider = provider === "local";
+	const isDirectUrl = provider === "external";
+	return syncMediaCaption({
+		id: item.id,
+		provider,
+		src: isDirectUrl ? item.url : undefined,
+		previewUrl: !isLocalProvider && !isDirectUrl ? item.url : undefined,
+		alt: item.alt || "",
+		caption: item.caption ?? metaString(item.meta, "caption"),
+		width: item.width,
+		height: item.height,
+		focalX: item.focalX ?? undefined,
+		focalY: item.focalY ?? undefined,
+		filename: item.filename,
+		mimeType: item.mimeType,
+		blurhash: item.blurhash ?? metaString(item.meta, "blurhash"),
+		dominantColor: item.dominantColor ?? metaString(item.meta, "dominantColor"),
+		meta: isLocalProvider ? { ...item.meta, storageKey: item.storageKey } : item.meta,
+	});
+}
+
+/**
+ * Offers to put back a photo removed from a labelled image field, such as one in a block. It's
+ * called with the photo removed, and calls `restored` once it puts the photo back.
+ */
+export const ImageRemovalContext = React.createContext<
+	((removed: ImageFieldValue | string, restored: () => void) => void) | null
+>(null);
+
+export interface ImageFieldRendererProps {
+	id?: string;
+	label: string;
+	description?: string;
+	value: ImageFieldValue | string | undefined;
+	onChange: (value: ImageFieldValue | null) => void;
+	required?: boolean;
+	showOptional?: boolean;
+	allowedMimeTypes?: string[];
+	fieldId?: string;
+	blockType?: string;
+	blockVersion?: number;
+	variant?: "default" | "featured" | "avatar";
+	/** Offer a second slot for the image shown in a dark color scheme */
+	darkVariant?: boolean;
+	/**
+	 * Leaves the label to the caller, which names the field with this element id.
+	 * The photo then spans the field, with its actions over it.
+	 */
+	labelledBy?: string;
+	describedBy?: string;
+	invalid?: boolean;
+	/**
+	 * With `labelledBy`, draws the photo as a thumbnail: in a settings row with Replace and
+	 * Remove beside it, or in a table cell as a button that opens the picker.
+	 */
+	thumbnail?: "row" | "cell";
+}
+
+const HOVER_REVEAL =
+	"opacity-0 transition-opacity duration-0 ease-emdash [@media(hover:none)]:opacity-100 pointer-coarse:opacity-100";
+const PHOTO_REVEAL = cn(
+	HOVER_REVEAL,
+	"group-hover/photo:opacity-100 group-hover/photo:duration-100 group-[:not([data-quiet-focus]):has(:focus-visible)]/photo:opacity-100",
+);
+const THUMB_REVEAL = cn(
+	HOVER_REVEAL,
+	"group-hover/thumb:opacity-100 group-hover/thumb:duration-100 group-[:not([data-quiet-focus]):has(:focus-visible)]/thumb:opacity-100",
+);
+const PHOTO_ACTION =
+	"bg-kumo-base/85 shadow-sm backdrop-blur-sm not-disabled:hover:bg-kumo-base pointer-coarse:h-11 pointer-coarse:min-w-11";
+
+export function ImageFieldRenderer({
+	id,
+	label,
+	description,
+	value,
+	onChange,
+	required,
+	showOptional,
+	allowedMimeTypes,
+	fieldId,
+	blockType,
+	blockVersion,
+	variant = "default",
+	darkVariant = false,
+	labelledBy,
+	describedBy,
+	invalid = false,
+	thumbnail,
+}: ImageFieldRendererProps) {
+	const { t } = useLingui();
+	const labelled = labelledBy !== undefined;
+	const [pickerOpen, setPickerOpen] = React.useState(false);
+	const errorId = React.useId();
+	const [pickerTarget, setPickerTarget] = React.useState<"image" | "darkVariant">("image");
+	const [mobileActionsOpen, setMobileActionsOpen] = React.useState(false);
+	const [imageBroken, setImageBroken] = React.useState(false);
+	const [darkImageBroken, setDarkImageBroken] = React.useState(false);
+	const mobileImageActionsRef = React.useRef<HTMLButtonElement>(null);
+	const quietFocus = useQuietReturnFocus();
+	const offerRestore = React.useContext(ImageRemovalContext);
+	/** The labelled slot's own button: Select image, or Replace beside a thumbnail. */
+	const slotButtonRef = React.useRef<HTMLButtonElement>(null);
+	const photoReplaceRef = React.useRef<HTMLButtonElement>(null);
+	/** Where focus goes once the photo has gone, or come back. */
+	const focusNextRef = React.useRef<"slot" | "photo" | null>(null);
+	/** The labelled field's box, which eases to its new height when a photo goes or comes back. */
+	const slotRef = React.useRef<HTMLDivElement>(null);
+	const heightBeforeRef = React.useRef<number | null>(null);
+	const [editedContentHashes, setEditedContentHashes] = React.useState<
+		Record<string, string | null | undefined>
+	>({});
+	// A legacy string URL needs object form to carry a dark variant. The runtime
+	// resolves the URL in `src` on save, so the provider linkage survives.
+	const objectValue: ImageFieldValue | undefined =
+		typeof value === "object" && value
+			? value
+			: typeof value === "string" && value
+				? { id: "", src: value }
+				: undefined;
+	const darkValue = objectValue?.darkVariant;
+	const handleAssetItemChanged = React.useCallback(
+		(item: MediaItem, metadataChanges?: MediaUpdateInput) => {
+			const currentUsage = pickerTarget === "darkVariant" ? darkValue : objectValue;
+			const caption = currentUsage?.caption ?? metaString(currentUsage?.meta, "caption");
+			const selected = mediaItemToImageFieldValue(item);
+			if (caption !== undefined && metadataChanges?.caption === undefined) {
+				selected.caption = caption;
+			}
+			if (currentUsage?.meta && Object.hasOwn(currentUsage.meta, "caption")) {
+				selected.meta = { ...selected.meta, caption: selected.caption };
+			}
+			const updated = syncMediaCaption(selected);
+			setEditedContentHashes((current) => ({ ...current, [item.id]: item.contentHash }));
+			if (pickerTarget === "darkVariant") {
+				if (objectValue) onChange({ ...objectValue, darkVariant: updated });
+				return;
+			}
+			onChange(darkValue ? { ...updated, darkVariant: darkValue } : updated);
+		},
+		[darkValue, objectValue, onChange, pickerTarget],
+	);
+	const assetEditor = useMediaAssetEditor(handleAssetItemChanged);
+	const currentMediaId =
+		variant === "featured" &&
+		objectValue?.id &&
+		canonicalMediaProviderId(objectValue.provider) === "local"
+			? objectValue.id
+			: null;
+	const { data: currentMedia } = useQuery({
+		queryKey: ["media", currentMediaId],
+		queryFn: ({ signal }) => fetchMediaItem(currentMediaId!, { signal }),
+		enabled: currentMediaId !== null,
+	});
+	const currentDarkMediaId =
+		variant === "featured" &&
+		darkValue?.id &&
+		canonicalMediaProviderId(darkValue.provider) === "local"
+			? darkValue.id
+			: null;
+	const { data: currentDarkMedia } = useQuery({
+		queryKey: ["media", currentDarkMediaId],
+		queryFn: ({ signal }) => fetchMediaItem(currentDarkMediaId!, { signal }),
+		enabled: currentDarkMediaId !== null,
+	});
+	const storedDisplayUrl = mediaDisplayUrl(value);
+	const primaryContentHash =
+		objectValue?.id && Object.hasOwn(editedContentHashes, objectValue.id)
+			? editedContentHashes[objectValue.id]
+			: currentMedia?.contentHash;
+	const displayUrl = storedDisplayUrl
+		? getMediaPreviewUrl(storedDisplayUrl, primaryContentHash)
+		: undefined;
+	const storedDarkDisplayUrl = mediaDisplayUrl(darkValue);
+	const darkContentHash =
+		darkValue?.id && Object.hasOwn(editedContentHashes, darkValue.id)
+			? editedContentHashes[darkValue.id]
+			: currentDarkMedia?.contentHash;
+	const darkDisplayUrl = storedDarkDisplayUrl
+		? getMediaPreviewUrl(storedDarkDisplayUrl, darkContentHash)
+		: undefined;
+
+	React.useEffect(() => {
+		setImageBroken(false);
+	}, [displayUrl]);
+
+	React.useEffect(() => {
+		setDarkImageBroken(false);
+	}, [darkDisplayUrl]);
+
+	React.useEffect(() => {
+		if (variant !== "featured") return;
+		const desktop = window.matchMedia("(min-width: 640px)");
+		const closeMobileActions = (event: MediaQueryListEvent) => {
+			if (event.matches) setMobileActionsOpen(false);
+		};
+		desktop.addEventListener("change", closeMobileActions);
+		return () => desktop.removeEventListener("change", closeMobileActions);
+	}, [variant]);
+
+	const openPicker = (target: "image" | "darkVariant") => {
+		setPickerTarget(target);
+		setPickerOpen(true);
+	};
+
+	const handlePrimarySelect = (item: MediaItem) => {
+		const selected = mediaItemToImageFieldValue(item);
+		onChange(darkValue ? { ...selected, darkVariant: darkValue } : selected);
+	};
+
+	const handleSelect = (item: MediaItem) => {
+		if (pickerTarget === "darkVariant") {
+			if (objectValue) onChange({ ...objectValue, darkVariant: mediaItemToImageFieldValue(item) });
+			return;
+		}
+		handlePrimarySelect(item);
+	};
+
+	const handleRemove = () => {
+		const removed = value;
+		if (!labelled) {
+			onChange(null);
+			return;
+		}
+		focusNextRef.current = "slot";
+		heightBeforeRef.current = slotRef.current?.getBoundingClientRect().height ?? null;
+		onChange(null);
+		if (removed && offerRestore) {
+			offerRestore(removed, () => {
+				focusNextRef.current = "photo";
+				heightBeforeRef.current = slotRef.current?.getBoundingClientRect().height ?? null;
+			});
+		}
+	};
+
+	// The rows below glide to where the photo's going or coming back puts them, as they do when a
+	// block or item is deleted or put back.
+	React.useLayoutEffect(() => {
+		const from = heightBeforeRef.current;
+		heightBeforeRef.current = null;
+		const slot = slotRef.current;
+		if (from === null || !slot || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+			return;
+		}
+		const to = slot.getBoundingClientRect().height;
+		if (Math.abs(to - from) < 1) return;
+		slot.animate(
+			{ height: [`${from}px`, `${to}px`], clipPath: ["inset(0)", "inset(0)"] },
+			{
+				duration: to < from ? DISCLOSURE_MS.close : DISCLOSURE_MS.open,
+				easing: DISCLOSURE_EASE,
+			},
+		);
+	}, [displayUrl]);
+
+	// A removed photo's actions go with it, so focus moves on to the slot's own button, and to the
+	// photo's Replace when Undo puts it back. Beside a thumbnail, or in a table cell, that button stays.
+	React.useLayoutEffect(() => {
+		const next = focusNextRef.current;
+		if (!next || (next === "photo") !== Boolean(displayUrl)) return;
+		focusNextRef.current = null;
+		const dropped = !document.activeElement || document.activeElement === document.body;
+		if (next === "slot" && !dropped) return;
+		(next === "photo" && !thumbnail ? photoReplaceRef : slotButtonRef).current?.focus();
+	}, [displayUrl, thumbnail]);
+
+	const handleRemoveDarkVariant = () => {
+		if (!objectValue) return;
+		const next = { ...objectValue };
+		delete next.darkVariant;
+		onChange(next);
+	};
+
+	const isFeatured = variant === "featured";
+	const isAvatar = variant === "avatar";
+	const selectedFilename =
+		typeof value === "object" && value.filename ? value.filename : t`Selected image`;
+	const currentWidth = currentMedia?.width ?? (typeof value === "object" ? value.width : undefined);
+	const currentHeight =
+		currentMedia?.height ?? (typeof value === "object" ? value.height : undefined);
+	const dimensions =
+		typeof currentWidth === "number" && typeof currentHeight === "number"
+			? `${currentWidth} × ${currentHeight}`
+			: undefined;
+	const mimeType =
+		currentMedia?.mimeType ??
+		(typeof value === "object" && value.mimeType ? value.mimeType : undefined);
+	const metadata = [dimensions, mimeType].filter(Boolean).join(" · ");
+	const objectPosition =
+		typeof value === "object" && value ? getMediaObjectPosition(value) : undefined;
+	const darkObjectPosition = darkValue ? getMediaObjectPosition(darkValue) : undefined;
+	const darkFilename = darkValue?.filename || t`Selected image`;
+	const canEditPrimaryAsset = Boolean(
+		objectValue?.id && canonicalMediaProviderId(objectValue.provider) === "local",
+	);
+	const canEditDarkAsset = Boolean(
+		darkValue?.id && canonicalMediaProviderId(darkValue.provider) === "local",
+	);
+	const primaryActions = (
+		<div
+			className={
+				isFeatured
+					? "hidden w-full min-w-0 flex-wrap items-center gap-2 @lg/featured:flex"
+					: "flex flex-wrap items-center gap-2"
+			}
+		>
+			<Button
+				type="button"
+				size="sm"
+				variant="secondary"
+				icon={<ImageSquare aria-hidden="true" />}
+				onClick={() => openPicker("image")}
+				disabled={assetEditor.isActive}
+			>
+				{t`Replace`}
+			</Button>
+			{canEditPrimaryAsset && (
+				<Button
+					type="button"
+					size="sm"
+					variant="secondary"
+					icon={<PencilSimple aria-hidden="true" />}
+					loading={assetEditor.isOpening && pickerTarget === "image"}
+					onClick={(event) => {
+						setPickerTarget("image");
+						void assetEditor.openAssetEditor(objectValue!.id, event.currentTarget);
+					}}
+				>
+					{t`Edit asset`}
+				</Button>
+			)}
+			<Button
+				type="button"
+				size="sm"
+				variant="secondary-destructive"
+				icon={<X aria-hidden="true" />}
+				onClick={handleRemove}
+				disabled={assetEditor.isActive}
+				aria-label={t`Remove image`}
+			>
+				{t`Remove`}
+			</Button>
+		</div>
+	);
+	const photoActions = (
+		<>
+			<Button
+				ref={photoReplaceRef}
+				type="button"
+				size="sm"
+				variant="secondary"
+				className={PHOTO_ACTION}
+				icon={<ImageSquare aria-hidden="true" />}
+				onClick={(event) => {
+					quietFocus.markOpener(event);
+					openPicker("image");
+				}}
+				disabled={assetEditor.isActive}
+			>
+				{t`Replace`}
+			</Button>
+			{canEditPrimaryAsset && (
+				<Button
+					type="button"
+					size="sm"
+					variant="secondary"
+					shape="square"
+					className={PHOTO_ACTION}
+					icon={<PencilSimple aria-hidden="true" />}
+					loading={assetEditor.isOpening && pickerTarget === "image"}
+					title={t`Edit asset`}
+					aria-label={t`Edit asset`}
+					onClick={(event) => {
+						quietFocus.markOpener(event);
+						setPickerTarget("image");
+						void assetEditor.openAssetEditor(objectValue!.id, event.currentTarget);
+					}}
+				/>
+			)}
+			<Button
+				type="button"
+				size="sm"
+				variant="secondary"
+				shape="square"
+				className={PHOTO_ACTION}
+				icon={<X aria-hidden="true" />}
+				title={t`Remove image`}
+				aria-label={t`Remove image`}
+				onClick={handleRemove}
+				disabled={assetEditor.isActive}
+			/>
+		</>
+	);
+	const mobileFeaturedActions = (
+		<DropdownMenu open={mobileActionsOpen} onOpenChange={setMobileActionsOpen}>
+			<Tooltip
+				content={t`Image actions`}
+				side="top"
+				className="cursor-pointer"
+				render={
+					<DropdownMenu.Trigger
+						render={
+							<Button
+								ref={mobileImageActionsRef}
+								type="button"
+								shape="square"
+								variant="ghost"
+								className="pointer-coarse:size-11"
+								icon={<DotsThree aria-hidden="true" />}
+								loading={assetEditor.isOpening && pickerTarget === "image"}
+								disabled={assetEditor.isActive}
+								aria-label={t`Image actions`}
+								aria-haspopup="menu"
+								aria-expanded={mobileActionsOpen}
+							/>
+						}
+					/>
+				}
+			/>
+			<DropdownMenu.Content align="end" className="min-w-40">
+				<DropdownMenu.Item
+					icon={<ImageSquare className="size-4" aria-hidden="true" />}
+					onClick={() => openPicker("image")}
+				>
+					{t`Replace`}
+				</DropdownMenu.Item>
+				{canEditPrimaryAsset && (
+					<DropdownMenu.Item
+						icon={<PencilSimple className="size-4" aria-hidden="true" />}
+						onClick={() => {
+							setPickerTarget("image");
+							void assetEditor.openAssetEditor(objectValue!.id, mobileImageActionsRef.current);
+						}}
+					>
+						{t`Edit asset`}
+					</DropdownMenu.Item>
+				)}
+				<DropdownMenu.Separator />
+				<DropdownMenu.Item
+					variant="danger"
+					icon={<X className="size-4" aria-hidden="true" />}
+					onClick={handleRemove}
+				>
+					{t`Remove`}
+				</DropdownMenu.Item>
+			</DropdownMenu.Content>
+		</DropdownMenu>
+	);
+
+	const darkVariantSlot =
+		darkVariant && objectValue && displayUrl ? (
+			<div className="flex flex-wrap items-center gap-3">
+				{darkDisplayUrl ? (
+					<>
+						<div className="h-12 w-16 shrink-0 overflow-hidden rounded bg-kumo-muted ring ring-kumo-line">
+							{darkImageBroken ? (
+								<div className="flex h-full items-center justify-center text-kumo-subtle">
+									<ImageBroken className="h-5 w-5" aria-hidden="true" />
+								</div>
+							) : (
+								<img
+									src={darkDisplayUrl}
+									alt=""
+									className="h-full w-full object-cover"
+									style={{ objectPosition: darkObjectPosition }}
+									onError={() => setDarkImageBroken(true)}
+								/>
+							)}
+						</div>
+						<div className="grid min-w-0 flex-1 gap-0.5">
+							<Text as="p" variant="secondary" size="xs">
+								{t`Dark mode variant`}
+							</Text>
+							<Text as="p" bold truncate>
+								{darkFilename}
+							</Text>
+						</div>
+						<div className="flex basis-full flex-wrap items-center gap-2 sm:basis-auto">
+							<Button
+								type="button"
+								size="sm"
+								variant="secondary"
+								icon={<ImageSquare aria-hidden="true" />}
+								onClick={() => openPicker("darkVariant")}
+								disabled={assetEditor.isActive}
+								aria-label={t`Replace dark mode image`}
+							>
+								{t`Replace`}
+							</Button>
+							{canEditDarkAsset && (
+								<Button
+									type="button"
+									size="sm"
+									variant="secondary"
+									icon={<PencilSimple aria-hidden="true" />}
+									loading={assetEditor.isOpening && pickerTarget === "darkVariant"}
+									onClick={(event) => {
+										setPickerTarget("darkVariant");
+										void assetEditor.openAssetEditor(darkValue!.id, event.currentTarget);
+									}}
+									aria-label={t`Edit dark mode asset`}
+								>
+									{t`Edit asset`}
+								</Button>
+							)}
+							<Button
+								type="button"
+								size="sm"
+								variant="secondary-destructive"
+								icon={<X aria-hidden="true" />}
+								onClick={handleRemoveDarkVariant}
+								disabled={assetEditor.isActive}
+								aria-label={t`Remove dark mode variant`}
+							>
+								{t`Remove`}
+							</Button>
+						</div>
+					</>
+				) : (
+					<Button
+						type="button"
+						size="sm"
+						variant="secondary"
+						icon={<Moon aria-hidden="true" />}
+						onClick={() => openPicker("darkVariant")}
+						disabled={assetEditor.isActive}
+					>
+						{t`Add dark mode variant`}
+					</Button>
+				)}
+			</div>
+		) : null;
+
+	const avatarField = (
+		<div className="flex items-center gap-4">
+			<div className="flex size-16 shrink-0 items-center justify-center overflow-hidden rounded-full bg-kumo-tint text-kumo-subtle ring ring-kumo-line">
+				{displayUrl && !imageBroken ? (
+					<img
+						src={displayUrl}
+						alt=""
+						className="size-full object-cover"
+						style={{ objectPosition }}
+						onError={() => setImageBroken(true)}
+					/>
+				) : displayUrl ? (
+					<>
+						<ImageBroken className="size-5" aria-hidden="true" />
+						<span className="sr-only">{t`Image not found`}</span>
+					</>
+				) : (
+					<ImageIcon className="size-6" aria-hidden="true" />
+				)}
+			</div>
+			<div className="min-w-0 flex-1">
+				{displayUrl ? (
+					primaryActions
+				) : (
+					<Button
+						type="button"
+						size="sm"
+						variant="secondary"
+						icon={<ImageSquare aria-hidden="true" />}
+						onClick={() => openPicker("image")}
+					>
+						{t`Select image`}
+					</Button>
+				)}
+			</div>
+		</div>
+	);
+
+	const featuredCard = displayUrl ? (
+		<LayerCard className="grid w-full grid-cols-[5rem_minmax(0,1fr)_auto] items-center rounded-xl p-0 @lg/featured:grid-cols-[12rem_minmax(0,1fr)] @lg/featured:items-stretch">
+			<div
+				className="emdash-featured-image-preview m-2 overflow-hidden rounded bg-kumo-tint ring ring-kumo-line @lg/featured:self-center"
+				style={{ aspectRatio: "16 / 9" }}
+			>
+				{imageBroken ? (
+					<div className="flex h-full items-center justify-center gap-2 text-kumo-subtle">
+						<ImageBroken className="h-5 w-5" aria-hidden="true" />
+						<Text
+							as="span"
+							variant="secondary"
+							size="xs"
+							DANGEROUS_className="sr-only @lg/featured:not-sr-only"
+						>
+							{t`Image not found`}
+						</Text>
+					</div>
+				) : (
+					<img
+						src={displayUrl}
+						alt=""
+						className="emdash-media-transparency-grid h-full w-full object-cover"
+						style={{ objectPosition }}
+						onError={() => setImageBroken(true)}
+					/>
+				)}
+			</div>
+			<div className="flex min-w-0 flex-col justify-center px-2 py-2 @lg/featured:px-4 @lg/featured:py-3">
+				<div className="flex w-full min-w-0 flex-col gap-1.5 @lg/featured:translate-y-1.5 @lg/featured:gap-3">
+					<div className="grid min-w-0 gap-1">
+						<Text as="p" bold truncate>
+							{selectedFilename}
+						</Text>
+						{metadata && (
+							<Text as="p" variant="secondary" size="xs" truncate>
+								<bdi dir="ltr">{metadata}</bdi>
+							</Text>
+						)}
+					</div>
+					{primaryActions}
+				</div>
+			</div>
+			<div className="me-2 @lg/featured:hidden">{mobileFeaturedActions}</div>
+		</LayerCard>
+	) : null;
+
+	const showRequiredError = useShowRequiredError(required, !displayUrl);
+	const requiredErrorProps = showRequiredError
+		? { "aria-invalid": true as const, "aria-describedby": errorId }
+		: undefined;
+
+	const labelContent = showOptional ? <OptionalLabel>{label}</OptionalLabel> : label;
+
+	const picker = (
+		<MediaPickerModal
+			open={pickerOpen}
+			onOpenChange={setPickerOpen}
+			onSelect={handleSelect}
+			mimeTypeFilters={
+				allowedMimeTypes && allowedMimeTypes.length > 0 ? allowedMimeTypes : ["image/"]
+			}
+			fieldId={fieldId}
+			blockType={blockType}
+			blockVersion={blockVersion}
+			title={
+				pickerTarget === "darkVariant"
+					? darkDisplayUrl
+						? t`Replace dark mode variant for ${label}`
+						: t`Select dark mode variant for ${label}`
+					: displayUrl
+						? t`Replace ${label}`
+						: t`Select ${label}`
+			}
+			confirmLabel={
+				pickerTarget === "darkVariant"
+					? darkDisplayUrl
+						? t`Replace`
+						: undefined
+					: displayUrl
+						? t`Replace`
+						: undefined
+			}
+		/>
+	);
+
+	if (labelled && thumbnail) {
+		const cell = thumbnail === "cell";
+		const preview =
+			displayUrl && !imageBroken ? (
+				<img
+					src={displayUrl}
+					alt=""
+					className="size-full object-cover"
+					style={{ objectPosition }}
+					onError={() => setImageBroken(true)}
+				/>
+			) : displayUrl ? (
+				<ImageBroken className="size-4" aria-hidden="true" />
+			) : (
+				<ImageSquare className="size-4" aria-hidden="true" />
+			);
+		const frame = cn(
+			"grid shrink-0 place-items-center overflow-hidden rounded-md",
+			cell ? "h-7 w-9" : "size-8",
+			displayUrl
+				? IMAGE_EDGE
+				: cn(
+						"border-[1.5px] border-dashed",
+						cell
+							? "border-transparent group-hover/item:border-kumo-line group-focus-within/item:border-kumo-line"
+							: "border-kumo-line",
+						invalid ? "text-kumo-danger" : "text-kumo-subtle",
+					),
+		);
+		return (
+			<div
+				id={id}
+				role="group"
+				aria-labelledby={labelledBy}
+				aria-describedby={describedBy}
+				{...quietFocus.groupProps}
+				className={cn(
+					"group/thumb flex min-h-8 min-w-0 items-center gap-1",
+					cell ? "justify-center" : "px-2",
+				)}
+			>
+				{cell ? (
+					<Button
+						ref={slotButtonRef}
+						type="button"
+						variant="ghost"
+						shape="square"
+						className={cn(frame, "p-0")}
+						aria-label={displayUrl ? t`Replace ${label}` : t`Select ${label}`}
+						aria-describedby={describedBy}
+						onClick={(event) => {
+							quietFocus.markOpener(event);
+							openPicker("image");
+						}}
+					>
+						{preview}
+					</Button>
+				) : (
+					<>
+						<span className={cn(frame, "me-1")}>{preview}</span>
+						<Button
+							ref={slotButtonRef}
+							type="button"
+							variant="ghost"
+							size="sm"
+							className={cn(
+								"h-8 px-2 text-base font-normal text-kumo-subtle",
+								ROW_BUTTON,
+								invalid && !displayUrl && "text-kumo-danger",
+							)}
+							aria-describedby={describedBy}
+							onClick={() => openPicker("image")}
+						>
+							{displayUrl ? t`Replace` : t`Select image`}
+						</Button>
+					</>
+				)}
+				{displayUrl &&
+					(cell ? (
+						<Button
+							type="button"
+							variant="ghost"
+							shape="square"
+							size="sm"
+							className={cn("size-6 text-kumo-subtle", THUMB_REVEAL)}
+							aria-label={t`Remove ${label}`}
+							onClick={handleRemove}
+						>
+							<X className="size-3.5" aria-hidden="true" />
+						</Button>
+					) : (
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							className={cn("h-8 px-2 text-base font-normal text-kumo-subtle", ROW_BUTTON)}
+							onClick={handleRemove}
+						>
+							{t`Remove`}
+						</Button>
+					))}
+				{picker}
+			</div>
+		);
+	}
+
+	return (
+		// The featured card lays out by its own width, which the editor's column keeps well below the viewport's.
+		<div
+			ref={slotRef}
+			id={id}
+			role={labelled ? "group" : undefined}
+			aria-labelledby={labelledBy}
+			aria-describedby={labelled ? describedBy : undefined}
+			className={cn("grid gap-2", isFeatured && "@container/featured")}
+		>
+			{labelled ? null : description ? (
+				<FieldHelpLabel
+					help={description}
+					helpLabel={t`More information about ${label}`}
+					labelClassName="text-base font-medium text-kumo-default"
+				>
+					{labelContent}
+				</FieldHelpLabel>
+			) : (
+				<Label>{labelContent}</Label>
+			)}
+			{isAvatar ? (
+				avatarField
+			) : isFeatured && displayUrl ? (
+				featuredCard
+			) : displayUrl && labelled ? (
+				<div className="group/photo relative mx-2" {...quietFocus.groupProps}>
+					{imageBroken ? (
+						<div className="flex min-h-20 items-center justify-center gap-2 rounded-lg bg-kumo-tint text-kumo-subtle ring ring-kumo-line">
+							<ImageBroken className="size-5" aria-hidden="true" />
+							<span className="text-xs leading-4">{t`Image not found`}</span>
+						</div>
+					) : (
+						// Its size is known before it loads, so a block opening around it animates to its full height.
+						<img
+							src={displayUrl}
+							alt=""
+							className={cn(
+								IMAGE_EDGE,
+								"emdash-media-transparency-grid max-h-60 min-h-20 w-full rounded-lg object-cover",
+							)}
+							style={{
+								objectPosition,
+								aspectRatio:
+									currentWidth && currentHeight ? `${currentWidth} / ${currentHeight}` : "16 / 9",
+							}}
+							onError={() => setImageBroken(true)}
+						/>
+					)}
+					<div
+						className={cn(
+							"absolute end-2 top-2 flex gap-1",
+							imageBroken ? undefined : PHOTO_REVEAL,
+						)}
+					>
+						{photoActions}
+					</div>
+				</div>
+			) : displayUrl ? (
+				imageBroken ? (
+					<div className="grid gap-2">
+						<div className="flex min-h-20 items-center justify-center gap-2 rounded-lg border bg-kumo-tint text-kumo-subtle">
+							<ImageBroken className="h-5 w-5" />
+							<span className="text-xs leading-4">{t`Image not found`}</span>
+						</div>
+						{primaryActions}
+					</div>
+				) : (
+					<div className="grid gap-2">
+						<img
+							src={displayUrl}
+							alt=""
+							className="emdash-media-transparency-grid max-h-48 min-h-20 rounded-lg border object-cover"
+							style={{ objectPosition }}
+							onError={() => setImageBroken(true)}
+						/>
+						{primaryActions}
+					</div>
+				)
+			) : isFeatured ? (
+				<ImageDropTarget
+					label={label}
+					onSelect={() => openPicker("image")}
+					onUploaded={handlePrimarySelect}
+					allowedMimeTypes={allowedMimeTypes}
+					fieldId={fieldId}
+					blockType={blockType}
+					blockVersion={blockVersion}
+					buttonProps={requiredErrorProps}
+				/>
+			) : (
+				<Button
+					ref={labelled ? slotButtonRef : undefined}
+					type="button"
+					variant="outline"
+					className={cn(
+						"justify-center border-dashed bg-kumo-control",
+						labelled ? "mx-2 h-14 w-auto" : "h-32 w-full",
+					)}
+					onClick={() => openPicker("image")}
+					{...(labelled ? { "aria-describedby": describedBy } : requiredErrorProps)}
+				>
+					<div
+						className={cn(
+							"flex items-center gap-2",
+							!labelled && "flex-col",
+							invalid ? "text-kumo-danger" : "text-kumo-subtle",
+						)}
+					>
+						<ImageIcon className={labelled ? "size-5" : "h-8 w-8"} />
+						<span>{t`Select image`}</span>
+					</div>
+				</Button>
+			)}
+			{darkVariantSlot}
+			{picker}
+			{assetEditor.dialog}
+			{assetEditor.error && (
+				<p role="alert" className="text-xs leading-4 text-kumo-danger">
+					{assetEditor.error}
+				</p>
+			)}
+			{showRequiredError && !labelled && (
+				<RequiredFieldMessage id={errorId}>{t`This field is required`}</RequiredFieldMessage>
+			)}
+		</div>
+	);
+}

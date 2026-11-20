@@ -1,0 +1,90 @@
+/**
+ * Sitemap index endpoint
+ *
+ * GET /sitemap.xml - Sitemap index listing the child sitemaps.
+ *
+ * Each collection with published, indexable content gets a child sitemap
+ * at /sitemap-{collection}.xml, continued at /sitemap-{collection}-{n}.xml
+ * once it exceeds one page. The index includes a <lastmod> per child
+ * derived from the most recently updated entry on that page.
+ */
+
+import type { APIRoute } from "astro";
+
+import { handleSitemapIndexData } from "#api/handlers/seo.js";
+import { getPublicSiteUrl } from "#api/public-url.js";
+import { getSiteSettingsWithDb } from "#settings/index.js";
+
+export const prerender = false;
+
+const AMP_RE = /&/g;
+const LT_RE = /</g;
+const GT_RE = />/g;
+const QUOT_RE = /"/g;
+const APOS_RE = /'/g;
+
+export const GET: APIRoute = async ({ locals, url }) => {
+	const { emdash } = locals;
+
+	if (!emdash?.db) {
+		return new Response("<!-- EmDash not configured -->", {
+			status: 500,
+			headers: { "Content-Type": "application/xml" },
+		});
+	}
+
+	try {
+		const settings = await getSiteSettingsWithDb(emdash.db);
+		const siteUrl = getPublicSiteUrl(url, emdash.config, settings.url, import.meta.env.BASE_URL);
+
+		const result = await handleSitemapIndexData(emdash.db);
+
+		if (!result.success || !result.data) {
+			return new Response("<!-- Failed to generate sitemap -->", {
+				status: 500,
+				headers: { "Content-Type": "application/xml" },
+			});
+		}
+
+		const { sitemaps } = result.data;
+
+		const lines: string[] = [
+			'<?xml version="1.0" encoding="UTF-8"?>',
+			'<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+		];
+
+		for (const sitemap of sitemaps) {
+			const suffix = sitemap.page === 1 ? "" : `-${sitemap.page}`;
+			const loc = `${siteUrl}/sitemap-${encodeURIComponent(sitemap.collection)}${suffix}.xml`;
+			lines.push("  <sitemap>");
+			lines.push(`    <loc>${escapeXml(loc)}</loc>`);
+			lines.push(`    <lastmod>${escapeXml(sitemap.lastmod)}</lastmod>`);
+			lines.push("  </sitemap>");
+		}
+
+		lines.push("</sitemapindex>");
+
+		return new Response(lines.join("\n"), {
+			status: 200,
+			headers: {
+				"Content-Type": "application/xml; charset=utf-8",
+				"Cache-Control": "public, max-age=3600",
+			},
+		});
+	} catch {
+		return new Response("<!-- Internal error generating sitemap -->", {
+			status: 500,
+			headers: { "Content-Type": "application/xml" },
+		});
+	}
+};
+
+/** Escape special XML characters in a string */
+function escapeXml(str: string): string {
+	return str
+		.replace(AMP_RE, "&amp;")
+		.replace(LT_RE, "&lt;")
+		.replace(GT_RE, "&gt;")
+		.replace(QUOT_RE, "&quot;")
+		.replace(APOS_RE, "&apos;");
+}

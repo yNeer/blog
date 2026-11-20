@@ -1,0 +1,407 @@
+/**
+ * Base API client configuration and shared types
+ */
+
+import type { Element } from "@emdash-cms/blocks";
+import { i18n } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
+
+import type { EditorDraftAccessDeclaration } from "../sandboxed-editor-extensions.js";
+
+export const API_BASE = "/_emdash/api";
+
+const forbiddenResponseListeners = new Set<() => void>();
+
+/**
+ * Fetch wrapper that adds the X-EmDash-Request CSRF protection header
+ * to all requests. All API calls should use this instead of raw fetch().
+ */
+export async function apiFetch(
+	input: string | URL | Request,
+	init?: RequestInit,
+): Promise<Response> {
+	const headers = new Headers(init?.headers);
+	headers.set("X-EmDash-Request", "1");
+	const response = await fetch(input, { ...init, headers });
+	if (response.status === 403) {
+		for (const listener of forbiddenResponseListeners) listener();
+	}
+	return response;
+}
+
+/**
+ * Calls `listener` after every `apiFetch` request the server refuses with 403.
+ * Returns a function that removes the listener.
+ */
+export function onForbiddenResponse(listener: () => void): () => void {
+	forbiddenResponseListeners.add(listener);
+	return () => {
+		forbiddenResponseListeners.delete(listener);
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+export class ApiResponseError extends Error {
+	constructor(
+		public status: number,
+		public code: string,
+		message: string,
+		public details?: Record<string, unknown>,
+	) {
+		super(message);
+		this.name = "ApiResponseError";
+	}
+}
+
+/** A list a change was based on changed on the server, so the change needs a fresh read. */
+export function isListConflict(error: unknown): boolean {
+	return error instanceof ApiResponseError && error.code === "LIST_CONFLICT";
+}
+
+/**
+ * Extract per-field validation issue messages from a `VALIDATION_ERROR`
+ * response's `error.details.issues` array (see `packages/core/src/api/parse.ts`).
+ * Returns undefined when the shape doesn't match, so callers can fall back
+ * to the generic top-level message.
+ */
+function formatValidationIssues(error: Record<string, unknown>): string | undefined {
+	if (error.code !== "VALIDATION_ERROR") return undefined;
+	if (!isRecord(error.details)) return undefined;
+	const issues = error.details.issues;
+	if (!Array.isArray(issues) || issues.length === 0) return undefined;
+
+	const messages = issues
+		.map((issue: unknown) => {
+			if (!isRecord(issue)) return undefined;
+			const { path, message } = issue;
+			if (typeof message !== "string") return undefined;
+			return typeof path === "string" && path.length > 0 ? `${path}: ${message}` : message;
+		})
+		.filter((m): m is string => m !== undefined);
+
+	return messages.length > 0 ? messages.join("; ") : undefined;
+}
+
+function formatSandboxedSaveRejection(error: Record<string, unknown>): string | undefined {
+	if (error.code !== "SAVE_REJECTED" || !isRecord(error.details)) return undefined;
+	const { pluginId, reason } = error.details;
+	if (typeof pluginId !== "string" || typeof reason !== "string") return undefined;
+	if (pluginId.length === 0 || reason.length === 0) return undefined;
+	return i18n._(msg`Plugin ${pluginId} rejected the save: ${reason}`);
+}
+
+/**
+ * Client errors that pass no verdict on the request body, so resending it
+ * unchanged can still succeed. Every other 4xx repeats its verdict on every
+ * attempt.
+ */
+const RETRYABLE_CLIENT_ERROR_STATUSES: ReadonlySet<number> = new Set([
+	408, // Request Timeout: the server gave up waiting for the request
+	421, // Misdirected Request: another connection can be routed correctly
+	425, // Too Early: sent as TLS early data, replayable after the handshake
+	429, // Too Many Requests: succeeds once the rate limit window has passed
+]);
+
+/** Whether retrying the same request unchanged can never succeed. */
+export function isTerminalRequestError(error: unknown): boolean {
+	if (!(error instanceof ApiResponseError)) return false;
+	return (
+		error.status >= 400 && error.status < 500 && !RETRYABLE_CLIENT_ERROR_STATUSES.has(error.status)
+	);
+}
+
+/**
+ * Throw an error with the message from the API response body if available,
+ * falling back to a generic message. All API error responses use the shape
+ * `{ success: false, error: { code, message, details? } }`. For validation
+ * errors, the field-level messages in `error.details.issues` are surfaced
+ * instead of the generic "Invalid request data" top-level message.
+ */
+export async function throwResponseError(res: Response, fallback: string): Promise<never> {
+	const body: unknown = await res.json().catch(() => ({}));
+	let message: string | undefined;
+	let code = "UNKNOWN_ERROR";
+	let details: Record<string, unknown> | undefined;
+	if (isRecord(body) && isRecord(body.error)) {
+		const { error } = body;
+		message = formatValidationIssues(error);
+		if (!message) message = formatSandboxedSaveRejection(error);
+		if (!message && typeof error.message === "string") message = error.message;
+		if (typeof error.code === "string") code = error.code;
+		if (isRecord(error.details)) details = error.details;
+	}
+	throw new ApiResponseError(res.status, code, message || fallback, details);
+}
+
+/**
+ * Generic paginated result
+ */
+export interface FindManyResult<T> {
+	items: T[];
+	nextCursor?: string;
+	/**
+	 * Total number of rows matching the filters (ignoring pagination).
+	 * Optional because older servers may not return it.
+	 */
+	total?: number;
+}
+
+/**
+ * Admin manifest describing available collections and plugins
+ */
+export interface AdminManifest {
+	version: string;
+	/** The commit EmDash was built from, when known. */
+	commit?: string;
+	/** Version of Astro the host is built with, when resolvable. */
+	astroVersion?: string;
+	/** Site title used for browser tab titles. */
+	siteTitle?: string;
+	/** IANA timezone used to interpret datetime-local editor values. */
+	timezone?: string;
+	hash: string;
+	collections: Record<
+		string,
+		{
+			label: string;
+			labelSingular: string;
+			supports: string[];
+			hasSeo: boolean;
+			urlPattern?: string;
+			routable?: boolean;
+			titleField?: string;
+			dateField?: string;
+			hidden?: boolean;
+			/** Phosphor icon name for the sidebar entry */
+			icon?: string;
+			/** Sidebar folder shared with other collections of the same group */
+			group?: string;
+			/** `false` omits the dashboard's "new entry" quick action */
+			quickCreate?: boolean;
+			listColumns?: string[];
+			fields: Record<
+				string,
+				{
+					/** Database row ID (ULID) for the field. Used to widen MIME allowlists on upload/media-list calls. */
+					id?: string;
+					kind: string;
+					label?: string;
+					required?: boolean;
+					translatable?: boolean;
+					widget?: string;
+					/**
+					 * For `select` / `multiSelect`: the list of enum choices.
+					 * For `json` fields driven by a plugin `widget`: arbitrary widget config.
+					 */
+					options?: Array<{ value: string; label: string }> | Record<string, unknown>;
+					validation?: Record<string, unknown>;
+					unsupportedType?: { type: string; path: string };
+					blockTypes?: import("./schema.js").BlockType[];
+					blockTypeFingerprint?: string;
+					/** Value a new entry starts with. */
+					defaultValue?: unknown;
+					/** Set on `integer` fields, which share the `number` kind. */
+					integer?: boolean;
+				}
+			>;
+		}
+	>;
+	plugins: Record<
+		string,
+		{
+			name?: string;
+			version?: string;
+			/** Package name for dynamic import (e.g., "@emdash-cms/plugin-audit-log") */
+			package?: string;
+			/** Whether the plugin is enabled */
+			enabled?: boolean;
+			/**
+			 * How this plugin renders its admin UI:
+			 * - "react": Trusted plugin with React components
+			 * - "blocks": Declarative Block Kit UI via admin route handler
+			 * - "none": No admin UI
+			 */
+			adminMode?: "react" | "blocks" | "none";
+			adminPages?: Array<{
+				path: string;
+				label?: string;
+				icon?: string;
+				group?: string;
+			}>;
+			dashboardWidgets?: Array<{
+				id: string;
+				title?: string;
+				size?: "full" | "half" | "third";
+			}>;
+			editorPanels?: Array<{
+				id: string;
+				title: string;
+				route: string;
+				collections?: string[];
+				order?: number;
+				draft?: EditorDraftAccessDeclaration;
+			}>;
+			editorActions?: Array<{
+				id: string;
+				label: string;
+				route: string;
+				placement: "toolbar" | "overflow";
+				collections?: string[];
+				style?: "default" | "danger";
+				confirm?: import("@emdash-cms/blocks").ConfirmDialog;
+				draft?: EditorDraftAccessDeclaration;
+			}>;
+			fieldWidgets?: Array<{
+				name: string;
+				label: string;
+				fieldTypes: string[];
+				elements?: import("@emdash-cms/blocks").Element[];
+			}>;
+			/** Block types for Portable Text editor */
+			portableTextBlocks?: Array<{
+				type: string;
+				label: string;
+				icon?: string;
+				description?: string;
+				placeholder?: string;
+				fields?: Element[];
+				category?: string;
+			}>;
+		}
+	>;
+	/**
+	 * Auth mode for the admin UI. When "passkey", the security settings
+	 * (passkey management, self-signup domains) are shown. When using
+	 * external auth (e.g., "cloudflare-access"), these are hidden since
+	 * authentication is handled externally.
+	 */
+	authMode: string;
+	/**
+	 * Whether the external auth provider replaces user names on every
+	 * authenticated request, so names cannot be edited in the admin.
+	 */
+	providerManagedName?: boolean;
+	/**
+	 * Whether self-signup is enabled (at least one allowed domain is active).
+	 * Used by the login page to conditionally show the "Sign up" link.
+	 */
+	signupEnabled?: boolean;
+	/** Whether the site is in staging (hidden from search engines). */
+	staging?: boolean;
+	/** Whether this host runs co-editing rooms. When false, the editor doesn't ask to join one. */
+	coEditing?: boolean;
+	/**
+	 * i18n configuration. Present when multiple locales are configured.
+	 */
+	i18n?: {
+		defaultLocale: string;
+		locales: string[];
+		prefixDefaultLocale?: boolean;
+	};
+	/** Stored-content locale policy, independent from the admin UI language. */
+	contentLocale?: {
+		defaultLocale: string;
+		implicit: boolean;
+	};
+	/**
+	 * Taxonomy definitions for the admin sidebar.
+	 */
+	taxonomies: Array<{
+		id?: string;
+		name: string;
+		label: string;
+		labelSingular?: string;
+		hierarchical: boolean;
+		collections: string[];
+		locale?: string;
+		translationGroup?: string | null;
+	}>;
+	/**
+	 * Whether legacy marketplace lifecycle support is configured. The admin
+	 * uses this to show migration guidance; marketplace discovery stays hidden.
+	 * @deprecated Present only while the site supports installed Marketplace plugins.
+	 */
+	marketplace?: boolean;
+	/** Whether a sandbox runner is enabled for installing and running sandboxed plugins. */
+	sandboxEnabled?: boolean;
+	/**
+	 * Decentralized plugin registry. Defaults to the hosted aggregator when
+	 * the plugin sandbox is enabled, or reflects an explicit registry config.
+	 */
+	registry?: {
+		aggregatorUrl: string;
+		acceptLabelers?: string;
+		policy?: {
+			minimumReleaseAgeSeconds?: number;
+			minimumReleaseAgeExclude?: string[];
+		};
+	};
+	/** Field-level diagnostic returned when registry configuration is invalid. */
+	registryConfigurationError?: {
+		code:
+			| "REGISTRY_AGGREGATOR_URL_REQUIRED"
+			| "REGISTRY_AGGREGATOR_URL_INVALID"
+			| "REGISTRY_AGGREGATOR_URL_FORBIDDEN"
+			| "REGISTRY_MINIMUM_RELEASE_AGE_INVALID"
+			| "REGISTRY_MINIMUM_RELEASE_AGE_EXCLUDE_INVALID";
+		field:
+			| "registry.aggregatorUrl"
+			| "registry.policy.minimumReleaseAge"
+			| "registry.policy.minimumReleaseAgeExclude";
+	};
+	/**
+	 * Admin branding overrides for white-labeling.
+	 * Set via the `admin` config in `astro.config.mjs`.
+	 */
+	admin?: {
+		logo?: string;
+		siteName?: string;
+		footerLabel?: string | false;
+		/** Built-in navigation entries hidden from the sidebar and command palette. */
+		hiddenNavItems?: string[];
+		favicon?: string;
+	};
+}
+
+/**
+ * Parse an API response with the { success, data: T } envelope.
+ *
+ * Handles error responses via throwResponseError, then unwraps the data envelope.
+ * Replaces both bare `response.json()` and field-unwrap patterns.
+ */
+export async function parseApiResponse<T>(
+	response: Response,
+	fallbackMessage = i18n._(msg`Request failed`),
+): Promise<T> {
+	if (!response.ok) await throwResponseError(response, fallbackMessage);
+	const body: { data: T } = await response.json();
+	return body.data;
+}
+
+/**
+ * Fetch admin manifest
+ */
+export async function fetchManifest(): Promise<AdminManifest> {
+	const response = await apiFetch(`${API_BASE}/manifest`);
+	return parseApiResponse<AdminManifest>(response, i18n._(msg`Failed to fetch manifest`));
+}
+
+/**
+ * Fetch auth mode (public endpoint — works without authentication).
+ * Used by the login page to determine which login UI to render.
+ */
+export async function fetchAuthMode(): Promise<{
+	authMode: string;
+	signupEnabled?: boolean;
+	providers?: Array<{ id: string; label: string }>;
+}> {
+	const response = await apiFetch(`${API_BASE}/auth/mode`);
+	return parseApiResponse<{
+		authMode: string;
+		signupEnabled?: boolean;
+		providers?: Array<{ id: string; label: string }>;
+	}>(response, i18n._(msg`Failed to fetch auth mode`));
+}

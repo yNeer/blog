@@ -1,0 +1,187 @@
+# @emdash-cms/plugin-forms
+
+## 0.2.13
+
+### Patch Changes
+
+- [#4521](https://github.com/emdash-cms/emdash/pull/4521) [`c22e634`](https://github.com/emdash-cms/emdash/commit/c22e63492968cfff31f13ac40c10e1e80c6f4c52) Thanks [@emdash-autofix](https://github.com/apps/emdash-autofix)! - Fixes the Recent Submissions widget and Submissions page opening on a newer, empty form when another form has received submissions. Both now select the form with the latest submission, skipping forms with no remaining submissions.
+
+- [#4488](https://github.com/emdash-cms/emdash/pull/4488) [`c29f10b`](https://github.com/emdash-cms/emdash/commit/c29f10bec063fb1cddf75e742bb34b3b8e99b44b) Thanks [@Chiji1108](https://github.com/Chiji1108)! - Fixes a form saving its fields to session storage again after a successful submission had cleared them, when the visitor submitted within half a second of typing. The next page in that tab that showed the form restored those stale values.
+
+- [#4466](https://github.com/emdash-cms/emdash/pull/4466) [`239e9d2`](https://github.com/emdash-cms/emdash/commit/239e9d2763a48a7acb4bfe1cd92890a894d49cd8) Thanks [@emdash-autofix](https://github.com/apps/emdash-autofix)! - Adds the missing form editor controls for daily digests, autoresponder emails, webhooks, field conditions, placeholders, help text, and default values. These existing options can now be viewed and changed in the admin instead of through the API. To disable a saved autoresponder through the update API, send `settings.autoresponder: null`.
+  
+  The editor now uses `@lingui/react` as a peer dependency for translations. On older EmDash hosts that do not share the admin's Lingui context, the new controls fall back to English.
+  
+  Fixes public form conditions controlled by a single checkbox or radio so unchecked controls count as empty. Dependents using "Is empty" now appear when the controller is unchecked, allowing required fields to be completed before submission. Placeholder and default-value inputs are only shown for field types that support them; file fields and checkbox groups are not offered as new condition controllers.
+
+- [#4544](https://github.com/emdash-cms/emdash/pull/4544) [`b53900a`](https://github.com/emdash-cms/emdash/commit/b53900a3350df391f635e47c193244fa0324e731) Thanks [@danielmlr](https://github.com/danielmlr)! - Fixes the Required checkbox on each field in the form editor sitting higher than the Type and Width dropdowns beside it. It now lines up with the dropdowns.
+
+- [#4489](https://github.com/emdash-cms/emdash/pull/4489) [`8abdd39`](https://github.com/emdash-cms/emdash/commit/8abdd399066cf973cf04b071a1601226ecd68dff) Thanks [@Chiji1108](https://github.com/Chiji1108)! - Fixes screen readers announcing an English "required" on forms in other languages. The required asterisk is now hidden from assistive technology, which already announces required fields from the input itself in the reader's language.
+
+- [#4762](https://github.com/emdash-cms/emdash/pull/4762) [`afac393`](https://github.com/emdash-cms/emdash/commit/afac3935261c65800d59c9a7f5b915113395ad7d) Thanks [@emdash-autofix](https://github.com/apps/emdash-autofix)! - Fixes the Forms Submissions page showing Editors controls that return permission errors. Star, status, delete, and CSV/JSON export controls now appear only for administrators; Editors can still view submissions, filter them, and open their details.
+
+- [#4505](https://github.com/emdash-cms/emdash/pull/4505) [`bd04c5f`](https://github.com/emdash-cms/emdash/commit/bd04c5fff521b20948b2f692630f8c543bc74eb1) Thanks [@eisenbruch](https://github.com/eisenbruch)! - Fixes the autoresponder and the notification Reply-To using a form's first email field even when it is optional. On a form with an optional business address before the submitter's own, the confirmation went to the business address, or nowhere when that field was left empty. They now use the first required email field that has a value, then any filled email field.
+
+- [#4552](https://github.com/emdash-cms/emdash/pull/4552) [`35183ee`](https://github.com/emdash-cms/emdash/commit/35183ee4b83a3029c1ad6fc221755ee9b5378cbc) Thanks [@emdash-autofix](https://github.com/apps/emdash-autofix)! - Fixes telephone fields rejecting numbers that start with a parenthesized area code, such as `(555) 123-4567` or `(11) 90000-0000`.
+
+- [#4308](https://github.com/emdash-cms/emdash/pull/4308) [`4df65eb`](https://github.com/emdash-cms/emdash/commit/4df65eba3e4dd2f990c92f65a4748117182949d5) Thanks [@khoinguyenpham04](https://github.com/khoinguyenpham04)! - Updates `@cloudflare/kumo` to 2.15.0. These packages now require exactly `@cloudflare/kumo@2.15.0`, so sites and plugins that install Kumo themselves should upgrade to that version to match the admin's prebuilt styles. Update `emdash` and the Forms, Field Kit, AI Moderation and AI Search plugins together: their earlier releases require Kumo 2.6.0, and these plugin releases need an `emdash` release with this change. Updating only one side leaves Kumo 2.15 next to an admin built for 2.6.
+  
+  In the admin, Select menus now open below their field instead of over it, and text sized `text-base` or `text-lg` has a taller line (1.5), so labels and headings take slightly more height. Kumo's `DropdownMenu` now spaces item icons itself, so plugin admin pages should remove any margin classes such as `me-2` from the elements they pass as an item's `icon`.
+
+## 0.2.12
+
+### Patch Changes
+
+- [#4377](https://github.com/emdash-cms/emdash/pull/4377) [`e6f6cd3`](https://github.com/emdash-cms/emdash/commit/e6f6cd3231cc5e61f25af4cd30569fbfe9f3d584) Thanks [@emdash-autofix](https://github.com/apps/emdash-autofix)! - Fixes embedded forms resetting custom submit button labels to "Submit" after successful or failed submissions.
+
+- [#3373](https://github.com/emdash-cms/emdash/pull/3373) [`88c2fa3`](https://github.com/emdash-cms/emdash/commit/88c2fa38556f7efae5d2d7e28ff9fff3644b9063) Thanks [@marks-zyz](https://github.com/marks-zyz)! - Editors can now view forms and all their submissions instead of seeing "Failed to load forms" or "No forms yet". The webhook URL stays hidden from them, and changing or deleting forms and submissions, and the export, stay admin-only. When a role still cannot read forms, the pages and the Recent Submissions widget now say so, and a write action that returns 403 shows a permission message instead of doing nothing.
+
+- [#4294](https://github.com/emdash-cms/emdash/pull/4294) [`d5cde58`](https://github.com/emdash-cms/emdash/commit/d5cde58a8ca3a13ba8057182c0d6a9a99de0ffaf) Thanks [@danielmlr](https://github.com/danielmlr)! - Hides submitters' IP addresses, user agents and referers from Editors. The `submissions/list` and `submissions/get` routes now return them to Admins only; the admin UI never showed them.
+
+- [#4144](https://github.com/emdash-cms/emdash/pull/4144) [`e5d9241`](https://github.com/emdash-cms/emdash/commit/e5d9241382e7f811433c7212a4619a7d3036f8db) Thanks [@marccardinal](https://github.com/marccardinal)! - Fixes form notification emails so that replying to one reaches the person who submitted the form. Instant notifications now set Reply-To to the address entered in the form's email field; before, a reply went to the site's sender address. The daily digest is unchanged. Reply-To is only set when the address is a plain, valid email: forms without an email field, submissions that leave it empty, or addresses like `"Name"<someone@example.com>` send notifications without a Reply-To, as before. On sites that set `replyTo` on the Cloudflare email provider, replies to these notifications now go to the visitor instead of that address. The site's email provider plugin must deliver `replyTo` (see the `email:deliver` hook).
+
+- [#4345](https://github.com/emdash-cms/emdash/pull/4345) [`fbf933d`](https://github.com/emdash-cms/emdash/commit/fbf933d6028109cbaf190c15d26c3601850a7ab5) Thanks [@Chiji1108](https://github.com/Chiji1108)! - Fixes required select fields without a default value preselecting their first option, so visitors must now pick an option before the form submits. The empty first option shows the field's `placeholder` when one is set.
+
+- [#4295](https://github.com/emdash-cms/emdash/pull/4295) [`bef030b`](https://github.com/emdash-cms/emdash/commit/bef030ba6c4e7ab7b07ccbd18f466483bab49acc) Thanks [@danielmlr](https://github.com/danielmlr)! - Fixes the Submissions page sometimes showing the submissions or load error of an earlier selection after switching forms or the status filter while the list was still loading. The Recent Submissions widget now says "Failed to load submissions" when the submissions request fails with a network error.
+
+- [#4078](https://github.com/emdash-cms/emdash/pull/4078) [`b0268a5`](https://github.com/emdash-cms/emdash/commit/b0268a5645283230630483133a37347cb98f5840) Thanks [@Cloud-Xero](https://github.com/Cloud-Xero)! - Fixes the `FormEmbed` textarea so it starts empty instead of containing indentation from the component source. Previously the caret began on a second line, an untouched `required` textarea passed the browser's validation, and the stray whitespace also surrounded a configured default value and returned after a successful submit reset the form.
+
+## 0.2.11
+
+### Patch Changes
+
+- [#4249](https://github.com/emdash-cms/emdash/pull/4249) [`05c06a3`](https://github.com/emdash-cms/emdash/commit/05c06a31cc87f1b38916eff596efaeb378f4e4f9) Thanks [@emdashbot](https://github.com/apps/emdashbot)! - Fixes conditional form fields remaining visible when their condition is false on sites using the forms plugin's default stylesheet.
+
+- [#4247](https://github.com/emdash-cms/emdash/pull/4247) [`1d9bc72`](https://github.com/emdash-cms/emdash/commit/1d9bc72126ef86b0553f9ef7548a12496a17fc96) Thanks [@emdashbot](https://github.com/apps/emdashbot)! - Fixes single `checkbox` fields so the input keeps its intrinsic width and sits next to its label, instead of stretching to full width and pushing the label away.
+
+- [#4248](https://github.com/emdash-cms/emdash/pull/4248) [`29c43c3`](https://github.com/emdash-cms/emdash/commit/29c43c38e2d9698740485cc1fb17b86168eb922d) Thanks [@emdashbot](https://github.com/apps/emdashbot)! - Fixes single checkbox fields so a checked box is stored as `true` when the default submitted value is `"1"`. Required checkbox fields that are not checked are still rejected during validation.
+
+## 0.2.10
+
+### Patch Changes
+
+- [#3979](https://github.com/emdash-cms/emdash/pull/3979) [`65aa1f4`](https://github.com/emdash-cms/emdash/commit/65aa1f4608116c668b9e04f81dcf468a15b3a1b8) Thanks [@eisenbruch](https://github.com/eisenbruch)! - Fixes the daily digest. Creating a form with the digest on, or turning it on for an existing form, failed with an "Invalid task name" error, and a form created that way was saved with the digest on but never sent one. The digest is now scheduled, including for a duplicated form, and is rescheduled or cancelled when the form's digest settings change.
+
+- [#3031](https://github.com/emdash-cms/emdash/pull/3031) [`cc40400`](https://github.com/emdash-cms/emdash/commit/cc40400341760dbf5fce53b54205dfb6bbee5dbd) Thanks [@eisenbruch](https://github.com/eisenbruch)! - Fixes duplicate element IDs when the same form is embedded more than once on a page. Field IDs were built from the form ID and the field name alone, so a form appearing in, say, a sidebar and a pop-up produced several elements sharing an ID: clicking a label focused the first copy rather than the one beside it, and anything resolving an ID — `aria-describedby`, a password manager, a test selector — reached the wrong instance. Each rendering now suffixes its IDs with a per-instance value, so labels, inputs and the honeypot stay paired within their own copy. Element IDs are not part of the plugin's API and nothing else references them; the client script scopes its lookups to the form element.
+
+- [#3032](https://github.com/emdash-cms/emdash/pull/3032) [`b709d72`](https://github.com/emdash-cms/emdash/commit/b709d720e801ce48e5fcae28e25df57f1b34aae6) Thanks [@eisenbruch](https://github.com/eisenbruch)! - Fixes embedded forms showing only the browser's validation bubble instead of the plugin's inline field errors. Native validation is turned off by the client script once it loads, so readers without JavaScript keep it.
+
+## 0.2.9
+
+No changes in this release.
+
+## 0.2.9-rc.0
+
+### Patch Changes
+
+- Updated dependencies [[`d274172`](https://github.com/emdash-cms/emdash/commit/d27417232e61bf85c1c613fecbe6875e1172af0d), [`bc54886`](https://github.com/emdash-cms/emdash/commit/bc5488685c8a886e2375d066d7424ddf4aac9a78), [`0b4be2c`](https://github.com/emdash-cms/emdash/commit/0b4be2c8388744153a7a82814bfe91af09a1fcfd), [`0b4be2c`](https://github.com/emdash-cms/emdash/commit/0b4be2c8388744153a7a82814bfe91af09a1fcfd), [`0b4be2c`](https://github.com/emdash-cms/emdash/commit/0b4be2c8388744153a7a82814bfe91af09a1fcfd), [`0b4be2c`](https://github.com/emdash-cms/emdash/commit/0b4be2c8388744153a7a82814bfe91af09a1fcfd)]:
+  - emdash@1.0.1-rc.0
+
+## 0.2.8
+
+### Patch Changes
+
+- [#3407](https://github.com/emdash-cms/emdash/pull/3407) [`256ba4f`](https://github.com/emdash-cms/emdash/commit/256ba4f774fb5cac0c123731f2b7a63d620c81e2) Thanks [@swissky](https://github.com/swissky)! - Fixes forms with a file field failing on every submission from the bundled form component. With JavaScript enabled, the component now sends a chosen file in the JSON submission body under `files.<fieldName>` as `{ filename, contentType, bytes }`, where `bytes` is the file encoded as base64. A required file field is now satisfied only by an attached file; a value for a file field in `data` is ignored, and a file sent for a field that its condition hides is not uploaded. A submission that attaches a file to one of the form's file fields now fails with a `500` error instead of being saved without it when the site has no media storage configured.
+
+- [#3405](https://github.com/emdash-cms/emdash/pull/3405) [`d9f0d85`](https://github.com/emdash-cms/emdash/commit/d9f0d851081b528039a011628ead10f61e7d51b2) Thanks [@swissky](https://github.com/swissky)! - Fixes public form submissions ignoring a file field's maximum file size, which let a visitor upload a file of any size. Submitted files are now checked against the field's `maxFileSize`, and no file can exceed 10 MB, even when the field's limit is higher or unset. Empty files are rejected. A file that fails its field's size or accepted-types check is rejected before any file in the submission is uploaded, and when a later upload fails, the files already uploaded for that submission are deleted.
+  
+  A file's `bytes` can now be sent as a base64 string, which is about a third larger than the file, instead of as an array of byte values, which is several times larger. Arrays of byte values are still accepted.
+  
+  Once `emdash` is also updated, file fields accept only PNG, JPEG, GIF, WebP, and AVIF images, video, audio, and PDF files. Submissions with any other file type are rejected with a `415` error, even when the field's accepted types list them, and a file with a malformed content type is rejected with a `400` error.
+
+- [#3207](https://github.com/emdash-cms/emdash/pull/3207) [`15d032f`](https://github.com/emdash-cms/emdash/commit/15d032fc26c22b58b496bfba1dfb756e56790181) Thanks [@eisenbruch](https://github.com/eisenbruch)! - Updating one form setting no longer resets the others. A partial `forms/update` previously filled in schema defaults for every setting the caller left out, so changing a notification address also reset the form's confirmation message, submit label, digest options, retention and — most seriously — its spam protection, silently turning off Cloudflare Turnstile.
+
+## 0.2.7
+
+### Patch Changes
+
+- [#3181](https://github.com/emdash-cms/emdash/pull/3181) [`ed3e9f5`](https://github.com/emdash-cms/emdash/commit/ed3e9f5afc08ce5ab399f1aeeb027c680e33723b) Thanks [@eisenbruch](https://github.com/eisenbruch)! - Fixes a form's webhook silently doing nothing. The call was never awaited or handed to the runtime, so on Cloudflare Workers it could be dropped once the visitor's confirmation had been sent; it now runs through `after()`, which registers it with the host so it is guaranteed to finish. A response that is not a success is also logged now: `fetch` only rejects on a transport error, so a 4xx, a 5xx, and the sign-in page an authenticated endpoint redirects to were all treated as if the webhook had worked, leaving no trace anywhere. The redirect case is detected by comparing the final URL rather than `Response.redirected`, because plugin HTTP access follows redirects itself and always reports `redirected: false`.
+
+- [#3139](https://github.com/emdash-cms/emdash/pull/3139) [`59ebc01`](https://github.com/emdash-cms/emdash/commit/59ebc01e404be8207be7e0d9615b024bec3a0e43) Thanks [@emdashbot](https://github.com/apps/emdashbot)! - Fixes checkbox-group validation so forms submit successfully when more than one option is selected.
+
+## 0.2.6
+
+### Patch Changes
+
+- [#2864](https://github.com/emdash-cms/emdash/pull/2864) [`ecdba4d`](https://github.com/emdash-cms/emdash/commit/ecdba4d1338447e1a267a3498764f9a1de2a0636) Thanks [@camc314](https://github.com/camc314)! - Updates Zod to 4.5 while keeping EmDash and native plugin schemas on one compatible version. Existing minute-precision ISO datetimes remain valid, and URL content fields continue to enforce configured length and pattern rules.
+
+## 0.2.5
+
+### Patch Changes
+
+- [#2173](https://github.com/emdash-cms/emdash/pull/2173) [`c91d56b`](https://github.com/emdash-cms/emdash/commit/c91d56bb30b9a865c6e7cbb8c490fb6cc6126611) Thanks [@masonjames](https://github.com/masonjames)! - Fixes the documented `@emdash-cms/plugin-forms/ui` import so standalone forms can be embedded outside Portable Text content.
+
+## 0.2.4
+
+### Patch Changes
+
+- [#1395](https://github.com/emdash-cms/emdash/pull/1395) [`298895d`](https://github.com/emdash-cms/emdash/commit/298895de11562d4a2e9864da91d961fd4ff1eeda) Thanks [@jcheese1](https://github.com/jcheese1)! - Fixes enhanced form submissions so standard EmDash plugin API responses wrapped in `{ data }` show the configured success message instead of the generic error state.
+
+## 0.2.3
+
+### Patch Changes
+
+- [#985](https://github.com/emdash-cms/emdash/pull/985) [`5456514`](https://github.com/emdash-cms/emdash/commit/54565143205035e475dabb16075e09ade046a74c) Thanks [@ppppangu](https://github.com/ppppangu)! - Fixes public form embeds during SSR by allowing frontend plugin components to call public plugin routes without self-fetching.
+
+## 0.2.2
+
+### Patch Changes
+
+- [#983](https://github.com/emdash-cms/emdash/pull/983) [`06d5f3f`](https://github.com/emdash-cms/emdash/commit/06d5f3f016aee44e0b6f44de5d6fc067b3a7b751) Thanks [@ppppangu](https://github.com/ppppangu)! - Fix embedded forms so public rendering accepts the API response envelope returned by the form definition route.
+
+- Updated dependencies [[`f8ee1ed`](https://github.com/emdash-cms/emdash/commit/f8ee1ed5e7b02b8905ebec82fb703e3061fe8161), [`27e6d58`](https://github.com/emdash-cms/emdash/commit/27e6d58ec1ba547ece4736ac0a87309812a95681), [`4c11017`](https://github.com/emdash-cms/emdash/commit/4c11017b833e4c009562b6063fd1fe281639f168), [`f1d4c0b`](https://github.com/emdash-cms/emdash/commit/f1d4c0bfc475ef947f0f4f00d171ab226f89dc6c), [`7c536e5`](https://github.com/emdash-cms/emdash/commit/7c536e59b005a79925dd0ecab46404d9d34196b8), [`d273e9a`](https://github.com/emdash-cms/emdash/commit/d273e9a3d3dff6e356bc17dd3e22d294e9635b03), [`514d32d`](https://github.com/emdash-cms/emdash/commit/514d32d97c11a56cd501f4a45a33524b31badd49), [`8116949`](https://github.com/emdash-cms/emdash/commit/8116949935d7b713ebcb3858435c29e45c00c090), [`c4ee7ad`](https://github.com/emdash-cms/emdash/commit/c4ee7ad838c5fcbc7939fe8102cd87d5d6856e68)]:
+  - emdash@0.11.0
+
+## 0.2.1
+
+### Patch Changes
+
+- [#918](https://github.com/emdash-cms/emdash/pull/918) [`1e0cb76`](https://github.com/emdash-cms/emdash/commit/1e0cb76899ce442fbc99f498fd2b57cb254c7c8d) Thanks [@ascorbic](https://github.com/ascorbic)! - Updates declared capabilities to the current names (`content:read`, `content:write`, `media:read`, `media:write`, `network:request`, `network:request:unrestricted`) instead of the deprecated aliases. Plugin descriptors now report the package's own version instead of a stale hard-coded literal.
+
+- Updated dependencies [[`a2d3658`](https://github.com/emdash-cms/emdash/commit/a2d3658e510f292bf1fbe6b0a9e8e4f02ebc1e03), [`c8a3a2c`](https://github.com/emdash-cms/emdash/commit/c8a3a2cce6bfdcdc6521556bcc507f88bd79ba31), [`699e1b3`](https://github.com/emdash-cms/emdash/commit/699e1b3d208a5ef4bca5dc3a40a39291e484f060), [`71f4e7d`](https://github.com/emdash-cms/emdash/commit/71f4e7d85b2568dbadd9dc6ff26160789cb24e47), [`7e32092`](https://github.com/emdash-cms/emdash/commit/7e32092596149ae2886bae34c8d2f4bad86dbe2f), [`2e2b8e9`](https://github.com/emdash-cms/emdash/commit/2e2b8e90c099f3422808f0e1da9c83a9ec533b64), [`9146931`](https://github.com/emdash-cms/emdash/commit/91469312df211304d51576c9aef621148707b6d3)]:
+  - emdash@0.10.0
+
+## 0.2.0
+
+### Minor Changes
+
+- [#814](https://github.com/emdash-cms/emdash/pull/814) [`a838000`](https://github.com/emdash-cms/emdash/commit/a83800068678daf6391e02bba8acf27ff4db0e19) Thanks [@arashackdev](https://github.com/arashackdev)! - rtl srtyle improvements and LTR/RTL compatible arrow/caret icons
+
+### Patch Changes
+
+- Updated dependencies [[`e2b3c6c`](https://github.com/emdash-cms/emdash/commit/e2b3c6cd930d5fa6fc607a0b26fd796f5b0f98b2), [`9dfc65c`](https://github.com/emdash-cms/emdash/commit/9dfc65c42c04c41088e0c8f5a8ca4347643e2fea), [`e0dc6fb`](https://github.com/emdash-cms/emdash/commit/e0dc6fb8adadc0e048f3f314d62bfa98d9bb48d4), [`c22fb3a`](https://github.com/emdash-cms/emdash/commit/c22fb3a10d445f12cca91620c9258d50695afa44), [`6a4e9b8`](https://github.com/emdash-cms/emdash/commit/6a4e9b8b0fa6064989224a42b14de435f487a76f), [`0ee372a`](https://github.com/emdash-cms/emdash/commit/0ee372a7f33eecce7d90e12624923d2d9c132adf), [`22a16ee`](https://github.com/emdash-cms/emdash/commit/22a16eed607a4e81391ecb6c45fe2e59aaca92fe), [`1e2b024`](https://github.com/emdash-cms/emdash/commit/1e2b02486ee0407e4f50b8342ba1a9e7d060e405), [`81662e9`](https://github.com/emdash-cms/emdash/commit/81662e98fcf1ad0ee880d4f1af96271c527d7423), [`2f22f57`](https://github.com/emdash-cms/emdash/commit/2f22f57abadf305cf6d3ce07ee78290178e032d1), [`ef3f076`](https://github.com/emdash-cms/emdash/commit/ef3f076c8112e9dffc2a87c019e5521e823f5e86), [`a9c29ea`](https://github.com/emdash-cms/emdash/commit/a9c29ea584300f6cf67206bedcb1d39f05ea1c26), [`e7df21f`](https://github.com/emdash-cms/emdash/commit/e7df21f0adca795cdb233d6e64cd543ead7e2347), [`d5f7c48`](https://github.com/emdash-cms/emdash/commit/d5f7c481a507868f470361cfd715a5828640d45a), [`8ae227c`](https://github.com/emdash-cms/emdash/commit/8ae227cceade5c9852897c7b56f89e7422ee82a1), [`e2d5d16`](https://github.com/emdash-cms/emdash/commit/e2d5d160acea4444945b1ea79c80ca9ce138965b), [`0d98c62`](https://github.com/emdash-cms/emdash/commit/0d98c620a5f407648f3b7f3cbd30b642c74be607), [`64bf5b9`](https://github.com/emdash-cms/emdash/commit/64bf5b98125ca18ec26f7e0e65a71fcbe71fd44f), [`e81aa0f`](https://github.com/emdash-cms/emdash/commit/e81aa0f717be11bacdff30ed9bbc454824268555), [`0041d76`](https://github.com/emdash-cms/emdash/commit/0041d7699b32b77b4cd2ecd77b97340f0dd3abce), [`cee403d`](https://github.com/emdash-cms/emdash/commit/cee403d5c008feb9ca60bb7201e151b828737743), [`a8bac5d`](https://github.com/emdash-cms/emdash/commit/a8bac5d7216e185b1bd9a2aaaeaa9a0306ab066e), [`5b6f059`](https://github.com/emdash-cms/emdash/commit/5b6f059d06175ae0cb740d1ba32867d1ec6b2249), [`a86ff80`](https://github.com/emdash-cms/emdash/commit/a86ff80836fed175508ff06f744c7ad6b805627c), [`d4be24f`](https://github.com/emdash-cms/emdash/commit/d4be24f478a0c8d0a7bba3c299e11105bba3ed94), [`eb6dbd0`](https://github.com/emdash-cms/emdash/commit/eb6dbd056717fd076a8b5fa807d91516a00f5f2f)]:
+  - emdash@0.9.0
+
+## 0.1.1
+
+### Patch Changes
+
+- [#120](https://github.com/emdash-cms/emdash/pull/120) [`66beb4d`](https://github.com/emdash-cms/emdash/commit/66beb4da1f53433cedb11b0a5537c646b181ca82) Thanks [@JULJERYT](https://github.com/JULJERYT)! - Fix DOM XSS in form redirects
+
+- Updated dependencies [[`422018a`](https://github.com/emdash-cms/emdash/commit/422018aeb227dffe3da7bfc772d86f9ce9c2bcd1), [`4221ba4`](https://github.com/emdash-cms/emdash/commit/4221ba48bc87ab9fa0b1bae144f6f2920beb4f5a), [`9269759`](https://github.com/emdash-cms/emdash/commit/9269759674bf254863f37d4cf1687fae56082063), [`d6cfc43`](https://github.com/emdash-cms/emdash/commit/d6cfc437f23e3e435a8862cab17d2c19363847d7), [`1bcfc50`](https://github.com/emdash-cms/emdash/commit/1bcfc502112d8756e34a720b8a170eb5486b425a), [`8c693b5`](https://github.com/emdash-cms/emdash/commit/8c693b582d7c5e29bd138161e81d9c8affb53689), [`5b3e33c`](https://github.com/emdash-cms/emdash/commit/5b3e33c26bc2eb30ab2a032960a5d57eb06f148a), [`9d10d27`](https://github.com/emdash-cms/emdash/commit/9d10d2791fe16be901d9d138e434bd79cf9335c4), [`91e31fb`](https://github.com/emdash-cms/emdash/commit/91e31fb2cab4c0470088c5d61bab6e2028821569), [`f112ac4`](https://github.com/emdash-cms/emdash/commit/f112ac48194d1c2302e93756d54b116d3d207c22), [`e9a6f7a`](https://github.com/emdash-cms/emdash/commit/e9a6f7ac3ceeaf5c2d0a557e4cf6cab5f3d7d764), [`b297fdd`](https://github.com/emdash-cms/emdash/commit/b297fdd88dadcabeb93f47abea9f24f70b7d4b71), [`d211452`](https://github.com/emdash-cms/emdash/commit/d2114523a55021f65ee46e44e11157b06334819e), [`8e28cfc`](https://github.com/emdash-cms/emdash/commit/8e28cfc5d66f58f0fb91aa35c02afdd426bb6555), [`38af118`](https://github.com/emdash-cms/emdash/commit/38af118ad517fd9aa83064368543bf64bc32c08a)]:
+  - emdash@0.1.1
+
+## 0.1.0
+
+### Minor Changes
+
+- [#14](https://github.com/emdash-cms/emdash/pull/14) [`755b501`](https://github.com/emdash-cms/emdash/commit/755b5017906811f97f78f4c0b5a0b62e67b52ec4) Thanks [@ascorbic](https://github.com/ascorbic)! - First beta release
+
+### Patch Changes
+
+- Updated dependencies [[`755b501`](https://github.com/emdash-cms/emdash/commit/755b5017906811f97f78f4c0b5a0b62e67b52ec4)]:
+  - emdash@0.1.0
+
+## 0.0.3
+
+### Patch Changes
+
+- Updated dependencies [[`3c319ed`](https://github.com/emdash-cms/emdash/commit/3c319ed6411a595e6974a86bc58c2a308b91c214)]:
+  - emdash@0.0.3
+
+## 0.0.2
+
+### Patch Changes
+
+- Updated dependencies [[`b09bfd5`](https://github.com/emdash-cms/emdash/commit/b09bfd51cece5e88fe8314668a591ab11de36b4d)]:
+  - emdash@0.0.2

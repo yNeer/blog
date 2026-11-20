@@ -1,0 +1,192 @@
+---
+import type { EditProxy, MediaValue } from "emdash";
+import { Image } from "emdash/ui";
+
+interface Props {
+	title: string;
+	href: string;
+	featuredImage?: MediaValue | null;
+	client?: string;
+	year?: string;
+	/** Discipline labels */
+	tags?: string[];
+	/** 1-based position, shown as "01" */
+	index?: number;
+	/** Image aspect ratio: wide is 21/9 (16/9 on phones), landscape 4/3, portrait 4/5 */
+	layout?: "wide" | "landscape" | "portrait";
+	/** The rendered image width; pass one that matches the card's grid column */
+	sizes?: string;
+	/** Load the image eagerly; use for the first card above the fold */
+	priority?: boolean;
+	headingLevel?: 2 | 3;
+	/** Starts the title id; give each grid its own when a project can appear in two */
+	idPrefix?: string;
+	edit?: EditProxy;
+}
+
+const {
+	title,
+	href,
+	featuredImage,
+	client,
+	year,
+	tags = [],
+	index,
+	layout = "landscape",
+	sizes,
+	priority = false,
+	headingLevel = 3,
+	idPrefix = "card",
+	edit,
+} = Astro.props;
+
+const Heading = `h${headingLevel}` as const;
+const titleId = `${idPrefix}-${encodeURIComponent(href)}`;
+const number = index === undefined ? null : String(index).padStart(2, "0");
+const disciplines = tags.filter(Boolean).join(", ");
+const imageSizes =
+	sizes ??
+	(layout === "wide"
+		? "(min-width: 1680px) 1600px, 100vw"
+		: "(min-width: 1680px) 800px, (min-width: 768px) 50vw, 100vw");
+---
+
+<article class:list={["card", "media-group", `card--${layout}`]}>
+	<a href={href} class="card__media media" tabindex="-1" aria-hidden="true">
+		<div class="card__image" {...edit?.featured_image}>
+			{
+				featuredImage && (
+					<Image
+						image={featuredImage}
+						alt=""
+						sizes={imageSizes}
+						priority={priority}
+					/>
+				)
+			}
+		</div>
+	</a>
+	<a href={href} class="card__link" aria-labelledby={titleId}>
+		{
+			number && (
+				<span class="card__index label" aria-hidden="true">
+					{number}
+				</span>
+			)
+		}
+		<div class="card__text">
+			<Heading class="card__title" id={titleId}>
+				<span {...edit?.title}>{title || "Untitled"}</span>
+			</Heading>
+			{
+				(client || disciplines || year) && (
+					<p class="card__meta">
+						{client && (
+							<span class="card__meta-item">
+								<span {...edit?.client}>{client}</span>
+							</span>
+						)}
+						{disciplines && <span class="card__meta-item">{disciplines}</span>}
+						{year && (
+							<span class="card__meta-item card__year">
+								<span {...edit?.year}>{year}</span>
+							</span>
+						)}
+					</p>
+				)
+			}
+		</div>
+	</a>
+</article>
+
+<style>
+	.card {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: var(--spacing-md);
+		min-width: 0;
+	}
+
+	.card__media {
+		display: block;
+		align-self: stretch;
+		aspect-ratio: 4 / 3;
+	}
+
+	.card--wide .card__media {
+		aspect-ratio: 16 / 9;
+	}
+
+	.card--portrait .card__media {
+		aspect-ratio: 4 / 5;
+	}
+
+	.card__image {
+		position: absolute;
+		inset: 0;
+	}
+
+	.card__link {
+		display: flex;
+		align-items: baseline;
+		gap: var(--spacing-md);
+		max-width: 100%;
+		min-width: 0;
+		color: var(--color-text);
+		text-decoration: none;
+	}
+
+	.card__index {
+		flex: none;
+	}
+
+	.card__text {
+		display: flex;
+		flex-direction: column;
+		gap: var(--spacing-xs);
+		min-width: 0;
+	}
+
+	.card__title {
+		font-size: var(--font-size-xl);
+		overflow-wrap: anywhere;
+		text-decoration-line: underline;
+		text-decoration-thickness: 1px;
+		text-decoration-color: transparent;
+		text-underline-offset: 0.15em;
+		transition: text-decoration-color var(--transition-fast);
+	}
+
+	.card__link:is(:hover, :focus-visible) .card__title,
+	.card:has(.card__media:hover) .card__title {
+		text-decoration-color: currentColor;
+	}
+
+	.card__meta {
+		font-size: var(--font-size-sm);
+		line-height: var(--leading-normal);
+		color: var(--color-muted);
+		overflow-wrap: anywhere;
+	}
+
+	/* Trailing separators, so a wrapped line never starts with a dot */
+	.card__meta-item:not(:last-child)::after {
+		content: "·";
+		content: "·" / "";
+		margin-inline: 0.5em;
+	}
+
+	.card__year {
+		font-family: var(--font-label);
+		font-size: var(--font-size-label);
+		letter-spacing: var(--tracking-label);
+		font-variant-numeric: tabular-nums;
+	}
+
+	@media (min-width: 768px) {
+		.card--wide .card__media {
+			aspect-ratio: 21 / 9;
+		}
+	}
+</style>

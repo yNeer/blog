@@ -1,0 +1,158 @@
+---
+import {
+	getEditMeta,
+	getEmDashEntry,
+	getSeoMeta,
+	getSiteSettings,
+} from "emdash";
+import { PortableText } from "emdash/ui";
+import type { PageLayoutBlock } from "../../emdash-env";
+import Base from "../layouts/Base.astro";
+import EditorNote from "../components/EditorNote.astro";
+import PageBlocks from "../components/PageBlocks.astro";
+import { layoutDescription, startsWithHeading } from "../utils/page";
+import { getSelectedWork } from "../utils/selected-work";
+
+const [settings, homeResult, projectsResult] = await Promise.all([
+	getSiteSettings(),
+	getEmDashEntry("pages", "home"),
+	getSelectedWork(),
+]);
+if (homeResult.error || projectsResult.error) {
+	return new Response("Could not load the portfolio", { status: 500 });
+}
+const home = homeResult.entry;
+if (Astro.cache?.enabled) {
+	Astro.cache.set(homeResult.cacheHint);
+	Astro.cache.set(projectsResult.cacheHint);
+	// A missing entry carries no tags, so publishing a Home page later
+	// wouldn't clear the cached default layout.
+	if (!home) Astro.cache.set({ tags: ["pages"] });
+}
+
+const projects = projectsResult.entries;
+const siteTitle = settings?.title || "Studio";
+
+const seo = home
+	? getSeoMeta(home, {
+			siteUrl: Astro.url.origin,
+			path: "/",
+			defaultTitle: siteTitle,
+			defaultDescription:
+				layoutDescription(home.data.layout) ?? settings?.tagline,
+		})
+	: null;
+
+const years = projects
+	.flatMap((project) => project.data.year?.match(/\b\d{4}\b/g) ?? [])
+	.map(Number);
+let yearRange: string | null = null;
+if (years.length > 0) {
+	const first = Math.min(...years);
+	const last = Math.max(...years);
+	yearRange = first === last ? String(first) : `${first}–${last}`;
+}
+
+const clients = [
+	...new Set(
+		projects
+			.map((project) => project.data.client?.trim())
+			.filter((client): client is string => Boolean(client)),
+	),
+];
+
+// Without a published Home page, as on a site set up without the sample
+// content, or with an empty one, the page shows the tagline, the selected
+// work and its clients.
+const defaultLayout: PageLayoutBlock[] = [
+	{
+		_type: "portfolio_statement",
+		_version: 1,
+		_key: "statement",
+		label: yearRange ? `Selected work ${yearRange}` : null,
+		text: settings?.tagline || siteTitle,
+	},
+	{
+		_type: "portfolio_selected_work",
+		_version: 1,
+		_key: "selected-work",
+		heading: "Selected work",
+	},
+];
+if (clients.length >= 2) {
+	defaultLayout.push({
+		_type: "portfolio_clients",
+		_version: 1,
+		_key: "clients",
+		heading: "Clients",
+		clients: clients.map((name) => ({ name })),
+	});
+}
+
+const layout = home?.data.layout?.length ? home.data.layout : defaultLayout;
+const content = home?.data.content;
+// In edit mode an empty body carries edit metadata; render it so the
+// inline editor has somewhere to start.
+const showContent = Boolean(
+	content && (content.length > 0 || getEditMeta(content)),
+);
+---
+
+<Base
+	title={seo?.title}
+	pageTitle={seo?.ogTitle}
+	description={seo?.description}
+	image={seo?.ogImage}
+	canonical={seo?.canonical}
+	robots={seo?.robots}
+	content={home
+		? { collection: "pages", id: home.data.id, slug: home.id }
+		: undefined}
+>
+	{
+		layout === defaultLayout && (
+			<EditorNote
+				href={home
+					? `/_emdash/admin/content/pages/${home.data.id}`
+					: "/_emdash/admin/content/pages"}
+				action={home ? "Edit the home page" : "Go to Pages"}
+			>
+				{home
+					? "The home page’s Layout is empty, so the default sections show. Add blocks to its Layout to replace them."
+					: "These are the default home page sections. To change them, create or publish a page with the slug “home” in Pages and add blocks to its Layout."}
+			</EditorNote>
+		)
+	}
+	{/* The statement and contact blocks render the h1 when they come first */}
+	{!startsWithHeading(layout) && <h1 class="sr-only">{siteTitle}</h1>}
+	<div class="home-layout" {...home?.edit.layout}>
+		<PageBlocks value={layout} />
+	</div>
+	{
+		showContent && (
+			<div class="frame prose prose-hang home-body" {...home?.edit.content}>
+				<PortableText value={content} />
+			</div>
+		)
+	}
+</Base>
+
+<style>
+	/* Blocks don't space themselves, so sections sit the same way in any order */
+	.home-layout > :global(*) {
+		margin-block-start: var(--section-gap);
+	}
+
+	.home-body {
+		--prose-media-column: 1 / -1;
+		margin-block-start: var(--section-gap);
+	}
+
+	.home-layout > :global(:first-child) {
+		margin-block-start: clamp(
+			var(--spacing-2xl),
+			1rem + 6vw,
+			var(--spacing-5xl)
+		);
+	}
+</style>

@@ -1,0 +1,138 @@
+import { Badge, Button, LinkButton, Popover } from "@cloudflare/kumo";
+import { useLingui } from "@lingui/react/macro";
+import { SignOut, Shield, Gear, ArrowSquareOut, EyeSlash } from "@phosphor-icons/react";
+import { Link } from "@tanstack/react-router";
+import * as React from "react";
+
+import { apiFetch } from "../lib/api/client";
+import { useCurrentUser } from "../lib/api/current-user";
+import { AdminBreadcrumbs } from "./AdminBreadcrumbs.js";
+import { Sidebar } from "./Sidebar";
+import { ThemeToggle } from "./ThemeToggle";
+import { UserAvatar } from "./UserAvatar.js";
+
+export type { CurrentUser } from "../lib/api/current-user";
+
+const ROLE_ADMIN = 50;
+
+async function handleLogout() {
+	// Clear the public-site toolbar-bootstrap flag (see Shell.tsx).
+	try {
+		localStorage.removeItem("emdash-editor");
+		localStorage.removeItem("emdash-toolbar-labels");
+	} catch {
+		// ignore — flag is best-effort
+	}
+	const res = await apiFetch("/_emdash/api/auth/logout?redirect=/_emdash/admin/login", {
+		method: "POST",
+		credentials: "same-origin",
+	});
+	if (res.redirected) {
+		window.location.href = res.url;
+	} else {
+		window.location.href = "/_emdash/admin/login";
+	}
+}
+
+/**
+ * Admin header with mobile menu toggle and user actions.
+ * Uses useSidebar() hook from kumo Sidebar.Provider context.
+ */
+export function Header({ staging = false }: { staging?: boolean }) {
+	const { t } = useLingui();
+	const [userMenuOpen, setUserMenuOpen] = React.useState(false);
+
+	const { data: user } = useCurrentUser();
+
+	const displayName = user?.name || user?.email || t`User`;
+
+	const stagingBadge = (
+		<Badge variant="warning">
+			<EyeSlash aria-hidden="true" className="size-3.5 sm:hidden" />
+			<span className="sr-only sm:not-sr-only">{t`Staging`}</span>
+		</Badge>
+	);
+
+	return (
+		// h-[58px] is mirrored by ADMIN_HEADER_HEIGHT_PX in ContentEditor.tsx
+		// (the settings sheet offsets its body by it) — change both together.
+		<header className="sticky top-0 z-10 flex h-[58px] items-center gap-3 border-b bg-kumo-elevated px-4 md:ps-6">
+			{/* The desktop trigger lives in the sidebar footer; mobile keeps it here so the closed sheet can reopen. */}
+			<Sidebar.Trigger className="shrink-0 cursor-pointer md:hidden rtl:rotate-180" />
+
+			<div className="flex min-w-0 flex-1 items-center">
+				<AdminBreadcrumbs />
+			</div>
+
+			<div className="flex shrink-0 items-center gap-2">
+				{staging &&
+					((user?.role ?? 0) >= ROLE_ADMIN ? (
+						<Link to="/settings/general" title={t`Hidden from search engines until you go live`}>
+							{stagingBadge}
+						</Link>
+					) : (
+						<span title={t`Hidden from search engines until you go live`}>{stagingBadge}</span>
+					))}
+
+				{/* View site link */}
+				<LinkButton variant="ghost" size="sm" href="/" external aria-label={t`View Site`}>
+					<ArrowSquareOut className="h-4 w-4 sm:me-1" aria-hidden="true" />
+					<span className="hidden sm:inline">{t`View Site`}</span>
+				</LinkButton>
+
+				{/* Theme toggle */}
+				<ThemeToggle />
+
+				{/* User menu */}
+				<Popover open={userMenuOpen} onOpenChange={setUserMenuOpen}>
+					<Popover.Trigger asChild>
+						<Button variant="ghost" size="sm" className="gap-2" aria-label={displayName}>
+							{user ? (
+								<UserAvatar user={user} size={20} />
+							) : (
+								<span aria-hidden="true" className="size-5 shrink-0 rounded-full bg-kumo-tint" />
+							)}
+							<span className="hidden sm:inline max-w-[120px] truncate">{displayName}</span>
+						</Button>
+					</Popover.Trigger>
+
+					<Popover.Content className="w-56 p-2" align="end">
+						{/* User info */}
+						<div className="px-3 py-2 border-b mb-1">
+							<div className="font-medium truncate">{user?.name || t`User`}</div>
+							<div className="text-xs text-kumo-subtle truncate">
+								<bdi dir="ltr">{user?.email}</bdi>
+							</div>
+						</div>
+						<div className="grid gap-1">
+							<Link
+								to="/settings/security"
+								onClick={() => setUserMenuOpen(false)}
+								className="flex items-center gap-2 rounded-md px-3 py-2 text-sm hover:bg-kumo-tint"
+							>
+								<Shield className="h-4 w-4" />
+								{t`Security Settings`}
+							</Link>
+							<Link
+								to="/settings"
+								onClick={() => setUserMenuOpen(false)}
+								className="flex items-center gap-2 rounded-md px-3 py-2 text-sm hover:bg-kumo-tint"
+							>
+								<Gear className="h-4 w-4" />
+								{t`Settings`}
+							</Link>
+							<hr className="my-1" />
+							<button
+								onClick={handleLogout}
+								className="flex items-center gap-2 rounded-md px-3 py-2 text-sm text-kumo-danger hover:bg-kumo-danger/10 w-full text-start cursor-pointer"
+							>
+								<SignOut className="h-4 w-4" />
+								{t`Log out`}
+							</button>
+						</div>
+					</Popover.Content>
+				</Popover>
+			</div>
+		</header>
+	);
+}

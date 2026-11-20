@@ -1,0 +1,5266 @@
+import { Toasty } from "@cloudflare/kumo";
+import { i18n } from "@lingui/core";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import * as React from "react";
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
+import { cdp, page, userEvent, type Locator } from "vitest/browser";
+
+import { AdminDocumentTitle } from "../../src/components/AdminDocumentTitle.js";
+import {
+	ContentEditor,
+	type FieldDescriptor,
+	type ContentEditorProps,
+} from "../../src/components/ContentEditor";
+import { focusDocumentStart } from "../../src/components/editor/BlockCommands";
+import { useRevisionViewContext } from "../../src/components/revisions/revision-view-context";
+import {
+	fetchBylines,
+	fetchReferenceChildren,
+	fetchRevisionEditors,
+	fetchRevisions,
+	restoreRevision,
+} from "../../src/lib/api";
+import type {
+	BylineSummary,
+	ContentItem,
+	RevisionListItem,
+	RevisionListResponse,
+} from "../../src/lib/api";
+import { PluginAdminProvider, type PluginAdmins } from "../../src/lib/plugin-context";
+import { diffVersion } from "../../src/lib/revision-diff/index.js";
+import { withAutosavedDraft } from "../../src/lib/revision-list-cache";
+import { render } from "../utils/render.tsx";
+
+function makeByline(overrides: Partial<BylineSummary> = {}): BylineSummary {
+	return {
+		id: "byline-1",
+		slug: "jane-smith",
+		displayName: "Jane Smith",
+		bio: null,
+		avatarMediaId: null,
+		websiteUrl: null,
+		userId: null,
+		isGuest: false,
+		createdAt: "2025-01-15T10:30:00Z",
+		updatedAt: "2025-01-15T10:30:00Z",
+		locale: "en",
+		translationGroup: null,
+		...overrides,
+	};
+}
+
+// Mock child components that have complex dependencies.
+// The mock simulates the real editor's behaviour of freezing initial content on mount:
+// it captures `value` once via useState initializer and never re-reads it.
+// This is what makes the translation-switch bug observable in tests — the displayed
+// content stays stale unless the component is forced to remount via a fresh `key`.
+//
+// It also mirrors the real component's onEditorReady contract: called with a stub
+// editor on mount and with `null` on unmount, so consumers can clear stale refs
+// before the next instance mounts.
+let portableTextMountCount = 0;
+type EditorReadyCall = { mockId: number | null };
+let onEditorReadyCalls: EditorReadyCall[] = [];
+const portableTextProps: { current: Record<string, unknown> | null } = { current: null };
+vi.mock("../../src/components/PortableTextEditor", () => ({
+	PortableTextEditor: (props: Record<string, any>) => {
+		const { value, placeholder, onEditorReady } = props;
+		portableTextProps.current = props;
+		// Mirror the real component: capture initial value once, never update.
+		const [initialValue] = React.useState(() => value);
+		const mountIdRef = React.useRef<number>(0);
+		React.useEffect(() => {
+			portableTextMountCount++;
+			mountIdRef.current = portableTextMountCount;
+		}, []);
+		React.useEffect(() => {
+			if (onEditorReady) {
+				const id = mountIdRef.current || portableTextMountCount + 1;
+				const stubEditor = { __mockId: id, commands: { focus: () => true } } as unknown;
+				onEditorReadyCalls.push({ mockId: id });
+				onEditorReady(stubEditor);
+				return () => {
+					onEditorReadyCalls.push({ mockId: null });
+					onEditorReady(null);
+				};
+			}
+			return undefined;
+		}, [onEditorReady]);
+		const text = Array.isArray(initialValue)
+			? initialValue
+					.map((b: any) => b?.children?.map((c: any) => c?.text ?? "").join("") ?? "")
+					.join("\n")
+			: "";
+		return (
+			<div data-testid="portable-text-editor" data-content={text}>
+				{placeholder}
+			</div>
+		);
+	},
+}));
+
+vi.mock("../../src/components/editor/BlockCommands", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../src/components/editor/BlockCommands")>()),
+	focusDocumentStart: vi.fn(),
+}));
+
+// Stands in for the version list: a button per version and one for a change, driving the
+// revision view through the same context the real list reads.
+function MockRevisionHistory() {
+	const view = useRevisionViewContext();
+	return (
+		<div data-testid="revision-history">
+			Revision History
+			{view &&
+				["rev-draft", "rev-old"].map((id) => (
+					<button
+						key={id}
+						type="button"
+						aria-current={view.viewingId === id || undefined}
+						onClick={(event) => view.view(id, { opener: event.currentTarget })}
+					>
+						{`View ${id}`}
+					</button>
+				))}
+			{view && (
+				<button type="button" onClick={() => view.goToChange("t1")}>
+					Go to change
+				</button>
+			)}
+			{view && <output aria-label="Versions requested">{view.listLimit}</output>}
+			{view && <output aria-label="Version to focus">{view.rowToFocus?.revisionId}</output>}
+		</div>
+	);
+}
+
+vi.mock("../../src/components/RevisionHistory", () => ({
+	RevisionHistory: () => <MockRevisionHistory />,
+}));
+
+/** A version label the stand-in canvas fails to draw. */
+let unreadableVersion: RegExp | null = null;
+
+vi.mock("../../src/components/revisions/RevisionViewCanvas", () => ({
+	RevisionViewCanvas: ({ label, showChanges }: { label: string; showChanges: boolean }) => {
+		if (unreadableVersion?.test(label)) throw new Error("The version can't be drawn.");
+		return (
+			<article aria-label={label} data-show-changes={String(showChanges)}>
+				<p id="revision-t1" tabIndex={-1}>
+					Changed paragraph
+				</p>
+			</article>
+		);
+	},
+}));
+
+vi.mock("../../src/lib/revision-diff/index.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../src/lib/revision-diff/index.js")>()),
+	diffVersion: vi.fn(() => ({ hasPrevious: true, fields: [], slug: null, changes: [] })),
+}));
+
+vi.mock("../../src/components/TaxonomySidebar", () => ({
+	TaxonomySidebar: () => <div data-testid="taxonomy-sidebar">Taxonomy</div>,
+	useHasApplicableTaxonomies: () => true,
+}));
+
+const mediaPickerProps = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
+
+vi.mock("../../src/components/MediaPickerModal", () => ({
+	MediaPickerModal: (props: Record<string, unknown>) => {
+		mediaPickerProps.current = props;
+		return props.open ? <div data-testid="media-picker" /> : null;
+	},
+}));
+
+const outlineClicks = vi.hoisted(() => ({ editorVisible: [] as boolean[] }));
+
+vi.mock("../../src/components/editor/DocumentOutline", () => ({
+	DocumentOutline: () => (
+		<div data-testid="doc-outline">
+			Outline
+			<button
+				type="button"
+				onClick={() =>
+					outlineClicks.editorVisible.push(
+						document.querySelector("[data-testid='portable-text-editor']")?.checkVisibility() ??
+							false,
+					)
+				}
+			>
+				Outline heading
+			</button>
+		</div>
+	),
+}));
+
+vi.mock("@tanstack/react-router", async () => {
+	const actual = await vi.importActual("@tanstack/react-router");
+	return {
+		...actual,
+		Link: ({ children, search, ...props }: any) => (
+			<a {...props} data-search={search ? JSON.stringify(search) : undefined}>
+				{children}
+			</a>
+		),
+		useBlocker: () => ({ status: "idle" }),
+	};
+});
+
+vi.mock("../../src/lib/api", async () => {
+	const actual = await vi.importActual("../../src/lib/api");
+	return {
+		...actual,
+		getPreviewUrl: vi.fn().mockResolvedValue({ url: "https://example.com/preview" }),
+		fetchBylines: vi.fn(async () => ({ items: [], nextCursor: null })),
+		fetchReferenceChildren: vi.fn(async () => ({ children: [] })),
+		fetchRevisionEditors: vi.fn(),
+		fetchRevisions: vi.fn(),
+		restoreRevision: vi.fn(),
+	};
+});
+
+const defaultFields: Record<string, FieldDescriptor> = {
+	title: { kind: "string", label: "Title", required: true },
+	body: { kind: "string", label: "Body" },
+};
+
+const MOVE_TO_TRASH_PATTERN = /Move to Trash/i;
+
+function getEditorBar(): HTMLElement {
+	return document.querySelector<HTMLElement>("[data-emdash-editor-bar]")!;
+}
+const URL_FIELD_ERROR_PATTERN = /Enter a valid URL/;
+
+function makeItem(overrides: Partial<ContentItem> = {}): ContentItem {
+	return {
+		id: "item-1",
+		type: "posts",
+		slug: "my-post",
+		status: "draft",
+		data: { title: "My Post", body: "Some content" },
+		authorId: null,
+		createdAt: "2025-01-15T10:30:00Z",
+		updatedAt: "2025-01-15T10:30:00Z",
+		publishedAt: null,
+		scheduledAt: null,
+		liveRevisionId: null,
+		draftRevisionId: null,
+		...overrides,
+	};
+}
+
+function deferred<T = void>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((promiseResolve, promiseReject) => {
+		resolve = promiseResolve;
+		reject = promiseReject;
+	});
+	return { promise, resolve, reject };
+}
+
+function renderEditor(props: Partial<ContentEditorProps> = {}) {
+	const defaultProps: ContentEditorProps = {
+		collection: "posts",
+		collectionLabel: "Post",
+		fields: defaultFields,
+		isNew: true,
+		onSave: vi.fn(),
+		...props,
+	};
+	return render(<ContentEditor {...defaultProps} />, { wrapper: Toasty });
+}
+
+type SavedBylineCredit = NonNullable<ContentItem["bylines"]>[number];
+
+function savedCredit(
+	byline: BylineSummary,
+	source?: SavedBylineCredit["source"],
+	roleLabel: string | null = null,
+	sortOrder = 0,
+): SavedBylineCredit {
+	return { byline, sortOrder, roleLabel, ...(source ? { source } : {}) };
+}
+
+function renderBylineContent(
+	bylines: SavedBylineCredit[],
+	props: Partial<ContentEditorProps> = {},
+) {
+	return renderEditor({
+		isNew: false,
+		item: makeItem({ data: { title: "Hello", body: "" }, bylines }),
+		currentUser: { id: "u-1", role: 50 },
+		availableBylines: [],
+		availableBylinesLoaded: true,
+		...props,
+	});
+}
+
+function installMatchMedia(initialMatches: boolean) {
+	let matches = initialMatches;
+	const listeners = new Set<(event: MediaQueryListEvent) => void>();
+	const mediaQuery = {
+		get matches() {
+			return matches;
+		},
+		media: "(max-width: 1023px)",
+		onchange: null,
+		addEventListener: (_type: string, listener: unknown) => {
+			if (typeof listener === "function")
+				listeners.add(listener as (event: MediaQueryListEvent) => void);
+		},
+		removeEventListener: (_type: string, listener: unknown) => {
+			if (typeof listener === "function") {
+				listeners.delete(listener as (event: MediaQueryListEvent) => void);
+			}
+		},
+		addListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
+			if (listener) listeners.add(listener);
+		},
+		removeListener: (listener: ((event: MediaQueryListEvent) => void) | null) => {
+			if (listener) listeners.delete(listener);
+		},
+		dispatchEvent: () => true,
+	} as MediaQueryList;
+	// Only viewport-width queries get the simulated value. Everything else
+	// (e.g. prefers-reduced-motion in SaveButton/Kumo) keeps its real default
+	// so these tests exercise the normal animation code paths.
+	const nonMatching = (query: string) =>
+		({
+			matches: false,
+			media: query,
+			onchange: null,
+			addEventListener: () => {},
+			removeEventListener: () => {},
+			addListener: () => {},
+			removeListener: () => {},
+			dispatchEvent: () => true,
+		}) as unknown as MediaQueryList;
+	const spy = vi
+		.spyOn(window, "matchMedia")
+		.mockImplementation((query: string) =>
+			query.includes("max-width") ? mediaQuery : nonMatching(query),
+		);
+
+	return {
+		setMatches(nextMatches: boolean) {
+			matches = nextMatches;
+			const event = { matches, media: mediaQuery.media } as MediaQueryListEvent;
+			for (const listener of listeners) listener(event);
+		},
+		async setMatchesSequentially(nextMatches: boolean) {
+			matches = nextMatches;
+			const event = { matches, media: mediaQuery.media } as MediaQueryListEvent;
+			const callbacks = [...listeners];
+			for (const listener of callbacks) {
+				listener(event);
+				await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+			}
+		},
+		restore() {
+			spy.mockRestore();
+		},
+	};
+}
+
+describe("ContentEditor", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		portableTextMountCount = 0;
+		onEditorReadyCalls = [];
+		portableTextProps.current = null;
+		mediaPickerProps.current = null;
+	});
+
+	it("passes the database field identity through a block file picker", async () => {
+		const blockType = {
+			id: "attachment-type",
+			slug: "attachment",
+			label: "Attachment",
+			currentVersion: 1,
+			source: "user" as const,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			versions: [
+				{
+					id: "attachment-v1",
+					blockTypeId: "attachment-type",
+					version: 1,
+					fields: [
+						{
+							slug: "file",
+							label: "File",
+							type: "file",
+							validation: { allowedMimeTypes: ["application/msword"] },
+						},
+					],
+					fingerprint: "attachment-v1",
+					active: true,
+					createdAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				},
+			],
+		};
+		const screen = await renderEditor({
+			isNew: false,
+			item: makeItem({
+				data: {
+					attachments: [{ _type: "attachment", _version: 1, _key: "block-key" }],
+				},
+			}),
+			fields: {
+				attachments: {
+					id: "database-field",
+					kind: "blocks",
+					label: "Attachments",
+					validation: { allowedTypes: ["attachment"] },
+					blockTypes: [blockType],
+				},
+			},
+		});
+
+		await screen.getByRole("button", { name: "Attachment", exact: true }).click();
+		await screen.getByRole("button", { name: "Select File" }).click();
+		expect(mediaPickerProps.current).toMatchObject({
+			fieldId: "database-field:block-key:file",
+			blockType: "attachment",
+			blockVersion: 1,
+			mimeTypeFilters: ["application/msword"],
+		});
+	});
+
+	it("uses a task-oriented placeholder for portable text fields", async () => {
+		await renderEditor({
+			isNew: false,
+			item: makeItem(),
+			fields: { content: { kind: "portableText", label: "Content" } },
+		});
+
+		expect(portableTextProps.current?.placeholder).toBe("Start writing, or type '/' for commands");
+	});
+
+	it("blocks manual save and autosave while a Portable Text field has unsupported marks", async () => {
+		vi.useFakeTimers();
+		try {
+			const onSave = vi.fn();
+			const onAutosave = vi.fn();
+			const item = makeItem({
+				data: {
+					title: "My Post",
+					content: [
+						{
+							_type: "block",
+							_key: "b1",
+							style: "normal",
+							children: [{ _type: "span", _key: "s1", text: "Unsafe", marks: ["accent"] }],
+						},
+					],
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title" },
+					content: { kind: "portableText", label: "Content" },
+				},
+				onSave,
+				onAutosave,
+			});
+
+			await screen.getByLabelText("Title").fill("Changed title");
+			const saveButton = screen.getByRole("button", { name: "Save" }).first();
+
+			await expect.element(saveButton).toBeDisabled();
+			await vi.advanceTimersByTimeAsync(2500);
+			expect(onAutosave).not.toHaveBeenCalled();
+			saveButton.element().click();
+			expect(onSave).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("saves nothing while its fields wait for the entry's content", async () => {
+		vi.useFakeTimers();
+		try {
+			const onSave = vi.fn();
+			const onAutosave = vi.fn();
+			const props: ContentEditorProps = {
+				collection: "posts",
+				collectionLabel: "Post",
+				fields: { title: { kind: "string", label: "Title" } },
+				isNew: false,
+				item: makeItem({ data: { title: "My Post" } }),
+				onSave,
+				onAutosave,
+			};
+			const screen = await render(<ContentEditor {...props} />, { wrapper: Toasty });
+
+			await screen.getByLabelText("Title").fill("Changed title");
+			// A tab that left its room waits for the entry's current content, so its form is stale.
+			await screen.rerender(<ContentEditor {...props} fieldsLoading />);
+			await vi.advanceTimersByTimeAsync(2500);
+			expect(onAutosave).not.toHaveBeenCalled();
+			await expect.element(screen.getByRole("button", { name: "Save" }).first()).toBeDisabled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("doesn't publish the form while its fields wait for the entry's content", async () => {
+		const onPublish = vi.fn();
+		const props: ContentEditorProps = {
+			collection: "posts",
+			collectionLabel: "Post",
+			fields: { title: { kind: "string", label: "Title" } },
+			isNew: false,
+			item: makeItem({ status: "draft", data: { title: "My Post" } }),
+			onSave: vi.fn(),
+			onPublish,
+		};
+		const screen = await render(<ContentEditor {...props} />, { wrapper: Toasty });
+		await screen.getByRole("button", { name: "Publish now", exact: true }).click();
+		const dialog = screen.getByRole("dialog", { name: "Publish now?" });
+		await expect.element(dialog).toBeVisible();
+
+		await screen.rerender(<ContentEditor {...props} fieldsLoading />);
+		dialog.getByRole("button", { name: "Publish now", exact: true }).element().click();
+		expect(onPublish).not.toHaveBeenCalled();
+	});
+
+	it("doesn't schedule the form while its fields wait for the entry's content", async () => {
+		const onSchedule = vi.fn().mockResolvedValue(undefined);
+		const props: ContentEditorProps = {
+			collection: "posts",
+			collectionLabel: "Post",
+			fields: { title: { kind: "string", label: "Title" } },
+			isNew: false,
+			item: makeItem({ status: "draft", data: { title: "My Post" } }),
+			onSave: vi.fn(),
+			onSchedule,
+		};
+		const screen = await render(<ContentEditor {...props} />, { wrapper: Toasty });
+		await screen.getByRole("button", { name: "Schedule" }).click();
+		const dialog = screen.getByRole("dialog", { name: "Schedule publication" });
+		await expect.element(dialog).toBeVisible();
+
+		await screen.rerender(<ContentEditor {...props} fieldsLoading />);
+		dialog.getByRole("button", { name: "Schedule", exact: true }).element().click();
+		await expect.element(screen.getByText("This entry is still loading.")).toBeVisible();
+		expect(onSchedule).not.toHaveBeenCalled();
+	});
+
+	it("makes an entry read-only when its schema contains an unsupported field type", async () => {
+		vi.useFakeTimers();
+		try {
+			const onSave = vi.fn();
+			const onAutosave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "My Post", layout: { columns: 2 } } }),
+				fields: {
+					title: { kind: "string", label: "Title" },
+					layout: {
+						kind: "unsupported",
+						label: "Layout",
+						unsupportedType: { type: "future_blocks", path: "type" },
+					},
+				},
+				onSave,
+				onAutosave,
+			});
+
+			await expect.element(screen.getByRole("alert")).toHaveTextContent("future_blocks");
+			await expect.element(screen.getByLabelText("Title")).toBeDisabled();
+			expect(screen.getByLabelText("Layout").query()).toBeNull();
+			await expect
+				.element(screen.getByRole("button", { name: "Save", exact: true }).query())
+				.toBeNull();
+
+			await vi.advanceTimersByTimeAsync(2500);
+			expect(onAutosave).not.toHaveBeenCalled();
+			expect(onSave).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("uses one label and spacing rhythm across editor field types", async () => {
+		const screen = await renderEditor({
+			isNew: false,
+			item: makeItem(),
+			fields: {
+				title: { kind: "string", label: "Title" },
+				featured_image: { kind: "image", label: "Featured Image" },
+				content: { kind: "portableText", label: "Content" },
+				attachment: { kind: "file", label: "Attachment" },
+			},
+		});
+		const contentLabelText = document.getElementById("field-content-label");
+		expect(contentLabelText).not.toBeNull();
+		const contentLabel = contentLabelText!.parentElement!;
+		const featuredLabel = screen.getByText("Featured Image", { exact: true }).element();
+		const attachmentLabel = screen.getByText("Attachment", { exact: true }).element();
+		const fieldStack = contentLabel.parentElement?.parentElement;
+
+		expect(contentLabelText).toHaveTextContent("Content");
+		expect(contentLabel.tagName).toBe("LABEL");
+		expect(contentLabel).toHaveClass("text-base", "font-medium");
+		expect(contentLabel.parentElement).toHaveClass("grid", "gap-2");
+		expect(featuredLabel).toHaveClass("text-base", "font-medium");
+		expect(featuredLabel).not.toHaveClass("text-sm");
+		expect(featuredLabel.parentElement).toHaveClass("flex", "items-center", "gap-1.5");
+		expect(featuredLabel.parentElement?.parentElement).toHaveClass("grid", "gap-2");
+		expect(attachmentLabel.parentElement).toHaveClass("grid", "gap-2");
+		expect(fieldStack).toHaveClass("space-y-6");
+	});
+
+	it("shows featured image guidance in the shared instant help tooltip", async () => {
+		const screen = await renderEditor({
+			isNew: false,
+			item: makeItem(),
+			fields: {
+				featured_image: { kind: "image", label: "Featured Image" },
+			},
+		});
+		const helpTrigger = screen.getByRole("button", {
+			name: "More information about Featured Image",
+		});
+
+		await userEvent.hover(helpTrigger.element());
+		await expect
+			.element(
+				screen.getByRole("tooltip", {
+					name: "Used as the main visual for this post on listing pages and at the top of the post",
+				}),
+			)
+			.toBeVisible();
+	});
+
+	describe("block panel + mobile sheet sync", () => {
+		const ptFields: Record<string, FieldDescriptor> = {
+			content: { kind: "portableText", label: "Content" },
+		};
+
+		function makeBlockPanel() {
+			return {
+				type: "image",
+				attrs: { src: "https://example.com/image.png", alt: "Example" },
+				onUpdate: vi.fn(),
+				onReplace: vi.fn(),
+				onDelete: vi.fn(),
+				onClose: vi.fn(),
+			};
+		}
+
+		function getPanelHooks() {
+			const open = portableTextProps.current?.onBlockSidebarOpen as
+				| ((panel: unknown) => void)
+				| undefined;
+			const close = portableTextProps.current?.onBlockSidebarClose as (() => void) | undefined;
+			expect(typeof open).toBe("function");
+			expect(typeof close).toBe("function");
+			return { open: open!, close: close! };
+		}
+
+		it("auto-opens the sheet for a block panel below lg and re-closes it after", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderEditor({ isNew: false, item: makeItem(), fields: ptFields });
+				await expect.element(screen.getByTestId("portable-text-editor")).toBeInTheDocument();
+				// Sheet starts closed.
+				await expect
+					.element(screen.getByRole("navigation", { name: "Settings" }), { timeout: 100 })
+					.not.toBeInTheDocument();
+
+				const { open, close } = getPanelHooks();
+				open(makeBlockPanel());
+
+				// The sheet must open by itself, showing the block detail panel.
+				await expect
+					.element(screen.getByRole("navigation", { name: "Settings" }))
+					.toBeInTheDocument();
+				await expect.element(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
+
+				// Closing the block panel restores the sheet's prior (closed) state.
+				close();
+				await expect
+					.element(screen.getByRole("navigation", { name: "Settings" }))
+					.not.toBeInTheDocument();
+			} finally {
+				media.restore();
+			}
+		});
+
+		// Not covered: the "restore to previously-open sheet" branch. Real input
+		// can't reach it below lg (the open sheet overlays the editor, so a block
+		// can't be tapped while it's up), and triggering it programmatically trips
+		// Kumo's focusout dismissal when the focused settings content is swapped
+		// out — pinning that would test Kumo internals, not the sync.
+
+		it("closes the block panel when a read replaces the body", async () => {
+			const props: ContentEditorProps = {
+				collection: "posts",
+				collectionLabel: "Post",
+				fields: ptFields,
+				isNew: false,
+				onSave: vi.fn(),
+			};
+			const body = (text: string) => [
+				{ _type: "block", _key: "b1", children: [{ _type: "span", _key: "s1", text }] },
+			];
+			const screen = await render(
+				<ContentEditor {...props} item={makeItem({ data: { content: body("Old body") } })} />,
+			);
+			getPanelHooks().open(makeBlockPanel());
+			await expect.element(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
+
+			await screen.rerender(
+				<ContentEditor {...props} item={makeItem({ data: { content: body("Newer body") } })} />,
+			);
+			await expect
+				.element(screen.getByTestId("portable-text-editor"))
+				.toHaveAttribute("data-content", "Newer body");
+			await expect.element(screen.getByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+		});
+
+		it("closes the sheet but keeps the block panel when crossing to desktop", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderEditor({ isNew: false, item: makeItem(), fields: ptFields });
+				await expect.element(screen.getByTestId("portable-text-editor")).toBeInTheDocument();
+
+				const { open } = getPanelHooks();
+				open(makeBlockPanel());
+				await expect
+					.element(screen.getByRole("navigation", { name: "Settings" }))
+					.toBeInTheDocument();
+
+				media.setMatches(false);
+
+				// No sheet on desktop; the block panel now lives in the pane.
+				await expect
+					.element(screen.getByRole("navigation", { name: "Settings" }))
+					.not.toBeInTheDocument();
+				await expect.element(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
+			} finally {
+				media.restore();
+			}
+		});
+	});
+
+	describe("customize sidebar link", () => {
+		function customizeLink() {
+			const link = [...document.querySelectorAll("a")].find(
+				(anchor) => anchor.textContent === "Customize sidebar",
+			);
+			expect(link).toBeDefined();
+			return link!;
+		}
+
+		it("links to the Editor tab of Settings → Sidebars after the last section", async () => {
+			await renderEditor({ isNew: false, item: makeItem() });
+
+			const link = customizeLink();
+			expect(link.getAttribute("to")).toBe("/settings/sidebars");
+			expect(JSON.parse(link.dataset.search ?? "null")).toEqual({ tab: "editor" });
+			const lastSection = [...document.querySelectorAll("[data-settings-section]")].at(-1);
+			expect(lastSection).toBeDefined();
+			expect(
+				lastSection!.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING,
+			).toBeTruthy();
+			expect(link.closest('[data-sidebar="footer"]')).toBeNull();
+		});
+
+		it("stays outside the read-only lock", async () => {
+			const screen = await renderEditor({ isNew: false, item: makeItem(), readOnly: true });
+
+			await expect.element(screen.getByLabelText("Slug")).toBeDisabled();
+			expect(customizeLink().closest("fieldset:disabled")).toBeNull();
+		});
+
+		it("is not shown while a block panel replaces the sections", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem(),
+				fields: { content: { kind: "portableText", label: "Content" } },
+			});
+			await expect.element(screen.getByTestId("portable-text-editor")).toBeInTheDocument();
+			customizeLink();
+
+			const open = portableTextProps.current?.onBlockSidebarOpen as (panel: unknown) => void;
+			open({
+				type: "image",
+				attrs: { src: "https://example.com/image.png", alt: "Example" },
+				onUpdate: vi.fn(),
+				onReplace: vi.fn(),
+				onDelete: vi.fn(),
+				onClose: vi.fn(),
+			});
+
+			await expect.element(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
+			expect(screen.getByText("Customize sidebar").query()).toBeNull();
+		});
+	});
+
+	it("uses a custom collection's title field and singular label in the browser tab", async () => {
+		const screen = await render(
+			<AdminDocumentTitle siteName="My Site" pageKey="/content/people/1" pageTitle="People">
+				<ContentEditor
+					collection="people"
+					collectionLabel="Person"
+					fields={{
+						name: { kind: "string", label: "Name" },
+						title: { kind: "string", label: "Job title" },
+					}}
+					item={makeItem({ data: { name: "Jane Smith", title: "Trustee" } })}
+					isNew={false}
+					onSave={vi.fn()}
+					manifest={{
+						version: "1",
+						hash: "hash",
+						authMode: "passkey",
+						collections: {
+							people: {
+								label: "People",
+								labelSingular: "Person",
+								supports: [],
+								hasSeo: false,
+								titleField: "name",
+							},
+						},
+						plugins: {},
+						taxonomies: [],
+					}}
+				/>
+			</AdminDocumentTitle>,
+			{ wrapper: Toasty },
+		);
+		await expect.poll(() => document.title).toBe("Edit Person: Jane Smith · My Site");
+		await screen.getByLabelText("Name").fill("Jane Doe");
+		await expect.poll(() => document.title).toBe("Edit Person: Jane Doe · My Site");
+		await screen.getByLabelText("Name").fill("");
+		await expect.poll(() => document.title).toBe("Edit Person: Trustee · My Site");
+		await screen.getByLabelText("Job title").fill("");
+		await expect.poll(() => document.title).toBe("Edit Person: my-post · My Site");
+	});
+
+	describe("slug generation", () => {
+		it("auto-generates slug from title for new items", async () => {
+			const screen = await renderEditor({ isNew: true });
+			const titleInput = screen.getByLabelText("Title");
+			await titleInput.fill("Hello World Post");
+
+			const slugInput = screen.getByLabelText("Slug");
+			await expect.element(slugInput).toHaveValue("hello-world-post");
+		});
+
+		it("auto-generates the slug from the collection's title field, not a field named title", async () => {
+			const screen = await renderEditor({
+				isNew: true,
+				fields: {
+					name: { kind: "string", label: "Name" },
+					title: { kind: "string", label: "Job title" },
+				},
+				manifest: {
+					version: "1.0.0",
+					hash: "hash",
+					authMode: "passkey",
+					collections: {
+						posts: {
+							label: "Posts",
+							labelSingular: "Post",
+							supports: [],
+							hasSeo: false,
+							titleField: "name",
+						},
+					},
+					plugins: {},
+					taxonomies: [],
+				},
+			});
+			const slugInput = screen.getByLabelText("Slug");
+
+			await screen.getByLabelText("Job title").fill("Trustee");
+			await expect.element(slugInput).toHaveValue("");
+
+			await screen.getByLabelText("Name").fill("Jane Smith");
+			await expect.element(slugInput).toHaveValue("jane-smith");
+
+			await screen.getByLabelText("Job title").fill("Mayor");
+			await expect.element(slugInput).toHaveValue("jane-smith");
+		});
+
+		it("auto-generates the slug from a multiline title when the collection sets no title field", async () => {
+			const screen = await renderEditor({
+				isNew: true,
+				fields: { title: { kind: "richText", label: "Title" } },
+			});
+
+			await screen.getByLabelText("Title").fill("Hello World");
+
+			await expect.element(screen.getByLabelText("Slug")).toHaveValue("hello-world");
+		});
+
+		it("slug accepts manual override", async () => {
+			const screen = await renderEditor({ isNew: true });
+			const slugInput = screen.getByLabelText("Slug");
+			await slugInput.fill("custom-slug");
+			await expect.element(slugInput).toHaveValue("custom-slug");
+
+			// After manual edit, typing in title should NOT update slug
+			const titleInput = screen.getByLabelText("Title");
+			await titleInput.fill("New Title");
+			await expect.element(slugInput).toHaveValue("custom-slug");
+		});
+
+		it("slug is editable for new items", async () => {
+			const screen = await renderEditor({ isNew: true });
+			const slugInput = screen.getByLabelText("Slug");
+			await expect.element(slugInput).toBeEnabled();
+		});
+	});
+
+	describe("field rendering", () => {
+		it("renders string fields as text inputs", async () => {
+			const screen = await renderEditor({
+				fields: { title: { kind: "string", label: "Title" } },
+			});
+			const input = screen.getByLabelText("Title");
+			await expect.element(input).toBeInTheDocument();
+		});
+
+		it("renders boolean fields as switches", async () => {
+			const screen = await renderEditor({
+				fields: { featured: { kind: "boolean", label: "Featured" } },
+			});
+			const toggle = screen.getByRole("switch");
+			await expect.element(toggle).toBeInTheDocument();
+		});
+
+		it("renders number fields as number inputs", async () => {
+			const screen = await renderEditor({
+				fields: { order: { kind: "number", label: "Order" } },
+			});
+			const input = screen.getByLabelText("Order", { exact: true });
+			await expect.element(input).toHaveAttribute("type", "number");
+		});
+
+		it("renders select fields as select dropdowns", async () => {
+			const screen = await renderEditor({
+				fields: {
+					color: {
+						kind: "select",
+						label: "Color",
+						options: [
+							{ value: "red", label: "Red" },
+							{ value: "blue", label: "Blue" },
+						],
+					},
+				},
+			});
+			// Select renders a combobox role
+			const select = screen.getByRole("combobox");
+			await expect.element(select).toBeInTheDocument();
+		});
+
+		it("renders multiSelect fields as checkbox group", async () => {
+			const screen = await renderEditor({
+				fields: {
+					tags: {
+						kind: "multiSelect",
+						label: "Tags",
+						options: [
+							{ value: "news", label: "News" },
+							{ value: "tech", label: "Tech" },
+							{ value: "sports", label: "Sports" },
+						],
+					},
+				},
+			});
+			const checkboxes = screen.getByRole("checkbox", { exact: false });
+			await expect.element(checkboxes.first()).toBeInTheDocument();
+			// All option labels should be present
+			await expect.element(screen.getByText("News")).toBeInTheDocument();
+			await expect.element(screen.getByText("Tech")).toBeInTheDocument();
+			await expect.element(screen.getByText("Sports")).toBeInTheDocument();
+		});
+
+		it("toggling a multiSelect checkbox updates the saved value", async () => {
+			const onSave = vi.fn();
+			const item = makeItem({
+				data: { title: "Test", tags: ["news", "sports"] },
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				onSave,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					tags: {
+						kind: "multiSelect",
+						label: "Tags",
+						options: [
+							{ value: "news", label: "News" },
+							{ value: "tech", label: "Tech" },
+							{ value: "sports", label: "Sports" },
+						],
+					},
+				},
+			});
+
+			const checkboxes = screen.getByRole("checkbox", { exact: false });
+			const all = checkboxes.all();
+
+			// Uncheck "sports" (index 2, currently checked)
+			await all[2]!.click();
+			await expect.element(all[2]!).not.toBeChecked();
+
+			// Check "tech" (index 1, currently unchecked)
+			await all[1]!.click();
+			await expect.element(all[1]!).toBeChecked();
+
+			// Save and verify the data sent to onSave
+			const saveBtn = screen.getByRole("button", { name: "Save" }).first();
+			await saveBtn.click();
+
+			expect(onSave).toHaveBeenCalledWith(
+				expect.objectContaining({
+					data: expect.objectContaining({
+						tags: ["news", "tech"],
+					}),
+				}),
+			);
+		});
+
+		it.each([
+			["/about", "/about"],
+			["#section", "#section"],
+			["mailto:hello@example.com", "mailto:hello@example.com"],
+			["tel:+1 555 0100", "tel:+1 555 0100"],
+			[" https://example.com/page ", "https://example.com/page"],
+		])("saves %j in a url field as %j", async (value, saved) => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Test", website: "https://example.com" } }),
+				onSave,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					website: { kind: "url", label: "Website" },
+				},
+			});
+
+			await screen.getByLabelText("Website").fill(value);
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			await vi.waitFor(() =>
+				expect(onSave).toHaveBeenCalledWith(
+					expect.objectContaining({
+						data: expect.objectContaining({ website: saved }),
+					}),
+				),
+			);
+		});
+
+		it.each(["javascript:alert(1)", "data:text/html,x", "//evil.example", "/\\evil.example"])(
+			"refuses to save %j in a url field",
+			async (value) => {
+				const onSave = vi.fn();
+				const screen = await renderEditor({
+					isNew: false,
+					item: makeItem({ data: { title: "Test", website: "https://example.com" } }),
+					onSave,
+					fields: {
+						title: { kind: "string", label: "Title", required: true },
+						website: { kind: "url", label: "Website" },
+					},
+				});
+
+				const input = screen.getByLabelText("Website");
+				await input.fill(value);
+				await userEvent.tab();
+				await expect.element(screen.getByText(URL_FIELD_ERROR_PATTERN)).toBeInTheDocument();
+				await screen.getByRole("button", { name: "Save" }).first().click();
+
+				expect(onSave).not.toHaveBeenCalled();
+			},
+		);
+
+		it("saves a cleared number field as null", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Test", price: 5 } }),
+				onSave,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					price: { kind: "number", label: "Price" },
+				},
+			});
+
+			await screen.getByLabelText("Price", { exact: true }).clear();
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			await vi.waitFor(() =>
+				expect(onSave).toHaveBeenCalledWith(
+					expect.objectContaining({
+						data: expect.objectContaining({ price: null }),
+					}),
+				),
+			);
+		});
+
+		it("saves a cleared URL field as null", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Test", website: "https://example.com" } }),
+				onSave,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					website: { kind: "url", label: "Website" },
+				},
+			});
+
+			await screen.getByLabelText("Website", { exact: true }).clear();
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			await vi.waitFor(() =>
+				expect(onSave).toHaveBeenCalledWith(
+					expect.objectContaining({
+						data: expect.objectContaining({ website: null }),
+					}),
+				),
+			);
+		});
+
+		it("accepts and saves a decimal in a number field", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Test" } }),
+				onSave,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					price: { kind: "number", label: "Price" },
+				},
+			});
+
+			const input = screen.getByLabelText("Price", { exact: true });
+			await input.fill("4.50");
+			await expect.element(input).toBeValid();
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			await vi.waitFor(() =>
+				expect(onSave).toHaveBeenCalledWith(
+					expect.objectContaining({
+						data: expect.objectContaining({ price: 4.5 }),
+					}),
+				),
+			);
+		});
+
+		it("rejects a decimal in an integer field", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Test" } }),
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					seats: { kind: "number", label: "Seats", integer: true },
+				},
+			});
+
+			const input = screen.getByLabelText("Seats", { exact: true });
+			await input.fill("44.5");
+			await expect.element(input).not.toBeValid();
+			await input.fill("44");
+			await expect.element(input).toBeValid();
+		});
+
+		it("rejects a decimal in an integer field inside a block", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({
+					data: {
+						title: "Test",
+						layout: [{ _type: "event", _version: 1, _key: "first", seats: 40, price: 4 }],
+					},
+				}),
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					layout: {
+						kind: "blocks",
+						label: "Layout",
+						validation: { allowedTypes: ["event"], retiredTypes: [] },
+						blockTypes: [
+							{
+								id: "event-type",
+								slug: "event",
+								label: "Event",
+								currentVersion: 1,
+								source: "user",
+								createdAt: "2026-01-01T00:00:00.000Z",
+								updatedAt: "2026-01-01T00:00:00.000Z",
+								versions: [
+									{
+										id: "event-v1",
+										blockTypeId: "event-type",
+										version: 1,
+										fields: [
+											{ slug: "seats", label: "Seats", type: "integer" },
+											{ slug: "price", label: "Price", type: "number" },
+										],
+										fingerprint: "one",
+										active: true,
+										createdAt: "2026-01-01T00:00:00.000Z",
+										updatedAt: "2026-01-01T00:00:00.000Z",
+									},
+								],
+							},
+						],
+					},
+				},
+			});
+
+			await screen.getByRole("button", { name: "Event", exact: true }).click();
+			const seats = screen.getByLabelText("Seats", { exact: true });
+			await seats.fill("44.5");
+			await expect.element(seats).not.toBeValid();
+			await seats.fill("44");
+			await expect.element(seats).toBeValid();
+
+			const price = screen.getByLabelText("Price", { exact: true });
+			await price.fill("4.50");
+			await expect.element(price).toBeValid();
+		});
+
+		it("keeps URL values left-to-right inside an RTL editor", async () => {
+			document.documentElement.dir = "rtl";
+			try {
+				const screen = await renderEditor({
+					isNew: false,
+					item: makeItem({ data: { title: "Test", website: "/about" } }),
+					fields: {
+						title: { kind: "string", label: "Title", required: true },
+						website: { kind: "url", label: "Website" },
+					},
+				});
+
+				await expect.element(screen.getByLabelText("Website")).toHaveAttribute("dir", "ltr");
+			} finally {
+				document.documentElement.dir = "ltr";
+			}
+		});
+
+		it("multiSelect checkboxes reflect existing values", async () => {
+			const item = makeItem({
+				data: { title: "Test", tags: ["news", "sports"] },
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					tags: {
+						kind: "multiSelect",
+						label: "Tags",
+						options: [
+							{ value: "news", label: "News" },
+							{ value: "tech", label: "Tech" },
+							{ value: "sports", label: "Sports" },
+						],
+					},
+				},
+			});
+			// Verify the checkbox group renders with correct checked state via aria
+			const checkboxes = screen.getByRole("checkbox", { exact: false });
+			const all = checkboxes.all();
+			// Should have 3 checkboxes
+			expect(all).toHaveLength(3);
+			// news (checked), tech (unchecked), sports (checked)
+			await expect.element(all[0]!).toBeChecked();
+			await expect.element(all[1]!).not.toBeChecked();
+			await expect.element(all[2]!).toBeChecked();
+		});
+
+		it("renders file fields with a Select file button (not a plain text input)", async () => {
+			// Regression test for #718: the "file" field kind used to fall through to the
+			// default case and render a text input, making it impossible to actually attach
+			// a file. It must render a media picker trigger instead.
+			const screen = await renderEditor({
+				fields: { attachment: { kind: "file", label: "Attachment" } },
+				isNew: true,
+			});
+
+			// The button that opens the picker should be present and labeled with the
+			// field's label (accessibility).
+			const selectBtn = screen.getByRole("button", { name: /Select Attachment/i });
+			await expect.element(selectBtn).toBeInTheDocument();
+
+			// And there must not be a text input inside the file field region — the old
+			// bug rendered an `<Input>` labeled "Attachment" as a plain text field.
+			// Use the field id (`field-attachment`) as an unconditional positive selector.
+			const fieldRoot = document.getElementById("field-attachment");
+			expect(fieldRoot).not.toBeNull();
+			const textInputs = fieldRoot!.querySelectorAll(
+				'input:not([type="file"]):not([type="hidden"])',
+			);
+			expect(textInputs).toHaveLength(0);
+		});
+
+		it("renders existing file field values as a filename, not a text input", async () => {
+			const item = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "file-1",
+						filename: "report.pdf",
+						mimeType: "application/pdf",
+						size: 102400,
+					},
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+
+			// Filename should be visible
+			await expect.element(screen.getByText("report.pdf")).toBeInTheDocument();
+			await expect.element(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
+			await expect
+				.element(screen.getByRole("button", { name: "Remove Attachment" }))
+				.toHaveTextContent("Remove");
+		});
+
+		it("renders 0-byte file size instead of hiding it", async () => {
+			// Regression test: a previous truthiness check (`const hasSize = normalized?.size`)
+			// hid the size label for valid 0-byte files even though `formatFileSize(0)`
+			// returns "0 B".
+			const item = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "file-empty",
+						filename: "empty.txt",
+						mimeType: "text/plain",
+						size: 0,
+					},
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+
+			await expect.element(screen.getByText("empty.txt")).toBeInTheDocument();
+			// "0 B" must be rendered, not silently hidden
+			await expect.element(screen.getByText(/0\s*B/)).toBeInTheDocument();
+		});
+
+		it("falls back to value.src and then value.id for local files without meta.storageKey", async () => {
+			// Regression test: local files without meta.storageKey previously lost their
+			// download link because the URL was only built from storageKey.
+			const itemWithSrc = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "file-no-key",
+						provider: "local",
+						src: "/_emdash/api/media/file/file-no-key",
+						filename: "backup.zip",
+						mimeType: "application/zip",
+						size: 2048,
+					},
+				},
+			});
+			const screen1 = await renderEditor({
+				isNew: false,
+				item: itemWithSrc,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+			const link1 = screen1.getByRole("link", { name: "backup.zip" });
+			await expect.element(link1).toHaveAttribute("href", "/_emdash/api/media/file/file-no-key");
+
+			// When src is also missing, fall back to value.id
+			const itemNoSrc = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "file-fallback",
+						provider: "local",
+						filename: "notes.txt",
+						mimeType: "text/plain",
+						size: 512,
+					},
+				},
+			});
+			const screen2 = await renderEditor({
+				isNew: false,
+				item: itemNoSrc,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+			const link2 = screen2.getByRole("link", { name: "notes.txt" });
+			await expect.element(link2).toHaveAttribute("href", "/_emdash/api/media/file/file-fallback");
+		});
+
+		it("renders a legacy external file URL when src is absent", async () => {
+			const item = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "external-file",
+						provider: "external",
+						url: "https://files.example.com/report.pdf",
+						filename: "report.pdf",
+						mimeType: "application/pdf",
+					},
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+
+			await expect
+				.element(screen.getByRole("link", { name: "report.pdf" }))
+				.toHaveAttribute("href", "https://files.example.com/report.pdf");
+		});
+
+		it("does not trust external URLs on local file snapshots", async () => {
+			const item = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "local-file",
+						provider: "local",
+						url: "https://attacker.example/file.pdf",
+						filename: "report.pdf",
+					},
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+
+			await expect
+				.element(screen.getByRole("link", { name: "report.pdf" }))
+				.toHaveAttribute("href", "/_emdash/api/media/file/local-file");
+		});
+
+		it("does not render data: or javascript: URLs from external providers as links", async () => {
+			// A hostile external provider plugin could return src: "javascript:..." or
+			// "data:..."; the file field must not surface either as a clickable <a href>.
+			// Filename should still display as plain text so the user can see what's set.
+			const item = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "evil-1",
+						provider: "evil",
+						src: "javascript:alert(1)",
+						filename: "ok.txt",
+						mimeType: "text/plain",
+					},
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+
+			// Filename renders…
+			await expect.element(screen.getByText("ok.txt")).toBeInTheDocument();
+			// …but never as a link with the hostile href.
+			const fieldRoot = document.getElementById("field-attachment");
+			expect(fieldRoot).not.toBeNull();
+			expect(fieldRoot!.querySelector('a[href^="javascript:"]')).toBeNull();
+			expect(fieldRoot!.querySelector('a[href^="data:"]')).toBeNull();
+		});
+
+		it("encodes path-unsafe characters in storageKey when building the local URL", async () => {
+			// Server-generated storage keys are flat ULIDs today, but the schema
+			// now allows clients to write any `meta.storageKey` string via the
+			// content API. `?` or `#` would otherwise escape the path.
+			const item = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "x",
+						provider: "local",
+						filename: "notes.txt",
+						mimeType: "text/plain",
+						meta: { storageKey: "abc?evil#frag" },
+					},
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+			const link = screen.getByRole("link", { name: "notes.txt" });
+			await expect
+				.element(link)
+				.toHaveAttribute("href", "/_emdash/api/media/file/abc%3Fevil%23frag");
+		});
+
+		it("Remove button clears the file field value", async () => {
+			const onSave = vi.fn();
+			const item = makeItem({
+				data: {
+					title: "Test",
+					body: "",
+					attachment: {
+						id: "file-1",
+						filename: "report.pdf",
+						mimeType: "application/pdf",
+						size: 1024,
+					},
+				},
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				onSave,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					attachment: { kind: "file", label: "Attachment" },
+				},
+			});
+
+			await screen.getByRole("button", { name: "Remove Attachment" }).click();
+			// The Select empty-state button replaces the filled state.
+			await expect
+				.element(screen.getByRole("button", { name: "Select Attachment" }))
+				.toBeInTheDocument();
+
+			await screen.getByRole("button", { name: "Save" }).first().click();
+			expect(onSave).toHaveBeenCalledWith(
+				expect.objectContaining({
+					data: expect.objectContaining({ attachment: null }),
+				}),
+			);
+		});
+
+		it("renders datetime fields as datetime-local inputs", async () => {
+			const screen = await renderEditor({
+				fields: { recall_date: { kind: "datetime", label: "Recall date" } },
+			});
+			const input = screen.getByLabelText("Recall date");
+			await expect.element(input).toHaveAttribute("type", "datetime-local");
+		});
+
+		it("displays a stored ISO datetime in the datetime-local input", async () => {
+			// The validator stores datetimes as full ISO 8601 with "Z" + millis,
+			// but <input type="datetime-local"> only accepts "YYYY-MM-DDTHH:mm".
+			// Without conversion the browser silently renders an empty input.
+			const item = makeItem({
+				data: { title: "Recall", recall_date: "2026-02-26T09:30:00.000Z" },
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					recall_date: { kind: "datetime", label: "Recall date" },
+				},
+			});
+			const input = screen.getByLabelText("Recall date");
+			await expect.element(input).toHaveValue("2026-02-26T09:30");
+		});
+
+		it("renders a datetime field when the site timezone is not a valid IANA zone", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Recall", recall_date: "2026-02-26T09:30:00.000Z" } }),
+				timezone: "Lisboa",
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					recall_date: { kind: "datetime", label: "Recall date" },
+				},
+			});
+			await expect.element(screen.getByLabelText("Recall date")).toHaveValue("2026-02-26T09:30");
+		});
+
+		it("saves datetime fields back as full ISO 8601 with Z and milliseconds", async () => {
+			// datetime-local emits "YYYY-MM-DDTHH:mm" which the field's
+			// `z.string().datetime().or(z.string().date())` schema rejects.
+			// The widget must round-trip the value back to a validator-accepted shape.
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: true,
+				onSave,
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					recall_date: { kind: "datetime", label: "Recall date" },
+				},
+			});
+
+			const titleInput = screen.getByLabelText("Title");
+			await titleInput.fill("Recall");
+
+			const dtInput = screen.getByLabelText("Recall date");
+			await dtInput.fill("2026-02-26T09:30");
+
+			const saveBtn = screen.getByRole("button", { name: "Save" }).first();
+			await saveBtn.click();
+
+			expect(onSave).toHaveBeenCalledWith(
+				expect.objectContaining({
+					data: expect.objectContaining({
+						recall_date: "2026-02-26T09:30:00.000Z",
+					}),
+				}),
+			);
+		});
+
+		it("saves null when an optional datetime field is cleared", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				onSave,
+				item: makeItem({ data: { title: "Recall", recall_date: "2026-02-26T09:30:00.000Z" } }),
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					recall_date: { kind: "datetime", label: "Recall date" },
+				},
+			});
+
+			await screen.getByLabelText("Recall date").fill("");
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			expect(onSave).toHaveBeenCalledWith(
+				expect.objectContaining({ data: expect.objectContaining({ recall_date: null }) }),
+			);
+		});
+
+		it("does not save when a required datetime field is cleared", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				onSave,
+				item: makeItem({ data: { title: "Recall", recall_date: "2026-02-26T09:30:00.000Z" } }),
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					recall_date: { kind: "datetime", label: "Recall date", required: true },
+				},
+			});
+
+			await screen.getByLabelText("Recall date").fill("");
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			expect(onSave).not.toHaveBeenCalled();
+		});
+
+		it("renders json fields as a textarea", async () => {
+			const screen = await renderEditor({
+				fields: { metadata: { kind: "json", label: "Metadata" } },
+				isNew: true,
+			});
+			const textarea = screen.getByLabelText("Metadata");
+			await expect.element(textarea).toBeInTheDocument();
+			// JSON field uses a textarea element
+			expect(textarea.element().tagName).toBe("TEXTAREA");
+		});
+
+		it("renders json fields with object values as formatted JSON", async () => {
+			const jsonData = { foo: "bar", num: 42 };
+			const screen = await renderEditor({
+				fields: { metadata: { kind: "json", label: "Metadata" } },
+				item: makeItem({ data: { title: "Test", body: "", metadata: jsonData } }),
+			});
+			const textarea = screen.getByLabelText("Metadata");
+			await expect.element(textarea).toHaveValue(JSON.stringify(jsonData, null, 2));
+		});
+
+		it("sizes text field textareas from the rows option", async () => {
+			const screen = await renderEditor({
+				fields: {
+					excerpt: { kind: "richText", label: "Excerpt", options: { rows: 4 } },
+					notes: { kind: "richText", label: "Notes" },
+				},
+			});
+			await expect.element(screen.getByLabelText("Excerpt")).toHaveAttribute("rows", "4");
+			await expect.element(screen.getByLabelText("Notes")).toHaveAttribute("rows", "10");
+		});
+	});
+
+	describe("field defaults", () => {
+		const fieldsWithDefaults: Record<string, FieldDescriptor> = {
+			featured: { kind: "boolean", label: "Featured", defaultValue: true },
+			color: {
+				kind: "select",
+				label: "Color",
+				options: [
+					{ value: "red", label: "Red" },
+					{ value: "blue", label: "Blue" },
+				],
+				defaultValue: "blue",
+			},
+			order: { kind: "number", label: "Order", defaultValue: 3 },
+			rank: { kind: "number", label: "Rank", defaultValue: 0 },
+			subtitle: { kind: "string", label: "Subtitle", defaultValue: "Draft" },
+			tagline: { kind: "string", label: "Tagline", defaultValue: "New" },
+		};
+
+		it("starts a new entry with each field's default and saves the defaults untouched", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({ isNew: true, onSave, fields: fieldsWithDefaults });
+
+			await expect.element(screen.getByRole("switch")).toBeChecked();
+			await expect
+				.element(screen.getByRole("combobox", { name: "Color" }))
+				.toHaveTextContent("Blue");
+			await expect.element(screen.getByLabelText("Order", { exact: true })).toHaveValue(3);
+			await expect.element(screen.getByLabelText("Rank", { exact: true })).toHaveValue(0);
+			await expect.element(screen.getByLabelText("Subtitle")).toHaveValue("Draft");
+
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			expect(onSave).toHaveBeenCalledTimes(1);
+			expect(onSave.mock.calls[0]![0].data).toEqual({
+				featured: true,
+				color: "blue",
+				order: 3,
+				rank: 0,
+				subtitle: "Draft",
+				tagline: "New",
+			});
+		});
+
+		it("keeps nested defaults unchanged across new entries", async () => {
+			const fields: Record<string, FieldDescriptor> = {
+				settings: {
+					kind: "json",
+					label: "Settings",
+					defaultValue: { links: [{ label: "Original" }] },
+				},
+				sections: { kind: "json", label: "Sections", defaultValue: ["First"] },
+			};
+			const expected = { settings: { links: [{ label: "Original" }] }, sections: ["First"] };
+			const onSave = vi.fn<NonNullable<ContentEditorProps["onSave"]>>();
+			const first = await renderEditor({ isNew: true, fields, onSave });
+
+			await first.getByRole("button", { name: "Save" }).first().click();
+			expect(onSave).toHaveBeenCalledTimes(1);
+			const saved = onSave.mock.calls[0]![0].data;
+			expect(saved).toEqual(expected);
+			await first.unmount();
+
+			(saved.settings as { links: { label: string }[] }).links[0]!.label = "Changed";
+			(saved.sections as string[]).push("Second");
+			expect(fields.settings!.defaultValue).toEqual(expected.settings);
+			expect(fields.sections!.defaultValue).toEqual(expected.sections);
+
+			const second = await renderEditor({ isNew: true, fields, onSave });
+			await second.getByRole("button", { name: "Save" }).first().click();
+			expect(onSave).toHaveBeenCalledTimes(2);
+			expect(onSave.mock.calls[1]![0].data).toEqual(expected);
+		});
+
+		it("shows an existing entry's stored values, not the defaults, and stays saved", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { featured: false, color: "red", order: 0, subtitle: "" } }),
+				fields: fieldsWithDefaults,
+			});
+
+			await expect.element(screen.getByRole("switch")).not.toBeChecked();
+			await expect
+				.element(screen.getByRole("combobox", { name: "Color" }))
+				.toHaveTextContent("Red");
+			await expect.element(screen.getByLabelText("Order", { exact: true })).toHaveValue(0);
+			await expect.element(screen.getByLabelText("Subtitle")).toHaveValue("");
+			await expect.element(screen.getByLabelText("Tagline")).toHaveValue("");
+			await expect
+				.element(screen.getByRole("button", { name: "Save", exact: true }).query())
+				.toBeNull();
+		});
+
+		it("leaves the defaults out of an edit form whose entry did not load", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: undefined,
+				fields: fieldsWithDefaults,
+			});
+
+			await expect.element(screen.getByRole("switch")).not.toBeChecked();
+			await expect
+				.element(screen.getByRole("button", { name: "Save", exact: true }).query())
+				.toBeNull();
+		});
+	});
+
+	describe("field constraints", () => {
+		it("caps string fields at maxLength and counts characters against it", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { summary: "Hello" } }),
+				fields: {
+					summary: { kind: "string", label: "Summary", validation: { maxLength: 160 } },
+				},
+			});
+			const input = screen.getByLabelText("Summary", { exact: true });
+			await expect.element(input).toHaveAttribute("maxlength", "160");
+			await expect.element(screen.getByText("5 of 160 characters")).toBeInTheDocument();
+			await expect.element(input).not.toHaveAttribute("aria-invalid");
+
+			await userEvent.fill(input, "Hello world");
+			await expect.element(screen.getByText("11 of 160 characters")).toBeInTheDocument();
+		});
+
+		it("flags string content that already exceeds maxLength", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { summary: "x".repeat(170) } }),
+				fields: {
+					summary: { kind: "string", label: "Summary", validation: { maxLength: 160 } },
+				},
+			});
+			const input = screen.getByLabelText("Summary", { exact: true });
+			await expect.element(input).toHaveAttribute("aria-invalid", "true");
+			await expect.element(screen.getByText("170 of 160 characters")).toBeInTheDocument();
+		});
+
+		it("flags a cleared field against minLength, not an untouched one", async () => {
+			const screen = await renderEditor({
+				fields: {
+					summary: { kind: "string", label: "Summary", validation: { minLength: 10 } },
+				},
+			});
+			const input = screen.getByLabelText("Summary", { exact: true });
+			await expect.element(screen.getByText("At least 10 characters")).toBeInTheDocument();
+			await expect.element(input).not.toHaveAttribute("aria-invalid");
+
+			await userEvent.fill(input, "short");
+			await expect.element(input).toHaveAttribute("aria-invalid", "true");
+
+			await userEvent.clear(input);
+			await expect.element(input).toHaveAttribute("aria-invalid", "true");
+			await expect.element(screen.getByText("At least 10 characters")).toBeInTheDocument();
+		});
+
+		it("caps text fields at maxLength", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { body: "Some markdown" } }),
+				fields: {
+					body: { kind: "richText", label: "Body", validation: { maxLength: 500 } },
+				},
+			});
+			const textarea = screen.getByLabelText("Body");
+			await expect.element(textarea).toHaveAttribute("maxlength", "500");
+			await expect.element(screen.getByText("13 of 500 characters")).toBeInTheDocument();
+		});
+
+		it("shows the allowed range on number fields and flags values outside it", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { rating: 12 } }),
+				fields: {
+					rating: { kind: "number", label: "Rating", validation: { min: 1, max: 10 } },
+				},
+			});
+			const input = screen.getByLabelText("Rating", { exact: true });
+			await expect.element(input).toHaveAttribute("min", "1");
+			await expect.element(input).toHaveAttribute("max", "10");
+			await expect.element(screen.getByText("Between 1 and 10")).toBeInTheDocument();
+			await expect.element(input).toHaveAttribute("aria-invalid", "true");
+
+			await userEvent.fill(input, "7");
+			await expect.element(input).not.toHaveAttribute("aria-invalid");
+		});
+
+		it("renders no hint when a field declares no bounds", async () => {
+			const screen = await renderEditor({
+				fields: { title: { kind: "string", label: "Title" } },
+			});
+			const input = screen.getByLabelText("Title");
+			await expect.element(input).not.toHaveAttribute("maxlength");
+			expect(screen.container.textContent).not.toContain("characters");
+		});
+
+		it("passes the field's validation to plugin field widgets", async () => {
+			const seen: unknown[] = [];
+			const pluginAdmins: PluginAdmins = {
+				counter: {
+					fields: {
+						limited: ({ validation }: { validation?: Record<string, unknown> }) => {
+							seen.push(validation);
+							return <div data-testid="limited-widget" />;
+						},
+					},
+				},
+			};
+			const screen = await render(
+				<PluginAdminProvider pluginAdmins={pluginAdmins}>
+					<ContentEditor
+						collection="posts"
+						collectionLabel="Post"
+						isNew
+						onSave={vi.fn()}
+						fields={{
+							summary: {
+								kind: "string",
+								label: "Summary",
+								widget: "counter:limited",
+								validation: { maxLength: 160 },
+							},
+						}}
+					/>
+				</PluginAdminProvider>,
+			);
+			await expect.element(screen.getByTestId("limited-widget")).toBeInTheDocument();
+			expect(seen[0]).toEqual({ maxLength: 160 });
+		});
+	});
+
+	describe("saving", () => {
+		it("save form calls onSave with formData including slug", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({ isNew: true, onSave });
+
+			const titleInput = screen.getByLabelText("Title");
+			await titleInput.fill("Test Title");
+
+			const saveBtn = screen.getByRole("button", { name: "Save" }).first();
+			await saveBtn.click();
+
+			expect(onSave).toHaveBeenCalledWith(
+				expect.objectContaining({
+					data: expect.objectContaining({ title: "Test Title" }),
+					slug: "test-title",
+					bylines: [],
+				}),
+			);
+		});
+
+		it("SaveButton shows correct dirty state for new items", async () => {
+			const screen = await renderEditor({ isNew: true });
+			// New items are always dirty
+			const saveBtn = screen.getByRole("button", { name: "Save" }).first();
+			await expect.element(saveBtn).toBeEnabled();
+		});
+
+		it("hides the save control for an existing item with no changes", async () => {
+			const item = makeItem();
+			const screen = await renderEditor({ isNew: false, item });
+			await expect
+				.element(screen.getByRole("button", { name: "Save", exact: true }).query())
+				.toBeNull();
+		});
+
+		// Strict per-locale hydration (migration 040) can return
+		// `item.bylines = []` even when junction rows exist at other
+		// locales (e.g. an FR post that inherited an EN-only byline via
+		// copyContentBylines). Sending `bylines: []` on every save would
+		// silently wipe the copied credit. The editor must omit `bylines`
+		// from the payload unless the user actually touched the editor.
+		it("omits bylines from save payload when the user did not touch the byline editor", async () => {
+			const onSave = vi.fn();
+			const item = makeItem({ data: { title: "Hello", body: "" } });
+			const screen = await renderEditor({ isNew: false, item, onSave });
+
+			const titleInput = screen.getByLabelText("Title");
+			await titleInput.fill("Changed");
+
+			const saveBtn = screen.getByRole("button", { name: "Save" }).first();
+			await saveBtn.click();
+
+			expect(onSave).toHaveBeenCalledTimes(1);
+			const payload = onSave.mock.calls[0]?.[0] as Record<string, unknown>;
+			expect(payload).not.toHaveProperty("bylines");
+		});
+
+		it("shows an owner-inferred byline as an automatic credit", async () => {
+			const screen = await renderBylineContent([
+				savedCredit(makeByline({ id: "inferred", displayName: "Owner Profile" }), "inferred"),
+			]);
+
+			await expect.element(screen.getByText("Automatic", { exact: true })).toBeInTheDocument();
+			await expect.element(screen.getByText("From the post owner")).toBeInTheDocument();
+			await expect.element(screen.getByLabelText("Role label")).not.toBeInTheDocument();
+		});
+
+		it("does not reveal an inferred credit from a malformed mixed response", async () => {
+			const explicit = makeByline({
+				id: "explicit",
+				slug: "mina-patel",
+				displayName: "Mina Patel",
+			});
+			const inferred = makeByline({ id: "inferred", displayName: "Owner Profile" });
+			const screen = await renderBylineContent(
+				[savedCredit(explicit, "explicit"), savedCredit(inferred, "inferred", null, 1)],
+				{ availableBylines: [explicit] },
+			);
+
+			await screen.getByRole("button", { name: "More actions for Mina Patel" }).click();
+			await screen.getByRole("menuitem", { name: "Remove from post" }).click();
+
+			await expect.element(screen.getByRole("button", { name: "Choose bylines" })).toBeVisible();
+			await expect.element(screen.getByText("Owner Profile")).not.toBeInTheDocument();
+			await expect.element(screen.getByText("Automatic", { exact: true })).not.toBeInTheDocument();
+		});
+
+		it("never saves an inferred byline as an explicit credit", async () => {
+			const onSave = vi.fn();
+			const inferred = makeByline({ id: "inferred", displayName: "Owner Profile" });
+			const explicit = makeByline({
+				id: "explicit",
+				slug: "mina-patel",
+				displayName: "Mina Patel",
+			});
+			const screen = await renderBylineContent([savedCredit(inferred, "inferred")], {
+				availableBylines: [explicit],
+				onSave,
+			});
+
+			await screen.getByRole("button", { name: "Choose bylines" }).click();
+			await screen.getByRole("button", { name: "Add Mina Patel" }).click();
+			await screen.getByRole("button", { name: "Save" }).first().click();
+
+			expect(onSave).toHaveBeenCalledWith(
+				expect.objectContaining({
+					bylines: [{ bylineId: "explicit", roleLabel: null }],
+				}),
+			);
+		});
+
+		it("keeps a credit without a source editable for backwards compatibility", async () => {
+			const legacy = makeByline({ id: "legacy", displayName: "Legacy Credit" });
+			const screen = await renderBylineContent([savedCredit(legacy)]);
+
+			await expect.element(screen.getByText("Legacy Credit")).toBeInTheDocument();
+			await expect
+				.element(screen.getByRole("button", { name: "More actions for Legacy Credit" }))
+				.toBeInTheDocument();
+			await expect.element(screen.getByText("Automatic", { exact: true })).not.toBeInTheDocument();
+		});
+
+		it("suppresses the locale empty-state CTA until the picker query resolves", async () => {
+			const item = makeItem({ data: { title: "Hello", body: "" }, locale: "fr-fr" });
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				currentUser: { id: "u-1", role: 50 },
+				i18n: { defaultLocale: "en", locales: ["en", "fr-fr"] },
+				entryLocale: "fr-fr",
+				availableBylines: [],
+				availableBylinesLoaded: false,
+			});
+
+			await expect
+				.element(screen.getByText(/No bylines available/), { timeout: 100 })
+				.not.toBeInTheDocument();
+		});
+
+		it("shows the locale empty-state CTA once the picker query resolves empty", async () => {
+			const item = makeItem({ data: { title: "Hello", body: "" }, locale: "fr-fr" });
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				currentUser: { id: "u-1", role: 50 },
+				i18n: { defaultLocale: "en", locales: ["en", "fr-fr"] },
+				entryLocale: "fr-fr",
+				availableBylines: [],
+				availableBylinesLoaded: true,
+			});
+
+			await expect.element(screen.getByText(/No bylines available/)).toBeInTheDocument();
+		});
+
+		it("includes bylines: [] in save payload for new entries even when untouched", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({ isNew: true, onSave });
+
+			const titleInput = screen.getByLabelText("Title");
+			await titleInput.fill("Brand new");
+
+			const saveBtn = screen.getByRole("button", { name: "Save" }).first();
+			await saveBtn.click();
+
+			expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ bylines: [] }));
+		});
+
+		it("keeps edited values after autosave completes without queuing another autosave", async () => {
+			vi.useFakeTimers();
+
+			try {
+				const item = makeItem();
+				const onAutosave = vi.fn();
+				const props: ContentEditorProps = {
+					collection: "posts",
+					collectionLabel: "Post",
+					fields: defaultFields,
+					isNew: false,
+					item,
+					onSave: vi.fn(),
+					onAutosave,
+					isAutosaving: false,
+					autosaveCompletionToken: 0,
+				};
+
+				const screen = await render(<ContentEditor {...props} />);
+				const titleInput = screen.getByLabelText("Title");
+				await titleInput.fill("Updated title");
+
+				await vi.advanceTimersByTimeAsync(2000);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+
+				await screen.rerender(<ContentEditor {...props} isAutosaving={true} />);
+				const autosavedItem = makeItem({
+					updatedAt: "2026-04-12T18:38:00Z",
+					data: { title: "Updated title", body: "Some content" },
+				});
+				await screen.rerender(
+					<ContentEditor
+						{...props}
+						item={autosavedItem}
+						isAutosaving={false}
+						autosaveCompletionToken={1}
+					/>,
+				);
+
+				await expect.element(screen.getByLabelText("Title")).toHaveValue("Updated title");
+				await vi.advanceTimersByTimeAsync(2500);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("does not resend a rejected autosave payload until the content changes", async () => {
+			vi.useFakeTimers();
+
+			try {
+				const item = makeItem();
+				const onAutosave = vi.fn();
+				const props: ContentEditorProps = {
+					collection: "posts",
+					collectionLabel: "Post",
+					fields: defaultFields,
+					isNew: false,
+					item,
+					onSave: vi.fn(),
+					onAutosave,
+					isAutosaving: false,
+					autosaveCompletionToken: 0,
+					autosaveRejectionToken: 0,
+				};
+
+				const screen = await render(<ContentEditor {...props} />);
+				const titleInput = screen.getByLabelText("Title");
+				await titleInput.fill("Too long");
+
+				await vi.advanceTimersByTimeAsync(2000);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+
+				await screen.rerender(<ContentEditor {...props} isAutosaving={true} />);
+				await screen.rerender(
+					<ContentEditor {...props} isAutosaving={false} autosaveRejectionToken={1} />,
+				);
+
+				await vi.advanceTimersByTimeAsync(10_000);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+				await expect.element(screen.getByLabelText("Title")).toHaveValue("Too long");
+				await expect
+					.element(screen.getByRole("button", { name: "Save", exact: true }).first())
+					.toBeEnabled();
+
+				await titleInput.fill("Short");
+				await vi.advanceTimersByTimeAsync(2000);
+				expect(onAutosave).toHaveBeenCalledTimes(2);
+				expect(onAutosave).toHaveBeenLastCalledWith(
+					expect.objectContaining({ data: expect.objectContaining({ title: "Short" }) }),
+				);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
+	describe("delete", () => {
+		it("shows delete button for existing items", async () => {
+			const item = makeItem();
+			const onDelete = vi.fn();
+			const screen = await renderEditor({ isNew: false, item, onDelete });
+			const deleteBtn = screen.getByRole("button", { name: MOVE_TO_TRASH_PATTERN });
+			await expect.element(deleteBtn).toBeInTheDocument();
+		});
+
+		it("delete button opens confirmation dialog and confirming calls onDelete", async () => {
+			const item = makeItem();
+			const onDelete = vi.fn();
+			const screen = await renderEditor({ isNew: false, item, onDelete });
+
+			// Click the delete trigger button
+			const deleteBtn = screen.getByRole("button", { name: MOVE_TO_TRASH_PATTERN });
+			await deleteBtn.click();
+
+			// Dialog should appear with "Move to Trash?" title
+			await expect.element(screen.getByText("Move to Trash?")).toBeInTheDocument();
+
+			// There are multiple "Move to Trash" buttons - click the last one (the dialog confirm)
+			const allBtns = document.querySelectorAll("button");
+			const trashBtns = [...allBtns].filter((b) => b.textContent?.trim() === "Move to Trash");
+			if (trashBtns[1]) {
+				trashBtns[1].click();
+			}
+
+			await vi.waitFor(() => {
+				expect(onDelete).toHaveBeenCalled();
+			});
+		});
+
+		it("does not show delete button for new items", async () => {
+			const screen = await renderEditor({ isNew: true });
+			await expect
+				.element(screen.getByText("Move to Trash"), { timeout: 100 })
+				.not.toBeInTheDocument();
+		});
+	});
+
+	describe("publish actions", () => {
+		describe("settings panel resizing", () => {
+			it("resizes through its bounded keyboard separator without collapsing", async () => {
+				const screen = await renderEditor({ isNew: false, item: makeItem() });
+				const panel = screen.getByRole("complementary", { name: "Settings" }).element();
+				const separator = screen.getByRole("separator", { name: "Settings" }).element();
+
+				expect(panel.getBoundingClientRect().width).toBeCloseTo(368);
+				expect(separator).toHaveAttribute("aria-valuemin", "320");
+				expect(separator).toHaveAttribute("aria-valuemax", "480");
+				expect(separator).toHaveAttribute("aria-valuenow", "368");
+				expect(separator).toHaveAttribute("aria-controls", panel.id);
+
+				separator.focus();
+				await userEvent.keyboard("{End}");
+				await vi.waitFor(() => expect(panel.getBoundingClientRect().width).toBeCloseTo(480));
+				expect(separator).toHaveAttribute("aria-valuenow", "480");
+
+				await userEvent.keyboard("{ArrowLeft}");
+				expect(panel.getBoundingClientRect().width).toBeCloseTo(480);
+
+				await userEvent.keyboard("{Home}");
+				await vi.waitFor(() => expect(panel.getBoundingClientRect().width).toBeCloseTo(320));
+				expect(separator).toHaveAttribute("aria-valuenow", "320");
+				await userEvent.keyboard("{ArrowLeft}");
+				await vi.waitFor(() => expect(panel.getBoundingClientRect().width).toBeCloseTo(330));
+			});
+
+			it.each([
+				{ locale: "en", dir: "ltr", growKey: "ArrowLeft", shrinkKey: "ArrowRight" },
+				{ locale: "ar", dir: "rtl", growKey: "ArrowRight", shrinkKey: "ArrowLeft" },
+			])("uses the physical growth key for $dir", async (testCase) => {
+				const previousLocale = i18n.locale;
+				const previousDir = document.documentElement.dir;
+				i18n.load(testCase.locale, {});
+				i18n.activate(testCase.locale);
+				document.documentElement.dir = testCase.dir;
+
+				try {
+					const screen = await renderEditor({ isNew: false, item: makeItem() });
+					const panel = screen.getByRole("complementary", { name: "Settings" }).element();
+					const separator = screen.getByRole("separator", { name: "Settings" }).element();
+					const before = panel.getBoundingClientRect();
+
+					separator.focus();
+					await userEvent.keyboard(`{${testCase.growKey}}`);
+					await vi.waitFor(() =>
+						expect(panel.getBoundingClientRect().width).toBeCloseTo(before.width + 10),
+					);
+					await userEvent.keyboard(`{${testCase.shrinkKey}}`);
+					await vi.waitFor(() =>
+						expect(panel.getBoundingClientRect().width).toBeCloseTo(before.width),
+					);
+				} finally {
+					document.documentElement.dir = previousDir;
+					i18n.activate(previousLocale);
+				}
+			});
+
+			it("hides resizing across a mobile round trip without losing the desktop width", async () => {
+				const media = installMatchMedia(false);
+				try {
+					const screen = await renderEditor({ isNew: false, item: makeItem() });
+					const separator = screen.getByRole("separator", { name: "Settings" });
+					separator.element().focus();
+					await userEvent.keyboard("{ArrowLeft}");
+					await expect.element(separator).toHaveAttribute("aria-valuenow", "378");
+
+					await media.setMatchesSequentially(true);
+					await expect
+						.element(screen.getByRole("separator", { name: "Settings" }))
+						.not.toBeInTheDocument();
+					await screen.getByRole("button", { name: "Show settings", exact: true }).click();
+					await expect
+						.element(screen.getByRole("navigation", { name: "Settings" }))
+						.toBeInTheDocument();
+					await screen.getByRole("button", { name: "Close settings" }).click();
+
+					await media.setMatchesSequentially(false);
+					await expect
+						.element(screen.getByRole("separator", { name: "Settings" }))
+						.toHaveAttribute("aria-valuenow", "378");
+				} finally {
+					media.restore();
+				}
+			});
+		});
+
+		describe("settings panel toggle", () => {
+			const STORAGE_KEY = "emdash-editor-settings-panel";
+			const ptFields: Record<string, FieldDescriptor> = {
+				title: { kind: "string", label: "Title" },
+				content: { kind: "portableText", label: "Content" },
+			};
+
+			beforeEach(() => {
+				localStorage.removeItem(STORAGE_KEY);
+			});
+			afterEach(() => {
+				localStorage.removeItem(STORAGE_KEY);
+			});
+
+			function getPanel(screen: Awaited<ReturnType<typeof renderEditor>>) {
+				return screen.getByRole("complementary", { name: "Settings", includeHidden: true });
+			}
+
+			function makeBlockPanel() {
+				return {
+					type: "image",
+					attrs: { src: "https://example.com/image.png", alt: "Example" },
+					onUpdate: vi.fn(),
+					onReplace: vi.fn(),
+					onDelete: vi.fn(),
+					onClose: vi.fn(),
+				};
+			}
+
+			function getPanelHooks() {
+				const open = portableTextProps.current?.onBlockSidebarOpen as (panel: unknown) => void;
+				const close = portableTextProps.current?.onBlockSidebarClose as () => void;
+				expect(typeof open).toBe("function");
+				expect(typeof close).toBe("function");
+				return { open, close };
+			}
+
+			it("keeps a settings link pending when its control cannot take focus", async () => {
+				localStorage.setItem(STORAGE_KEY, "hidden");
+				const onFieldFocused = vi.fn();
+				const screen = await renderEditor({
+					isNew: false,
+					item: makeItem(),
+					readOnly: true,
+					focusField: "slug",
+					onFieldFocused,
+				});
+				const panel = getPanel(screen).element();
+				await expect.poll(() => panel.getBoundingClientRect().width).toBeCloseTo(368);
+				await new Promise(requestAnimationFrame);
+				await new Promise(requestAnimationFrame);
+				await expect.element(screen.getByLabelText("Slug")).toBeDisabled();
+				expect(document.activeElement).not.toBe(screen.getByLabelText("Slug").element());
+				expect(onFieldFocused).not.toHaveBeenCalled();
+				await screen.rerender(
+					<ContentEditor
+						collection="posts"
+						collectionLabel="Post"
+						fields={defaultFields}
+						isNew={false}
+						item={makeItem()}
+						focusField="slug"
+						onFieldFocused={onFieldFocused}
+					/>,
+				);
+				await new Promise(requestAnimationFrame);
+				await new Promise(requestAnimationFrame);
+				expect(document.activeElement).not.toBe(screen.getByLabelText("Slug").element());
+				expect(onFieldFocused).not.toHaveBeenCalled();
+			});
+
+			it("hides and shows the panel without unmounting it", async () => {
+				const screen = await renderEditor({ isNew: false, item: makeItem() });
+				const slug = screen.getByLabelText("Slug");
+				await slug.fill("kept-slug");
+				const slugInput = slug.element();
+				const panel = getPanel(screen).element();
+
+				await screen.getByRole("button", { name: "Hide settings" }).click();
+				expect(panel).toHaveAttribute("inert");
+				await vi.waitFor(() => expect(panel.getBoundingClientRect().width).toBe(0));
+
+				await screen.getByRole("button", { name: "Show settings" }).click();
+				expect(panel).not.toHaveAttribute("inert");
+				await vi.waitFor(() => expect(panel.getBoundingClientRect().width).toBeCloseTo(368));
+				expect(screen.getByLabelText("Slug").element()).toBe(slugInput);
+				await expect.element(screen.getByLabelText("Slug")).toHaveValue("kept-slug");
+			});
+
+			it("moves focus to the toggle when hiding from inside the panel", async () => {
+				const screen = await renderEditor({ isNew: false, item: makeItem() });
+				screen.getByLabelText("Slug").element().focus();
+				const toggle = screen.getByRole("button", { name: "Hide settings" }).element();
+
+				// A scripted click doesn't move focus, like a click in Safari.
+				(toggle as HTMLButtonElement).click();
+				await vi.waitFor(() => expect(getPanel(screen).element()).toHaveAttribute("inert"));
+				expect(document.activeElement).toBe(toggle);
+			});
+
+			it("keeps the closed phone sheet inert after hiding the panel on desktop", async () => {
+				localStorage.setItem(STORAGE_KEY, "hidden");
+				const media = installMatchMedia(false);
+				try {
+					const screen = await renderEditor({ isNew: false, item: makeItem() });
+					expect(getPanel(screen).element()).toHaveAttribute("inert");
+
+					await media.setMatchesSequentially(true);
+					const sheet = screen.getByRole("navigation", { name: "Settings", includeHidden: true });
+					await vi.waitFor(() => expect(sheet.element()).toHaveAttribute("inert"));
+
+					await screen.getByRole("button", { name: "Show settings", exact: true }).click();
+					await vi.waitFor(() => expect(sheet.element()).not.toHaveAttribute("inert"));
+					await screen.getByRole("button", { name: "Close settings" }).click();
+					await vi.waitFor(() => expect(sheet.element()).toHaveAttribute("inert"));
+				} finally {
+					media.restore();
+				}
+			});
+
+			it("remembers the choice in this browser", async () => {
+				const first = await renderEditor({ isNew: false, item: makeItem() });
+				await first.getByRole("button", { name: "Hide settings" }).click();
+				expect(localStorage.getItem(STORAGE_KEY)).toBe("hidden");
+				await first.unmount();
+
+				const second = await renderEditor({ isNew: false, item: makeItem() });
+				const panel = getPanel(second).element();
+				expect(panel).toHaveAttribute("inert");
+				expect(panel.getBoundingClientRect().width).toBe(0);
+				await expect
+					.element(second.getByRole("button", { name: "Show settings" }))
+					.toBeInTheDocument();
+			});
+
+			it("opens for an unrecognized stored value", async () => {
+				localStorage.setItem(STORAGE_KEY, "banana");
+				const screen = await renderEditor({ isNew: false, item: makeItem() });
+				expect(getPanel(screen).element()).not.toHaveAttribute("inert");
+				await expect
+					.element(screen.getByRole("button", { name: "Hide settings" }))
+					.toBeInTheDocument();
+			});
+
+			it("closes an image panel when the panel is hidden", async () => {
+				const screen = await renderEditor({ isNew: false, item: makeItem(), fields: ptFields });
+				await expect.element(screen.getByTestId("portable-text-editor")).toBeInTheDocument();
+				const blockPanel = makeBlockPanel();
+				getPanelHooks().open(blockPanel);
+				await expect.element(screen.getByRole("textbox", { name: "Alt text" })).toBeVisible();
+
+				await screen.getByRole("button", { name: "Hide settings" }).click();
+				expect(getPanel(screen).element()).toHaveAttribute("inert");
+				expect(blockPanel.onClose).toHaveBeenCalled();
+
+				await screen.getByRole("button", { name: "Show settings" }).click();
+				await expect.element(screen.getByLabelText("Slug")).toBeVisible();
+				expect(
+					screen.getByRole("textbox", { name: "Alt text", includeHidden: true }).query(),
+				).toBeNull();
+			});
+
+			it("shows a hidden panel for a block panel, then hides it again", async () => {
+				localStorage.setItem(STORAGE_KEY, "hidden");
+				const screen = await renderEditor({ isNew: false, item: makeItem(), fields: ptFields });
+				await expect.element(screen.getByTestId("portable-text-editor")).toBeInTheDocument();
+				const panel = getPanel(screen).element();
+				expect(panel).toHaveAttribute("inert");
+
+				const { open, close } = getPanelHooks();
+				open(makeBlockPanel());
+				await expect.element(screen.getByText("Image settings")).toBeVisible();
+				expect(panel).not.toHaveAttribute("inert");
+				expect(localStorage.getItem(STORAGE_KEY)).toBe("hidden");
+
+				close();
+				await vi.waitFor(() => expect(panel).toHaveAttribute("inert"));
+				expect(localStorage.getItem(STORAGE_KEY)).toBe("hidden");
+			});
+
+			it.each([
+				["after the panel slides open", false],
+				["under reduced motion", true],
+			])("opens a hidden panel to report its invalid control on Save %s", async (_, reduced) => {
+				if (reduced) {
+					await cdp().send("Emulation.setEmulatedMedia", {
+						features: [{ name: "prefers-reduced-motion", value: "reduce" }],
+					});
+					onTestFinished(() => cdp().send("Emulation.setEmulatedMedia", { features: [] }));
+				}
+				localStorage.setItem(STORAGE_KEY, "hidden");
+				const onSave = vi.fn();
+				const pluginAdmins: PluginAdmins = {
+					ratings: {
+						contentEditorPanels: [
+							{
+								id: "rating",
+								title: "Rating",
+								component: () => (
+									<input type="number" min={1} max={10} defaultValue={50} aria-label="Rating" />
+								),
+							},
+						],
+					},
+				};
+				const screen = await render(
+					<PluginAdminProvider pluginAdmins={pluginAdmins}>
+						<ContentEditor
+							collection="posts"
+							collectionLabel="Post"
+							fields={defaultFields}
+							isNew={false}
+							item={makeItem()}
+							currentUser={{ id: "u-1", role: 50 }}
+							onSave={onSave}
+						/>
+					</PluginAdminProvider>,
+					{ wrapper: Toasty },
+				);
+				const rating = screen.getByRole("spinbutton", { name: "Rating", includeHidden: true });
+				await expect.element(rating).toBeInTheDocument();
+				const panel = getPanel(screen).element();
+				expect(panel).toHaveAttribute("inert");
+
+				await screen.getByLabelText("Title").fill("Changed");
+				await screen.getByRole("button", { name: "Save" }).first().click();
+
+				await vi.waitFor(() => expect(document.activeElement).toBe(rating.element()));
+				expect(onSave).not.toHaveBeenCalled();
+				expect(panel).not.toHaveAttribute("inert");
+				await expect
+					.element(screen.getByRole("button", { name: "Hide settings" }))
+					.toBeInTheDocument();
+				expect(localStorage.getItem(STORAGE_KEY)).toBe("hidden");
+
+				await new Promise((resolve) => setTimeout(resolve, 400));
+				expect(document.activeElement).toBe(rating.element());
+				expect(panel).not.toHaveAttribute("inert");
+			});
+
+			it("leaves a hidden panel closed when the invalid control is in the canvas", async () => {
+				localStorage.setItem(STORAGE_KEY, "hidden");
+				const onSave = vi.fn();
+				const screen = await renderEditor({
+					isNew: false,
+					item: makeItem({ data: { title: "My Post", rating: 50 } }),
+					fields: {
+						title: { kind: "string", label: "Title" },
+						rating: { kind: "number", label: "Rating", validation: { min: 1, max: 10 } },
+					},
+					onSave,
+				});
+				await screen.getByLabelText("Title").fill("Changed");
+				await screen.getByRole("button", { name: "Save" }).first().click();
+
+				const rating = screen.getByLabelText("Rating", { exact: true }).element();
+				await vi.waitFor(() => expect(document.activeElement).toBe(rating));
+				expect(onSave).not.toHaveBeenCalled();
+				expect(getPanel(screen).element()).toHaveAttribute("inert");
+			});
+
+			it("shows a hidden panel on a read-only entry", async () => {
+				localStorage.setItem(STORAGE_KEY, "hidden");
+				const screen = await renderEditor({ isNew: false, item: makeItem(), readOnly: true });
+				const panel = getPanel(screen).element();
+				expect(panel).toHaveAttribute("inert");
+
+				await screen.getByRole("button", { name: "Show settings" }).click();
+				expect(panel).not.toHaveAttribute("inert");
+			});
+
+			it("ignores the stored choice below lg", async () => {
+				localStorage.setItem(STORAGE_KEY, "hidden");
+				const media = installMatchMedia(true);
+				try {
+					const screen = await renderEditor({ isNew: false, item: makeItem() });
+					await screen.getByRole("button", { name: "Show settings" }).click();
+					await expect
+						.element(screen.getByRole("navigation", { name: "Settings" }))
+						.toBeInTheDocument();
+					expect(screen.getByRole("button", { name: /^(Hide|Show) settings$/ }).all()).toHaveLength(
+						1,
+					);
+				} finally {
+					media.restore();
+				}
+			});
+		});
+
+		it("uses the elevated surface for the full-bleed canvas and settings panel", async () => {
+			await renderEditor({ isNew: false, item: makeItem() });
+			const form = document.querySelector("form");
+			const provider = document.querySelector<HTMLElement>('[style*="--sidebar-width"]');
+
+			expect(form).toHaveClass("bg-kumo-elevated");
+			expect(form).not.toHaveClass("bg-kumo-base");
+			expect(provider?.style.getPropertyValue("--sidebar-bg")).toBe("var(--color-kumo-elevated)");
+		});
+
+		it("offers Save draft before the first save and Publish now after it", async () => {
+			const onPublish = vi.fn();
+			const screen = await renderEditor({ isNew: true, supportsDrafts: true, onPublish });
+
+			await expect.element(screen.getByRole("button", { name: "Save draft" })).toBeInTheDocument();
+			await expect
+				.element(
+					screen.getByText("Saving creates a draft that stays off the site.", { exact: false }),
+				)
+				.toBeVisible();
+			expect(screen.getByRole("button", { name: "Publish now", exact: true }).query()).toBeNull();
+
+			await screen.rerender(
+				<ContentEditor
+					collection="posts"
+					collectionLabel="Post"
+					fields={defaultFields}
+					isNew={false}
+					supportsDrafts
+					item={makeItem({ status: "draft" })}
+					onSave={vi.fn()}
+					onPublish={onPublish}
+				/>,
+			);
+
+			await expect
+				.element(screen.getByRole("button", { name: "Publish now", exact: true }))
+				.toBeInTheDocument();
+			expect(screen.getByRole("button", { name: "Save draft" }).query()).toBeNull();
+			await expect
+				.element(screen.getByText("This version is not visible on the site"))
+				.toBeVisible();
+		});
+
+		it("shows Publish now for draft items", async () => {
+			const item = makeItem({ status: "draft" });
+			const onPublish = vi.fn();
+			const screen = await renderEditor({ isNew: false, item, onPublish });
+			const publishBtn = screen.getByRole("button", { name: "Publish now", exact: true });
+			await expect.element(publishBtn).toBeInTheDocument();
+		});
+
+		it("publish button confirms before calling onPublish", async () => {
+			const item = makeItem({ status: "draft" });
+			const onPublish = vi.fn();
+			const screen = await renderEditor({ isNew: false, item, onPublish });
+			const publishBtn = screen.getByRole("button", { name: "Publish now", exact: true });
+			await publishBtn.click();
+			expect(onPublish).not.toHaveBeenCalled();
+			screen
+				.getByRole("dialog", { name: "Publish now?" })
+				.getByRole("button", { name: "Publish now", exact: true })
+				.element()
+				.click();
+			expect(onPublish).toHaveBeenCalledOnce();
+		});
+
+		it.each([
+			{
+				name: "Publish now",
+				item: makeItem({ status: "draft" }),
+				props: {},
+				settlement: "resolve" as const,
+			},
+			{
+				name: "Publish now",
+				item: makeItem({ status: "draft" }),
+				props: {},
+				settlement: "reject" as const,
+			},
+			{
+				name: "Publish changes",
+				item: makeItem({
+					status: "published",
+					liveRevisionId: "rev-live",
+					draftRevisionId: "rev-draft",
+				}),
+				props: { supportsDrafts: true },
+				settlement: "resolve" as const,
+			},
+			{
+				name: "Publish changes",
+				item: makeItem({
+					status: "published",
+					liveRevisionId: "rev-live",
+					draftRevisionId: "rev-draft",
+				}),
+				props: { supportsDrafts: true },
+				settlement: "reject" as const,
+			},
+		])(
+			"disables $name while the publish request is in flight and re-enables after it $settlement",
+			async ({ name, item, props, settlement }) => {
+				const pending = deferred();
+				const onPublish = vi.fn(() => pending.promise);
+				const screen = await renderEditor({ isNew: false, item, onPublish, ...props });
+				const publish = screen.getByRole("button", { name, exact: true });
+
+				await publish.click();
+				const dialogName = name === "Publish changes" ? "Publish changes?" : "Publish now?";
+				screen
+					.getByRole("dialog", { name: dialogName })
+					.getByRole("button", { name, exact: true })
+					.element()
+					.click();
+				await vi.waitFor(() => expect(onPublish).toHaveBeenCalledOnce());
+				await expect.element(publish).toBeDisabled();
+
+				if (settlement === "resolve") pending.resolve();
+				else pending.reject(new Error("publish failed"));
+				await expect.element(publish).not.toBeDisabled();
+			},
+		);
+
+		it("shows Preview in normal mode when previews are supported", async () => {
+			const item = makeItem({ status: "draft" });
+			const screen = await renderEditor({ isNew: false, item, supportsPreview: true });
+			const previewBtn = screen.getByRole("button", { name: "Preview" });
+			await expect.element(previewBtn).toBeInTheDocument();
+		});
+
+		it("Preview opens the entry's own tab, so a second click reuses it", async () => {
+			const open = vi.spyOn(window, "open").mockReturnValue(null);
+			try {
+				const item = makeItem({ status: "draft" });
+				const screen = await renderEditor({ isNew: false, item, supportsPreview: true });
+				const previewBtn = screen.getByRole("button", { name: "Preview" });
+				await previewBtn.click();
+				await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
+				await previewBtn.click();
+				await vi.waitFor(() => expect(open).toHaveBeenCalledTimes(2));
+				const [first, second] = open.mock.calls;
+				expect(first![0]).toBe("https://example.com/preview");
+				expect(first![1]).not.toBe("_blank");
+				expect(second![1]).toBe(first![1]);
+			} finally {
+				open.mockRestore();
+			}
+		});
+
+		it("keeps one publish action reachable below lg", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const item = makeItem({ status: "draft" });
+				const screen = await renderEditor({ isNew: false, item, onPublish: vi.fn() });
+
+				await expect.element(screen.getByRole("button", { name: "Settings" })).toBeInTheDocument();
+				await expect
+					.element(screen.getByRole("button", { name: "Save", exact: true }).query())
+					.toBeNull();
+				const publishButtons = screen
+					.getByRole("button", { name: "Publish now", exact: true })
+					.all();
+				expect(publishButtons).toHaveLength(1);
+				await expect.element(publishButtons[0]!).toBeVisible();
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("keeps the editor bar in the document flow below lg", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderEditor({ isNew: false, item: makeItem() });
+				const canvas = screen
+					.getByLabelText("Title")
+					.element()
+					.closest("[data-emdash-editor-canvas]");
+
+				expect(canvas?.contains(getEditorBar())).toBe(true);
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("pins the editor bar above the scrolling page on wide screens", async () => {
+			const screen = await renderEditor({ isNew: false, item: makeItem() });
+			const canvas = screen
+				.getByLabelText("Title")
+				.element()
+				.closest("[data-emdash-editor-canvas]");
+
+			expect(canvas).toBeTruthy();
+			expect(canvas?.contains(getEditorBar())).toBe(false);
+		});
+
+		it("labels and closes the settings sheet below lg", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderEditor({ isNew: false, item: makeItem() });
+
+				await screen.getByRole("button", { name: "Settings" }).click();
+				await expect
+					.element(screen.getByRole("navigation", { name: "Settings" }))
+					.toBeInTheDocument();
+
+				await screen.getByRole("button", { name: "Close settings" }).click();
+				await expect
+					.element(screen.getByRole("navigation", { name: "Settings" }))
+					.not.toBeInTheDocument();
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("keeps the settings sheet open when a sortable handle restores focus after drop", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderBylineContent([savedCredit(makeByline())]);
+
+				await screen.getByRole("button", { name: "Settings" }).click();
+				const handle = screen.getByRole("button", { name: "Reorder Jane Smith" }).element();
+				handle.focus();
+				handle.dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: null }));
+
+				await vi.waitFor(() => {
+					const sheet = document.querySelector('nav[data-sidebar="sidebar"][data-mobile="true"]');
+					expect(sheet?.getAttribute("data-state")).toBe("expanded");
+				});
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("keeps the settings sheet open when the byline chooser replaces its trigger", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const byline = makeByline({ id: "credited", displayName: "Mina Patel" });
+				const screen = await renderBylineContent([savedCredit(byline)]);
+
+				await screen.getByRole("button", { name: "Settings" }).click();
+				await screen.getByRole("button", { name: "Add another byline" }).click();
+
+				await expect.element(screen.getByLabelText("Search bylines")).toBeInTheDocument();
+				await vi.waitFor(() => {
+					const sheet = document.querySelector('nav[data-sidebar="sidebar"][data-mobile="true"]');
+					expect(sheet?.getAttribute("data-state")).toBe("expanded");
+				});
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("keeps the settings sheet open when keyboard sorting is cancelled", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderBylineContent([savedCredit(makeByline())]);
+
+				await screen.getByRole("button", { name: "Settings" }).click();
+				const handle = screen.getByRole("button", { name: "Reorder Jane Smith" }).element();
+				handle.focus();
+				await userEvent.keyboard(" ");
+
+				await vi.waitFor(() => expect(handle.dataset.sorting).toBe("true"));
+				await userEvent.keyboard("{Escape}");
+
+				await vi.waitFor(() => {
+					const sheet = document.querySelector('nav[data-sidebar="sidebar"][data-mobile="true"]');
+					expect(sheet?.getAttribute("data-state")).toBe("expanded");
+					expect(handle.dataset.sorting).toBe("false");
+				});
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("lets Escape close the settings sheet when sorting is idle", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderBylineContent([savedCredit(makeByline())]);
+
+				await screen.getByRole("button", { name: "Settings" }).click();
+				const handle = screen.getByRole("button", { name: "Reorder Jane Smith" }).element();
+				handle.focus();
+				await userEvent.keyboard("{Escape}");
+
+				await vi.waitFor(() => {
+					const sheet = document.querySelector('nav[data-sidebar="sidebar"][data-mobile="true"]');
+					expect(sheet?.getAttribute("data-state")).toBe("collapsed");
+				});
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("keeps nested dialogs above the settings sheet and dismisses only the dialog", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderEditor({
+					isNew: false,
+					item: makeItem(),
+					onDelete: vi.fn(),
+				});
+
+				await screen.getByRole("button", { name: "Settings" }).click();
+				await screen.getByRole("button", { name: "Move to Trash" }).click();
+				const dialog = screen.getByRole("dialog", { name: "Move to Trash?" });
+				await expect.element(dialog).toBeVisible();
+				expect(dialog.element().closest<HTMLElement>("[data-base-ui-portal]")?.style.zIndex).toBe(
+					"60",
+				);
+
+				await vi.waitFor(() => {
+					const sheet = document.querySelector('nav[data-sidebar="sidebar"][data-mobile="true"]');
+					expect(sheet?.getAttribute("data-state")).toBe("expanded");
+				});
+
+				await userEvent.keyboard("{Escape}");
+				await expect.element(dialog).not.toBeInTheDocument();
+				await vi.waitFor(() => {
+					const sheet = document.querySelector('nav[data-sidebar="sidebar"][data-mobile="true"]');
+					expect(sheet?.getAttribute("data-state")).toBe("expanded");
+				});
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("keeps nested tooltips above the settings sheet below lg", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const screen = await renderEditor({
+					isNew: false,
+					item: makeItem(),
+					hasSeo: true,
+					onSeoChange: vi.fn(),
+				});
+
+				await screen.getByRole("button", { name: "Settings" }).click();
+				await userEvent.hover(
+					screen
+						.getByRole("button", { name: "Why is this important for search result titles?" })
+						.element(),
+				);
+
+				const tooltip = screen.getByRole("tooltip", {
+					name: "Overrides the page title in search engine results",
+				});
+				await expect.element(tooltip).toBeVisible();
+				expect(tooltip.element().closest<HTMLElement>("[data-base-ui-portal]")?.style.zIndex).toBe(
+					"60",
+				);
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("keeps live view and unpublish reachable below lg", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const item = makeItem({
+					status: "published",
+					liveRevisionId: "rev-1",
+					draftRevisionId: "rev-1",
+				});
+				const screen = await renderEditor({
+					isNew: false,
+					item,
+					onUnpublish: vi.fn(),
+					supportsDrafts: true,
+				});
+
+				await expect.element(screen.getByRole("button", { name: "Settings" })).toBeInTheDocument();
+				await expect.element(screen.getByRole("link", { name: "Live View" })).toBeVisible();
+				const unpublishButtons = screen
+					.getByRole("button", { name: "Unpublish Post", exact: true })
+					.all();
+				expect(unpublishButtons).toHaveLength(1);
+				await expect.element(unpublishButtons[0]!).toBeVisible();
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("links live translated content to its locale-prefixed path", async () => {
+			const item = makeItem({
+				status: "published",
+				locale: "pl",
+				liveRevisionId: "rev-1",
+				draftRevisionId: "rev-1",
+			});
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				i18n: {
+					defaultLocale: "en",
+					locales: ["en", "pl"],
+					prefixDefaultLocale: false,
+				},
+				supportsDrafts: true,
+			});
+
+			await expect
+				.element(screen.getByRole("link", { name: "Live View" }))
+				.toHaveAttribute("href", "/pl/posts/my-post");
+		});
+
+		it("keeps actions reachable when crossing from mobile to desktop layout", async () => {
+			const media = installMatchMedia(true);
+			try {
+				const item = makeItem({ status: "draft" });
+				const screen = await renderEditor({
+					isNew: false,
+					item,
+					supportsPreview: true,
+					onPublish: vi.fn(),
+				});
+
+				await expect.element(screen.getByRole("button", { name: "Settings" })).toBeInTheDocument();
+				await expect
+					.element(screen.getByRole("button", { name: "Preview" }).first())
+					.toBeInTheDocument();
+				await expect
+					.element(screen.getByRole("button", { name: "Save", exact: true }).query())
+					.toBeNull();
+
+				media.setMatches(false);
+				await expect
+					.element(screen.getByRole("button", { name: "Show settings", exact: true }))
+					.not.toBeInTheDocument();
+				await expect
+					.element(screen.getByRole("button", { name: "Publish now", exact: true }))
+					.toBeVisible();
+			} finally {
+				media.restore();
+			}
+		});
+
+		it("shows Unpublish for published items with supportsDrafts", async () => {
+			const item = makeItem({
+				status: "published",
+				liveRevisionId: "rev-1",
+				draftRevisionId: "rev-1",
+			});
+			const onUnpublish = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				onUnpublish,
+				supportsDrafts: true,
+			});
+			const unpublishBtn = screen.getByRole("button", {
+				name: "Unpublish Post",
+				exact: true,
+			});
+			await expect.element(unpublishBtn).toBeInTheDocument();
+		});
+
+		it("unpublish button calls onUnpublish", async () => {
+			const item = makeItem({
+				status: "published",
+				liveRevisionId: "rev-1",
+				draftRevisionId: "rev-1",
+			});
+			const onUnpublish = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				onUnpublish,
+				supportsDrafts: true,
+			});
+			const unpublishBtn = screen.getByRole("button", {
+				name: "Unpublish Post",
+				exact: true,
+			});
+			await unpublishBtn.click();
+			expect(onUnpublish).toHaveBeenCalled();
+		});
+
+		it.each(["resolve", "reject"] as const)(
+			"disables Unpublish while the request is pending and re-enables after it %s",
+			async (settlement) => {
+				const pending = deferred();
+				const onUnpublish = vi.fn(() => pending.promise);
+				const screen = await renderEditor({
+					isNew: false,
+					item: makeItem({
+						status: "published",
+						liveRevisionId: "rev-1",
+						draftRevisionId: "rev-1",
+					}),
+					onUnpublish,
+					supportsDrafts: true,
+				});
+				const unpublish = screen
+					.getByRole("button", { name: "Unpublish Post", exact: true })
+					.element();
+
+				unpublish.click();
+				await vi.waitFor(() => expect(onUnpublish).toHaveBeenCalledOnce());
+				await expect.element(unpublish).toBeDisabled();
+				if (settlement === "resolve") pending.resolve();
+				else pending.reject(new Error("unpublish failed"));
+				await expect.element(unpublish).not.toBeDisabled();
+			},
+		);
+	});
+
+	describe("scheduler", () => {
+		it("hides scheduling actions when the collection does not support scheduling", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "draft" }),
+				onSchedule: vi.fn(),
+				supportsScheduling: false,
+			});
+
+			expect(screen.getByRole("button", { name: "Schedule" }).query()).toBeNull();
+		});
+
+		it("allows removing an existing schedule without scheduling support", async () => {
+			const onUnschedule = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "scheduled", scheduledAt: "2027-06-01T12:00:00.000Z" }),
+				onSchedule: vi.fn(),
+				onUnschedule,
+				supportsScheduling: false,
+			});
+
+			expect(screen.getByRole("button", { name: "Change schedule" }).query()).toBeNull();
+			await expect.element(screen.getByRole("button", { name: "Remove schedule" })).toBeVisible();
+			await screen.getByRole("button", { name: "Remove schedule" }).click();
+			expect(onUnschedule).toHaveBeenCalledOnce();
+		});
+
+		it("keeps draft scheduling separate from confirmed publishing", async () => {
+			const onPublish = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "draft" }),
+				onPublish,
+				onSchedule: vi.fn(),
+			});
+			const publish = screen.getByRole("button", { name: "Publish now", exact: true });
+			const schedule = screen.getByRole("button", { name: "Schedule" });
+
+			await expect.element(publish).not.toHaveAttribute("aria-haspopup", "menu");
+			await schedule.click();
+			expect(onPublish).not.toHaveBeenCalled();
+			const dialog = screen.getByRole("dialog", { name: "Schedule publication" });
+			await expect.element(dialog.getByLabelText("Schedule date")).toBeInTheDocument();
+			await expect.element(dialog.getByRole("textbox", { name: "Hour" })).toBeInTheDocument();
+			await expect.element(dialog.getByRole("textbox", { name: "Minute" })).toBeInTheDocument();
+			await expect.element(dialog.getByRole("combobox", { name: "Period" })).toBeInTheDocument();
+			expect(dialog.element().querySelector('input[type="time"]')).toBeNull();
+			expect(dialog.getByRole("button", { name: /Tomorrow at/ }).query()).toBeNull();
+			expect(dialog.getByRole("button", { name: /Next .* at/ }).query()).toBeNull();
+		});
+
+		it("labels schedule and publish actions for live draft changes", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({
+					status: "published",
+					liveRevisionId: "rev-live",
+					draftRevisionId: "rev-draft",
+				}),
+				supportsDrafts: true,
+				onPublish: vi.fn(),
+				onSchedule: vi.fn(),
+			});
+
+			await expect
+				.element(screen.getByRole("button", { name: "Publish changes", exact: true }))
+				.toBeInTheDocument();
+			await screen.getByRole("button", { name: "Schedule" }).click();
+			const dialog = screen.getByRole("dialog", { name: "Schedule changes" });
+			await expect
+				.element(dialog.getByRole("button", { name: "Schedule changes", exact: true }))
+				.toBeVisible();
+		});
+
+		it("keeps scheduled management in one two-button row", async () => {
+			const onUnschedule = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "scheduled", scheduledAt: "2027-06-01T12:00:00.000Z" }),
+				onPublish: vi.fn(),
+				onSchedule: vi.fn(),
+				onUnschedule,
+			});
+			const changeSchedule = screen.getByRole("button", { name: "Change schedule" });
+			const removeSchedule = screen.getByRole("button", { name: "Remove schedule" });
+
+			expect(changeSchedule.element().parentElement).toBe(removeSchedule.element().parentElement);
+			await changeSchedule.click();
+			const dialog = screen.getByRole("dialog", { name: "Change schedule" });
+			await expect.element(dialog).toBeVisible();
+			dialog.getByRole("button", { name: "Cancel" }).element().click();
+			await vi.waitFor(() => expect(dialog.query()).toBeNull());
+			await removeSchedule.click();
+			expect(onUnschedule).toHaveBeenCalledOnce();
+		});
+
+		it("confirms immediate publication of a scheduled item", async () => {
+			const onPublish = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "scheduled", scheduledAt: "2026-06-01T12:00:00Z" }),
+				onPublish,
+				onSchedule: vi.fn(),
+			});
+
+			await screen.getByRole("button", { name: "Publish now", exact: true }).click();
+			expect(onPublish).not.toHaveBeenCalled();
+			const dialog = screen.getByRole("dialog", { name: "Publish now?" });
+			await expect
+				.element(dialog.getByText("This removes the schedule and publishes immediately."))
+				.toBeVisible();
+			dialog.getByRole("button", { name: "Publish now", exact: true }).element().click();
+			expect(onPublish).toHaveBeenCalledOnce();
+		});
+
+		it("blocks immediate publishing while a schedule change is pending", async () => {
+			const onPublish = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "scheduled", scheduledAt: "2027-06-01T12:00:00Z" }),
+				isUnscheduling: true,
+				onPublish,
+				onSchedule: vi.fn(),
+				onUnschedule: vi.fn(),
+			});
+
+			const publish = screen.getByRole("button", { name: "Publish now", exact: true });
+			await expect.element(publish).toBeDisabled();
+			await publish.click({ force: true });
+			expect(screen.getByRole("dialog", { name: "Publish now?" }).query()).toBeNull();
+			expect(onPublish).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("heading", () => {
+		it("preserves configured collection label casing", async () => {
+			const item = makeItem({ data: { title: "", body: "" } });
+			const screen = await renderEditor({ isNew: false, item, collectionLabel: "API Docs" });
+
+			await expect
+				.element(screen.getByRole("heading", { name: "Edit API Docs", exact: true }))
+				.toBeInTheDocument();
+		});
+
+		it("names the back link after the list it opens", async () => {
+			const screen = await renderEditor({
+				isNew: true,
+				collectionLabel: "Post",
+				manifest: {
+					version: "1.0.0",
+					hash: "hash",
+					authMode: "passkey",
+					collections: {
+						posts: { label: "Posts", labelSingular: "Post", supports: [], hasSeo: false },
+					},
+					plugins: {},
+					taxonomies: [],
+				},
+			});
+
+			await expect
+				.element(screen.getByLabelText("Back to Posts list", { exact: true }))
+				.toBeInTheDocument();
+		});
+
+		it("shows a quiet heading for new items", async () => {
+			const screen = await renderEditor({ isNew: true, collectionLabel: "Post" });
+			const heading = screen.getByRole("heading", { name: "New Post" });
+
+			await expect.element(heading).toBeInTheDocument();
+			await expect.element(heading).toHaveClass("text-base", "truncate");
+		});
+
+		it("names existing items by their title", async () => {
+			const item = makeItem();
+			const screen = await renderEditor({ isNew: false, item, collectionLabel: "Post" });
+
+			await expect.element(screen.getByRole("heading", { name: "My Post" })).toBeInTheDocument();
+		});
+
+		it("follows the title as it is edited", async () => {
+			const screen = await renderEditor({ isNew: true, collectionLabel: "Post" });
+
+			await screen.getByLabelText("Title").fill("A fresh start");
+
+			await expect
+				.element(screen.getByRole("heading", { name: "A fresh start" }))
+				.toBeInTheDocument();
+		});
+	});
+
+	describe("page title", () => {
+		const pageFields: Record<string, FieldDescriptor> = {
+			title: { kind: "string", label: "Title", required: true },
+			content: { kind: "portableText", label: "Content" },
+		};
+
+		beforeEach(() => {
+			vi.mocked(focusDocumentStart).mockClear();
+		});
+
+		it("moves on to the body on Enter", async () => {
+			const screen = await renderEditor({ fields: pageFields });
+			await screen.getByLabelText("Title").fill("A fresh start");
+
+			await userEvent.keyboard("{Enter}");
+
+			expect(focusDocumentStart).toHaveBeenCalledOnce();
+		});
+
+		it("moves on to the body on ArrowDown only from the end of the title", async () => {
+			const screen = await renderEditor({ fields: pageFields });
+			const title = screen.getByLabelText("Title");
+			await title.fill("Hello");
+			const input = title.element() as HTMLInputElement;
+
+			input.setSelectionRange(2, 2);
+			await userEvent.keyboard("{ArrowDown}");
+			expect(focusDocumentStart).not.toHaveBeenCalled();
+
+			input.setSelectionRange(5, 5);
+			await userEvent.keyboard("{ArrowDown}");
+			expect(focusDocumentStart).toHaveBeenCalledOnce();
+		});
+
+		it("stays in the title while an input method is composing", async () => {
+			const screen = await renderEditor({ fields: pageFields });
+			const title = screen.getByLabelText("Title").element();
+
+			for (const init of [{ isComposing: true }, { keyCode: 229 }]) {
+				title.dispatchEvent(
+					new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, ...init }),
+				);
+			}
+
+			expect(focusDocumentStart).not.toHaveBeenCalled();
+		});
+
+		it("saves on Enter when there is no body to move to", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({ onSave });
+			await screen.getByLabelText("Title").fill("A fresh start");
+
+			await userEvent.keyboard("{Enter}");
+
+			await vi.waitFor(() => expect(onSave).toHaveBeenCalledOnce());
+			expect(focusDocumentStart).not.toHaveBeenCalled();
+		});
+	});
+
+	// ---------------------------------------------------------------------------
+	// Bug: translation switch leaves stale content in PortableTextEditor.
+	//
+	// When navigating between translations of the same content (e.g. /en post ->
+	// /fr post), TanStack Router keeps ContentEditor mounted and only the `item`
+	// prop changes. The PortableTextEditor (TipTap) freezes its content via
+	// useMemo([], ...) on mount and has no effect to reconcile incoming `value`
+	// changes, so it keeps showing the previous locale's body.
+	//
+	// Worse: any subsequent edit fires onUpdate with the stale content, silently
+	// overwriting the new translation's body in formData.
+	//
+	// Fix: key <FieldRenderer> by `${name}:${item?.id ?? "new"}` so all field
+	// editors remount cleanly when the underlying content item changes.
+	// ---------------------------------------------------------------------------
+	describe("translation / item switch", () => {
+		function buildPtItem(id: string, text: string): ContentItem {
+			return makeItem({
+				id,
+				slug: id,
+				data: {
+					title: text,
+					body: [
+						{
+							_type: "block",
+							_key: `block-${id}`,
+							style: "normal",
+							children: [{ _type: "span", _key: `span-${id}`, text, marks: [] }],
+							markDefs: [],
+						},
+					],
+				},
+			});
+		}
+
+		const ptFields: Record<string, FieldDescriptor> = {
+			title: { kind: "string", label: "Title", required: true },
+			body: { kind: "portableText", label: "Body" },
+		};
+
+		it("remounts the portable text editor when item.id changes (translation switch)", async () => {
+			const itemEn = buildPtItem("post-en", "English body");
+			const itemFr = buildPtItem("post-fr", "French body");
+
+			// Use a wrapper so we can swap items without unmounting ContentEditor.
+			function Switcher({ item }: { item: ContentItem }) {
+				return (
+					<ContentEditor
+						collection="posts"
+						collectionLabel="Post"
+						fields={ptFields}
+						isNew={false}
+						item={item}
+						onSave={vi.fn()}
+					/>
+				);
+			}
+
+			const screen = await render(<Switcher item={itemEn} />);
+
+			// Initial mount: editor shows the English body.
+			const editor = screen.getByTestId("portable-text-editor");
+			await expect.element(editor).toHaveAttribute("data-content", "English body");
+			expect(portableTextMountCount).toBe(1);
+
+			// Simulate translation switch by rerendering with a different item id.
+			// The fix (keying FieldRenderer by item.id) must force a fresh mount
+			// so the editor reads the new locale's body.
+			await screen.rerender(<Switcher item={itemFr} />);
+
+			const editorAfter = screen.getByTestId("portable-text-editor");
+			await expect.element(editorAfter).toHaveAttribute("data-content", "French body");
+
+			// A new mount means the FieldRenderer was keyed by id and remounted.
+			// Without the fix, mountCount stays at 1 and content stays stale.
+			expect(portableTextMountCount).toBeGreaterThanOrEqual(2);
+		});
+
+		it("wires onEditorReady through for the 'content' field so DocumentOutline tracks remounts", async () => {
+			// ContentEditor only wires `onEditorReady` to its `setPortableTextEditor`
+			// slot when the field name is exactly "content" (see ContentEditor.tsx,
+			// where the conditional onEditorReady prop is set). On a translation
+			// switch, the FieldRenderer is keyed by item.id so the editor remounts;
+			// the corresponding cleanup call flows through, clearing the stale ref
+			// in the parent before the new instance mounts.
+			//
+			// The actual cleanup behaviour of PortableTextEditor (calling
+			// onEditorReady(null) on unmount) is exercised against the real
+			// component in tests/editor/PortableTextEditor.test.tsx — this test
+			// only verifies that ContentEditor wires the callback in the first place.
+			const ptFieldsForContent: Record<string, FieldDescriptor> = {
+				title: { kind: "string", label: "Title", required: true },
+				// "content" is the magic field name that wires onEditorReady through
+				// to ContentEditor's setPortableTextEditor (see ContentEditor.tsx).
+				content: { kind: "portableText", label: "Body" },
+			};
+
+			const itemEn = makeItem({
+				id: "post-en",
+				slug: "post-en",
+				data: {
+					title: "EN",
+					content: [
+						{
+							_type: "block",
+							_key: "block-en",
+							style: "normal",
+							children: [{ _type: "span", _key: "span-en", text: "English", marks: [] }],
+							markDefs: [],
+						},
+					],
+				},
+			});
+			const itemFr = makeItem({
+				id: "post-fr",
+				slug: "post-fr",
+				data: {
+					title: "FR",
+					content: [
+						{
+							_type: "block",
+							_key: "block-fr",
+							style: "normal",
+							children: [{ _type: "span", _key: "span-fr", text: "French", marks: [] }],
+							markDefs: [],
+						},
+					],
+				},
+			});
+
+			function Switcher({ item }: { item: ContentItem }) {
+				return (
+					<ContentEditor
+						collection="posts"
+						collectionLabel="Post"
+						fields={ptFieldsForContent}
+						isNew={false}
+						item={item}
+						onSave={vi.fn()}
+					/>
+				);
+			}
+
+			const screen = await render(<Switcher item={itemEn} />);
+			await expect
+				.element(screen.getByTestId("portable-text-editor"))
+				.toHaveAttribute("data-content", "English");
+
+			// Initial mount fired exactly one onEditorReady call with a non-null editor.
+			expect(onEditorReadyCalls).toHaveLength(1);
+			expect(onEditorReadyCalls[0]?.mockId).not.toBeNull();
+
+			await screen.rerender(<Switcher item={itemFr} />);
+			await expect
+				.element(screen.getByTestId("portable-text-editor"))
+				.toHaveAttribute("data-content", "French");
+
+			// After the switch we expect the call sequence:
+			//   1. mount (en) -> non-null
+			//   2. cleanup (en) -> null   <-- the M1 fix
+			//   3. mount (fr) -> non-null
+			// Without the cleanup in PortableTextEditor's onEditorReady effect,
+			// step 2 is missing and the stale en-editor reference lingers in
+			// ContentEditor's state during the remount window.
+			const nullCallIndex = onEditorReadyCalls.findIndex((c) => c.mockId === null);
+			expect(nullCallIndex).toBeGreaterThan(-1);
+
+			// The null call must come before the final mount (otherwise the slot
+			// would end up null after a fresh editor was reported ready).
+			const lastCall = onEditorReadyCalls.at(-1);
+			expect(lastCall?.mockId).not.toBeNull();
+			expect(nullCallIndex).toBeLessThan(onEditorReadyCalls.length - 1);
+		});
+	});
+
+	// ---------------------------------------------------------------------------
+	// Bug #1217: the byline picker was a plain Select over the first 100 bylines
+	// with no search, so bylines beyond the initial page were unreachable, and a
+	// credited byline outside that page failed to render at all. The picker now
+	// searches the server and resolves credited bylines from the saved entry.
+	// ---------------------------------------------------------------------------
+	describe("byline picker search (#1217)", () => {
+		it("keeps search behind one choose action for an automatic credit", async () => {
+			const inferred = makeByline({ id: "inferred", displayName: "Owner Profile" });
+			const screen = await renderBylineContent([savedCredit(inferred, "inferred")], {
+				availableBylines: [makeByline()],
+			});
+
+			await expect.element(screen.getByLabelText("Search bylines")).not.toBeInTheDocument();
+			await screen.getByRole("button", { name: "Choose bylines" }).click();
+			await expect.element(screen.getByLabelText("Search bylines")).toBeInTheDocument();
+		});
+
+		it("searches the server and adds a byline from outside the initial list", async () => {
+			vi.mocked(fetchBylines).mockResolvedValue({
+				items: [makeByline({ id: "b-far", slug: "zoe-far", displayName: "Zoe Far" })],
+				nextCursor: null,
+			});
+
+			const item = makeItem({ data: { title: "Hello", body: "" } });
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				currentUser: { id: "u-1", role: 50 },
+				// Empty initial list: the only way to reach "Zoe Far" is via search.
+				availableBylines: [],
+				availableBylinesLoaded: true,
+			});
+
+			await screen.getByRole("button", { name: "Choose bylines" }).click();
+			const searchInput = screen.getByLabelText("Search bylines");
+			await searchInput.fill("Zoe");
+
+			// The debounced server search surfaces the result.
+			await expect.element(screen.getByText("Zoe Far")).toBeInTheDocument();
+			await vi.waitFor(() => {
+				expect(vi.mocked(fetchBylines)).toHaveBeenCalledWith(
+					expect.objectContaining({ search: "Zoe" }),
+				);
+			});
+
+			// Clicking the result credits the byline and leaves the results list.
+			await screen.getByRole("button", { name: "Add Zoe Far" }).click();
+			await expect
+				.element(screen.getByRole("button", { name: "More actions for Zoe Far" }))
+				.toBeInTheDocument();
+		});
+
+		it("renders a credited byline that is not in the initial picker list", async () => {
+			const credited = makeByline({ id: "b-100plus", slug: "ada", displayName: "Ada Lovelace" });
+			const item = makeItem({
+				data: { title: "Hello", body: "" },
+				bylines: [{ byline: credited, sortOrder: 0, roleLabel: "Author" }],
+			});
+
+			const screen = await renderEditor({
+				isNew: false,
+				item,
+				currentUser: { id: "u-1", role: 50 },
+				// Initial list does NOT include the credited byline (it would be
+				// past the old 100-row cap). It must still render from the entry.
+				availableBylines: [],
+				availableBylinesLoaded: true,
+			});
+
+			await expect.element(screen.getByText("Ada Lovelace")).toBeInTheDocument();
+		});
+	});
+
+	describe("reference field paging", () => {
+		const RELATION = "rel-group-1";
+
+		const referenceFields: Record<string, FieldDescriptor> = {
+			title: { kind: "string", label: "Title" },
+			related: {
+				kind: "reference",
+				label: "Related",
+				validation: { relation: RELATION, targetCollection: "posts", multiple: true },
+			},
+		};
+
+		/**
+		 * An entry whose hydrated first page leaves a second page to auto-load.
+		 * Keyed by field slug, as the server hydrates it; the paging request
+		 * addresses the relation the field names.
+		 */
+		function itemWithPendingPage(): ContentItem {
+			return makeItem({
+				data: { title: "Hello" },
+				references: {
+					related: {
+						children: [
+							{ id: "c-1", slug: "one", title: "One", locale: "en", translationGroup: "g-1" },
+						],
+						nextCursor: "cursor-1",
+					},
+				},
+			});
+		}
+
+		async function renderWithFailedPage() {
+			vi.mocked(fetchReferenceChildren).mockRejectedValue(new Error("network"));
+			const screen = await renderEditor({
+				isNew: false,
+				item: itemWithPendingPage(),
+				fields: referenceFields,
+			});
+			await expect.element(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+			return screen;
+		}
+
+		it("offers a retry instead of spinning forever when a page fails", async () => {
+			const screen = await renderWithFailedPage();
+
+			await expect.element(screen.getByText("Couldn't load all references.")).toBeInTheDocument();
+			expect(screen.getByText("Loading references...").query()).toBeNull();
+		});
+
+		it("retries the same cursor and recovers the field", async () => {
+			const screen = await renderWithFailedPage();
+			const before = vi.mocked(fetchReferenceChildren).mock.calls.length;
+
+			vi.mocked(fetchReferenceChildren).mockResolvedValue({
+				children: [
+					{
+						id: "c-2",
+						slug: "second-entry",
+						title: "Two",
+						locale: "en",
+						translationGroup: "g-2",
+					} as never,
+				],
+			});
+
+			await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+			await expect.element(screen.getByText("Two")).toBeInTheDocument();
+			const calls = vi.mocked(fetchReferenceChildren).mock.calls;
+			expect(calls.length).toBeGreaterThan(before);
+			// The failed page must be re-requested, not skipped past, and addressed
+			// by the relation the field names.
+			expect(calls[before]?.[2]).toBe(RELATION);
+			expect(calls[before]?.[3]).toEqual({ cursor: "cursor-1" });
+			expect(screen.getByText("Couldn't load all references.").query()).toBeNull();
+		});
+
+		it("re-enables editing once the retried page lands", async () => {
+			const screen = await renderWithFailedPage();
+			await expect.element(screen.getByRole("button", { name: "Add reference" })).toBeDisabled();
+
+			vi.mocked(fetchReferenceChildren).mockResolvedValue({ children: [] });
+			await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+			await expect.element(screen.getByRole("button", { name: "Add reference" })).toBeEnabled();
+		});
+
+		it("autosaves a reference change made after a rejected autosave", async () => {
+			vi.useFakeTimers();
+
+			try {
+				const onAutosave = vi.fn();
+				const item = makeItem({
+					data: { title: "Hello" },
+					references: {
+						related: {
+							children: [
+								{ id: "c-1", slug: "one", title: "One", locale: "en", translationGroup: "g-1" },
+							],
+						},
+					},
+				});
+				const props: ContentEditorProps = {
+					collection: "posts",
+					collectionLabel: "Post",
+					fields: referenceFields,
+					isNew: false,
+					item,
+					onSave: vi.fn(),
+					onAutosave,
+					isAutosaving: false,
+					autosaveCompletionToken: 0,
+					autosaveRejectionToken: 0,
+				};
+
+				const screen = await render(<ContentEditor {...props} />);
+				await screen.getByLabelText("Title").fill("Rejected");
+				await vi.advanceTimersByTimeAsync(2000);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+
+				await screen.rerender(<ContentEditor {...props} isAutosaving={true} />);
+				await screen.rerender(
+					<ContentEditor {...props} isAutosaving={false} autosaveRejectionToken={1} />,
+				);
+				await vi.advanceTimersByTimeAsync(10_000);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+
+				// The selection is the only thing that changes now. The rejected
+				// payload is not what this save would send, so it has to go out —
+				// otherwise the edit is stuck in the editor until a field changes.
+				await screen.getByRole("button", { name: "Remove One" }).click();
+				await vi.advanceTimersByTimeAsync(2000);
+
+				expect(onAutosave).toHaveBeenCalledTimes(2);
+				expect(onAutosave).toHaveBeenLastCalledWith(
+					expect.objectContaining({ references: { related: [] } }),
+				);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
+	describe("reference field requiredness", () => {
+		function referenceField(required: boolean): Record<string, FieldDescriptor> {
+			return {
+				title: { kind: "string", label: "Title" },
+				related: {
+					kind: "reference",
+					label: "Related",
+					required,
+					validation: { relation: "rel-group-1", targetCollection: "posts", multiple: true },
+				},
+			};
+		}
+
+		it("says a required reference field needs an entry once a save is attempted", async () => {
+			const screen = await renderEditor({ fields: referenceField(true) });
+			expect(screen.getByText("Select at least one entry.").query()).toBeNull();
+
+			await userEvent.click(screen.getByRole("button", { name: "Save" }).first());
+
+			await expect.element(screen.getByText("Select at least one entry.")).toBeInTheDocument();
+		});
+
+		it("marks an optional reference field the way every other field is marked", async () => {
+			const screen = await renderEditor({ fields: referenceField(false) });
+
+			await expect.element(screen.getByText("(optional)")).toBeInTheDocument();
+			expect(screen.getByText("Select at least one entry.").query()).toBeNull();
+		});
+	});
+
+	describe("required file, image and reference fields", () => {
+		const REQUIRED_MESSAGES = ["This field is required", "Select at least one entry."];
+		const requiredFields: Record<string, FieldDescriptor> = {
+			title: { kind: "string", label: "Title", required: true },
+			attachment: { kind: "file", label: "Attachment", required: true },
+			photo: { kind: "image", label: "Photo", required: true },
+			related: {
+				kind: "reference",
+				label: "Related",
+				required: true,
+				validation: { relation: "rel-group-1", targetCollection: "posts", multiple: true },
+			},
+		};
+
+		function expectNoRequiredMessage(screen: Awaited<ReturnType<typeof renderEditor>>) {
+			for (const message of REQUIRED_MESSAGES) {
+				expect(screen.getByText(message).query()).toBeNull();
+			}
+		}
+
+		it("stays quiet when the form opens", async () => {
+			const screen = await renderEditor({ fields: requiredFields });
+			await expect.element(screen.getByRole("button", { name: "Select Attachment" })).toBeVisible();
+
+			expectNoRequiredMessage(screen);
+		});
+
+		it("reports each empty field after a save the browser stopped", async () => {
+			// The empty required title fails the browser's own check, so the form
+			// never submits; the editor still has to answer the click.
+			const onSave = vi.fn();
+			const screen = await renderEditor({ fields: requiredFields, onSave });
+
+			await userEvent.click(screen.getByRole("button", { name: "Save" }).first());
+
+			expect(onSave).not.toHaveBeenCalled();
+			await expect.element(screen.getByText("Select at least one entry.")).toBeVisible();
+			await expect.element(screen.getByText("This field is required").first()).toBeVisible();
+			expect(screen.getByText("This field is required").elements()).toHaveLength(2);
+		});
+
+		it("reports each empty field after a save that goes through", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({ fields: requiredFields, onSave });
+			await screen.getByLabelText("Title").fill("Hello");
+
+			await userEvent.click(screen.getByRole("button", { name: "Save" }).first());
+
+			expect(onSave).toHaveBeenCalledOnce();
+			await expect.element(screen.getByText("Select at least one entry.")).toBeVisible();
+			expect(screen.getByText("This field is required").elements()).toHaveLength(2);
+		});
+
+		it("reports each empty field after a publish", async () => {
+			const onPublish = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "draft", data: { title: "Hello" } }),
+				fields: requiredFields,
+				onPublish,
+			});
+			expectNoRequiredMessage(screen);
+
+			await screen.getByRole("button", { name: "Publish now", exact: true }).click();
+			screen
+				.getByRole("dialog", { name: "Publish now?" })
+				.getByRole("button", { name: "Publish now", exact: true })
+				.element()
+				.click();
+
+			expect(onPublish).toHaveBeenCalledOnce();
+			await expect.element(screen.getByText("Select at least one entry.")).toBeVisible();
+			expect(screen.getByText("This field is required").elements()).toHaveLength(2);
+		});
+
+		it("links the message to the control that is missing a value", async () => {
+			const screen = await renderEditor({ fields: requiredFields });
+			const fileButton = screen.getByRole("button", { name: "Select Attachment" });
+			await expect.element(fileButton).not.toHaveAttribute("aria-invalid");
+
+			await userEvent.click(screen.getByRole("button", { name: "Save" }).first());
+
+			const describedBy = fileButton.element().getAttribute("aria-describedby");
+			expect(fileButton.element().getAttribute("aria-invalid")).toBe("true");
+			const message = document.getElementById(describedBy ?? "");
+			expect(message?.textContent).toBe("This field is required");
+			expect(message?.getAttribute("role")).toBe("alert");
+			expect(
+				screen
+					.getByRole("button", { name: "Add reference" })
+					.element()
+					.getAttribute("aria-invalid"),
+			).toBe("true");
+		});
+
+		it("reports a file the editor removes at once", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({
+					data: {
+						title: "Hello",
+						attachment: {
+							id: "file-1",
+							filename: "report.pdf",
+							mimeType: "application/pdf",
+							size: 1024,
+						},
+					},
+				}),
+				fields: { title: requiredFields.title!, attachment: requiredFields.attachment! },
+			});
+			await expect.element(screen.getByText("report.pdf")).toBeVisible();
+			expectNoRequiredMessage(screen);
+
+			await screen.getByRole("button", { name: "Remove Attachment" }).click();
+
+			await expect.element(screen.getByText("This field is required")).toBeVisible();
+		});
+
+		it("starts quiet again on the next entry after a save attempt", async () => {
+			function Switcher({ item }: { item: ContentItem }) {
+				return (
+					<ContentEditor
+						collection="posts"
+						collectionLabel="Post"
+						fields={requiredFields}
+						isNew={false}
+						item={item}
+						onSave={vi.fn()}
+					/>
+				);
+			}
+			const screen = await render(
+				<Switcher item={makeItem({ id: "post-en", data: { title: "Hello" } })} />,
+			);
+			await screen.getByLabelText("Title").fill("Hello again");
+			await userEvent.click(screen.getByRole("button", { name: "Save" }).first());
+			await expect.element(screen.getByText("Select at least one entry.")).toBeVisible();
+
+			await screen.rerender(
+				<Switcher item={makeItem({ id: "post-fr", locale: "fr", data: { title: "Bonjour" } })} />,
+			);
+
+			await expect.element(screen.getByLabelText("Title")).toHaveValue("Bonjour");
+			expectNoRequiredMessage(screen);
+		});
+
+		it("reports each empty field when scheduling saves pending changes", async () => {
+			const onSchedule = vi.fn().mockResolvedValue(undefined);
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ status: "draft", data: { title: "Hello" } }),
+				fields: requiredFields,
+				onSchedule,
+			});
+			await screen.getByLabelText("Title").fill("Hello again");
+
+			await screen.getByRole("button", { name: "Schedule" }).click();
+			screen
+				.getByRole("dialog", { name: "Schedule publication" })
+				.getByRole("button", { name: "Schedule", exact: true })
+				.element()
+				.click();
+
+			await vi.waitFor(() => expect(onSchedule).toHaveBeenCalledOnce());
+			expect(onSchedule.mock.calls[0]?.[1]).toBeDefined();
+			await expect.element(screen.getByText("Select at least one entry.")).toBeVisible();
+			expect(screen.getByText("This field is required").elements()).toHaveLength(2);
+		});
+	});
+
+	describe("reference field that predates relations", () => {
+		// No relation means the field still owns a column holding one entry id, so
+		// it keeps the text input it had before reference pickers existed.
+		const legacyFields: Record<string, FieldDescriptor> = {
+			title: { kind: "string", label: "Title" },
+			author: { kind: "reference", label: "Author", options: { collection: "authors" } },
+		};
+
+		it("edits its stored entry id in a text input", async () => {
+			const onSave = vi.fn();
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Hello", author: "author-entry-id" } }),
+				fields: legacyFields,
+				onSave,
+			});
+
+			const input = screen.getByLabelText("Author");
+			await expect.element(input).toHaveValue("author-entry-id");
+
+			await userEvent.fill(input, "another-entry-id");
+			await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+			expect(onSave).toHaveBeenCalled();
+			expect(onSave.mock.calls[0]?.[0]?.data).toMatchObject({ author: "another-entry-id" });
+		});
+
+		it("points at the schema editor instead of claiming it is misconfigured", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "Hello", author: "author-entry-id" } }),
+				fields: legacyFields,
+			});
+
+			await expect
+				.element(screen.getByText(/Set a target collection under Content Types/))
+				.toBeInTheDocument();
+		});
+	});
+
+	describe("edit lock read-only mode", () => {
+		it("does not accept edits while another editor holds the entry", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem(),
+				readOnly: true,
+			});
+
+			await expect.element(screen.getByLabelText("Title")).toBeDisabled();
+			await expect
+				.element(screen.getByRole("button", { name: "Save", exact: true }).query())
+				.toBeNull();
+		});
+
+		it("stops autosaving as soon as the entry is taken away", async () => {
+			vi.useFakeTimers();
+
+			try {
+				const onAutosave = vi.fn();
+				const props: ContentEditorProps = {
+					collection: "posts",
+					collectionLabel: "Post",
+					fields: defaultFields,
+					isNew: false,
+					item: makeItem(),
+					onSave: vi.fn(),
+					onAutosave,
+				};
+
+				const screen = await render(<ContentEditor {...props} />);
+				await screen.getByLabelText("Title").fill("Half-typed title");
+				await screen.rerender(<ContentEditor {...props} readOnly />);
+
+				await vi.advanceTimersByTimeAsync(5000);
+
+				expect(onAutosave).not.toHaveBeenCalled();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("retries a refused autosave once the entry is taken back", async () => {
+			vi.useFakeTimers();
+
+			try {
+				const onAutosave = vi.fn();
+				const props: ContentEditorProps = {
+					collection: "posts",
+					collectionLabel: "Post",
+					fields: defaultFields,
+					isNew: false,
+					item: makeItem(),
+					onSave: vi.fn(),
+					onAutosave,
+					isAutosaving: false,
+					autosaveCompletionToken: 0,
+					autosaveRejectionToken: 0,
+				};
+
+				const screen = await render(<ContentEditor {...props} />);
+				await screen.getByLabelText("Title").fill("Typed before the take-over");
+				await vi.advanceTimersByTimeAsync(2000);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+
+				await screen.rerender(<ContentEditor {...props} isAutosaving={true} />);
+				await screen.rerender(
+					<ContentEditor {...props} isAutosaving={false} autosaveRejectionToken={1} readOnly />,
+				);
+				await vi.advanceTimersByTimeAsync(10_000);
+				expect(onAutosave).toHaveBeenCalledTimes(1);
+
+				await screen.rerender(
+					<ContentEditor {...props} isAutosaving={false} autosaveRejectionToken={1} />,
+				);
+				await vi.advanceTimersByTimeAsync(2000);
+				expect(onAutosave).toHaveBeenCalledTimes(2);
+				expect(onAutosave).toHaveBeenLastCalledWith(
+					expect.objectContaining({
+						data: expect.objectContaining({ title: "Typed before the take-over" }),
+					}),
+				);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("keeps the entry editable when nobody else holds it", async () => {
+			const screen = await renderEditor({ isNew: false, item: makeItem() });
+
+			await expect.element(screen.getByLabelText("Title")).not.toBeDisabled();
+		});
+
+		// `disabled` on a fieldset does not reach a contenteditable, so the rich
+		// text editor has to be told separately.
+		it("stops the rich text editor accepting input in read-only", async () => {
+			await renderEditor({
+				isNew: false,
+				item: makeItem(),
+				fields: { content: { kind: "portableText", label: "Content" } },
+				readOnly: true,
+			});
+
+			expect(portableTextProps.current?.editable).toBe(false);
+		});
+
+		it("shows the fields of every block in a read-only entry", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({
+					data: {
+						title: "Test",
+						layout: [{ _type: "event", _version: 1, _key: "first", seats: 40 }],
+					},
+				}),
+				fields: {
+					title: { kind: "string", label: "Title", required: true },
+					layout: {
+						kind: "blocks",
+						label: "Layout",
+						validation: { allowedTypes: ["event"], retiredTypes: [] },
+						blockTypes: [
+							{
+								id: "event-type",
+								slug: "event",
+								label: "Event",
+								currentVersion: 1,
+								source: "user",
+								createdAt: "2026-01-01T00:00:00.000Z",
+								updatedAt: "2026-01-01T00:00:00.000Z",
+								versions: [
+									{
+										id: "event-v1",
+										blockTypeId: "event-type",
+										version: 1,
+										fields: [{ slug: "seats", label: "Seats", type: "integer" }],
+										fingerprint: "one",
+										active: true,
+										createdAt: "2026-01-01T00:00:00.000Z",
+										updatedAt: "2026-01-01T00:00:00.000Z",
+									},
+								],
+							},
+						],
+					},
+				},
+				readOnly: true,
+			});
+
+			await expect.element(screen.getByLabelText("Seats", { exact: true })).toHaveValue(40);
+		});
+
+		it("does not offer to save over a newer version while the entry is read-only", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem(),
+				hasSaveConflict: true,
+				readOnly: true,
+			});
+
+			await expect.element(screen.getByRole("button", { name: "Save anyway" })).toBeDisabled();
+		});
+
+		it("offers to save over a newer version when the entry is not locked", async () => {
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem(),
+				hasSaveConflict: true,
+			});
+
+			await expect.element(screen.getByRole("button", { name: "Save anyway" })).not.toBeDisabled();
+		});
+	});
+
+	it("leaves the rich text editor writable when the entry is not locked", async () => {
+		await renderEditor({
+			isNew: false,
+			item: makeItem(),
+			fields: { content: { kind: "portableText", label: "Content" } },
+		});
+
+		expect(portableTextProps.current?.editable).toBe(true);
+	});
+
+	describe("stored value that is not a list", () => {
+		type Screen = Awaited<ReturnType<typeof renderEditor>>;
+		const repeaterField: FieldDescriptor = {
+			kind: "repeater",
+			label: "Highlights",
+			validation: { subFields: [{ slug: "caption", type: "string", label: "Caption" }] },
+		};
+		const addFirstItem = (s: Screen) =>
+			s.getByRole("button", { name: "Add First Item", exact: true });
+		const cases: Array<{ kind: string; field: FieldDescriptor; widget: (s: Screen) => Locator }> = [
+			{ kind: "repeater", field: repeaterField, widget: addFirstItem },
+			{
+				kind: "portableText",
+				field: { kind: "portableText", label: "Highlights" },
+				widget: (s) => s.getByTestId("portable-text-editor"),
+			},
+			{
+				kind: "multiSelect",
+				field: {
+					kind: "multiSelect",
+					label: "Highlights",
+					options: [{ value: "news", label: "News" }],
+				},
+				widget: (s) => s.getByRole("checkbox", { name: "News" }),
+			},
+			{
+				kind: "blocks",
+				field: { kind: "blocks", label: "Highlights", blockTypes: [] },
+				widget: (s) => s.getByText("No blocks yet"),
+			},
+		];
+
+		function renderWithStoredValue(field: FieldDescriptor, stored: unknown, onSave = vi.fn()) {
+			return renderEditor({
+				isNew: false,
+				item: makeItem({ data: { title: "My Post", highlights: stored } }),
+				fields: { title: { kind: "string", label: "Title" }, highlights: field },
+				onSave,
+			});
+		}
+
+		it.each(cases)(
+			"keeps a $kind field's stored value through an unrelated edit and save",
+			async ({ field, widget }) => {
+				const onSave = vi.fn();
+				const screen = await renderWithStoredValue(field, "First\nSecond", onSave);
+
+				await expect.element(screen.getByLabelText("Highlights")).toHaveValue("First\nSecond");
+				expect(widget(screen).query()).toBeNull();
+
+				await screen.getByLabelText("Title").fill("Changed title");
+				await screen.getByRole("button", { name: "Save" }).first().click();
+
+				expect(onSave).toHaveBeenCalledWith(
+					expect.objectContaining({
+						data: expect.objectContaining({ title: "Changed title", highlights: "First\nSecond" }),
+					}),
+				);
+			},
+		);
+
+		it.each(cases)(
+			"replaces a $kind field's stored value only through the replace action",
+			async ({ field, widget }) => {
+				const onSave = vi.fn();
+				const screen = await renderWithStoredValue(field, "First\nSecond", onSave);
+
+				await screen.getByRole("button", { name: "Replace with empty list" }).click();
+				await expect.element(widget(screen)).toBeVisible();
+				await screen.getByRole("button", { name: "Save" }).first().click();
+
+				expect(onSave).toHaveBeenCalledWith(
+					expect.objectContaining({ data: expect.objectContaining({ highlights: [] }) }),
+				);
+			},
+		);
+
+		it("shows a stored object read-only as JSON", async () => {
+			const screen = await renderWithStoredValue(repeaterField, { caption: "First" });
+
+			await expect
+				.element(screen.getByLabelText("Highlights"))
+				.toHaveValue('{\n  "caption": "First"\n}');
+			expect(addFirstItem(screen).query()).toBeNull();
+		});
+
+		it("opens a blank stored string as an empty list", async () => {
+			const screen = await renderWithStoredValue(repeaterField, "  ");
+
+			await expect.element(addFirstItem(screen)).toBeVisible();
+			expect(screen.getByRole("button", { name: "Replace with empty list" }).query()).toBeNull();
+		});
+	});
+
+	describe("autosave race with repeater sub-field", () => {
+		it("does not overwrite a sub-field input with a stale autosave payload", async () => {
+			const fields: Record<string, FieldDescriptor> = {
+				gallery: {
+					kind: "repeater",
+					label: "Gallery",
+					validation: {
+						subFields: [{ slug: "caption", type: "string", label: "Caption" }],
+					},
+				},
+			};
+
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { gallery: [] } }),
+				fields,
+				onAutosave: vi.fn(),
+				supportsDrafts: true,
+			});
+
+			await screen.getByRole("button", { name: "Add First Item", exact: true }).click();
+			const caption = screen.getByRole("textbox", { name: "Caption" });
+			await expect.element(caption).toBeVisible();
+			await caption.fill("Mobile view of the dashboard");
+
+			await screen.rerender(
+				<ContentEditor
+					collection="posts"
+					collectionLabel="Post"
+					fields={fields}
+					isNew={false}
+					item={makeItem({ data: { gallery: [{ caption: "Mobile view" }] } })}
+					onSave={vi.fn()}
+					onAutosave={vi.fn()}
+					supportsDrafts={true}
+					autosaveCompletionToken={1}
+				/>,
+			);
+
+			await expect.element(caption).toHaveValue("Mobile view of the dashboard");
+		});
+	});
+
+	describe("autosave race with blocks", () => {
+		it("preserves newer nested edits, order, keys, and versions", async () => {
+			const fields: Record<string, FieldDescriptor> = {
+				layout: {
+					kind: "blocks",
+					label: "Layout",
+					validation: { allowedTypes: ["hero"], retiredTypes: [] },
+					blockTypes: [
+						{
+							id: "hero-type",
+							slug: "hero",
+							label: "Hero",
+							currentVersion: 2,
+							source: "user",
+							createdAt: "2026-01-01T00:00:00.000Z",
+							updatedAt: "2026-01-01T00:00:00.000Z",
+							versions: [
+								{
+									id: "hero-v1",
+									blockTypeId: "hero-type",
+									version: 1,
+									fields: [{ slug: "heading", label: "Heading", type: "string" }],
+									fingerprint: "one",
+									active: false,
+									createdAt: "2026-01-01T00:00:00.000Z",
+									updatedAt: "2026-01-01T00:00:00.000Z",
+								},
+								{
+									id: "hero-v2",
+									blockTypeId: "hero-type",
+									version: 2,
+									fields: [{ slug: "heading", label: "Heading", type: "string" }],
+									fingerprint: "two",
+									active: true,
+									createdAt: "2026-01-01T00:00:00.000Z",
+									updatedAt: "2026-01-01T00:00:00.000Z",
+								},
+							],
+						},
+					],
+				},
+			};
+			const initialBlocks = [
+				{ _type: "hero", _version: 1, _key: "first", heading: "First" },
+				{ _type: "hero", _version: 2, _key: "second", heading: "Second" },
+			];
+			const screen = await renderEditor({
+				isNew: false,
+				item: makeItem({ data: { layout: initialBlocks } }),
+				fields,
+				onAutosave: vi.fn(),
+				supportsDrafts: true,
+			});
+
+			await screen.getByRole("button", { name: "Expand all" }).click();
+			const headings = screen.getByRole("textbox", { name: "Heading" }).all();
+			await headings[0]!.fill("First, edited again");
+			await screen.getByRole("button", { name: "Hero actions" }).first().click();
+			await screen.getByRole("menuitem", { name: "Move down" }).click();
+
+			await screen.rerender(
+				<ContentEditor
+					collection="posts"
+					collectionLabel="Post"
+					fields={fields}
+					isNew={false}
+					item={makeItem({ data: { layout: initialBlocks } })}
+					onSave={vi.fn()}
+					onAutosave={vi.fn()}
+					supportsDrafts={true}
+					autosaveCompletionToken={1}
+				/>,
+			);
+
+			await expect
+				.element(screen.getByRole("textbox", { name: "Heading" }).all()[1]!)
+				.toHaveValue("First, edited again");
+			expect(
+				Array.from(document.querySelectorAll<HTMLElement>("[data-block-key]"), (element) => [
+					element.dataset.blockKey,
+					element.textContent?.includes("Inactive version") ? 1 : 2,
+				]),
+			).toEqual([
+				["second", 2],
+				["first", 1],
+			]);
+		});
+	});
+});
+
+describe("ContentEditor revision view", () => {
+	const revisionFields: Record<string, FieldDescriptor> = {
+		title: { kind: "string", label: "Title" },
+		content: { kind: "portableText", label: "Content" },
+	};
+
+	function textBlocks(text: string) {
+		return [
+			{
+				_type: "block",
+				_key: "b1",
+				style: "normal",
+				markDefs: [],
+				children: [{ _type: "span", _key: "s1", text, marks: [] }],
+			},
+		];
+	}
+
+	function makeRevisionItem(overrides: Partial<ContentItem> = {}): ContentItem {
+		return makeItem({
+			status: "published",
+			data: { title: "Draft title", content: textBlocks("Draft body") },
+			liveRevisionId: "rev-old",
+			draftRevisionId: "rev-draft",
+			...overrides,
+		});
+	}
+
+	function makeRevisionList(currentId = "rev-draft"): RevisionListResponse {
+		return {
+			items: [
+				{
+					id: currentId,
+					collection: "posts",
+					entryId: "item-1",
+					data: { title: "Draft title", content: textBlocks("Draft body") },
+					authorId: "user-maya",
+					author: { id: "user-maya", name: "Maya Chen" },
+					createdAt: "2026-10-02 13:12:00",
+				},
+				{
+					id: "rev-old",
+					collection: "posts",
+					entryId: "item-1",
+					data: { title: "Old title", content: textBlocks("Old body") },
+					authorId: "user-sam",
+					author: { id: "user-sam", name: "Sam Rivera" },
+					createdAt: "2026-10-01 09:30:00",
+				},
+			],
+			total: 2,
+		};
+	}
+
+	function revisionEditorProps(props: Partial<ContentEditorProps> = {}): ContentEditorProps {
+		return {
+			collection: "posts",
+			collectionLabel: "Post",
+			fields: revisionFields,
+			isNew: false,
+			item: makeRevisionItem(),
+			supportsRevisions: true,
+			supportsDrafts: true,
+			onSave: vi.fn(),
+			...props,
+		};
+	}
+
+	function renderRevisionEditor(props: Partial<ContentEditorProps> = {}) {
+		return render(<ContentEditor {...revisionEditorProps(props)} />, { wrapper: Toasty });
+	}
+
+	const versionCanvas = () => document.querySelector("article[aria-label^='Version from']");
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		portableTextMountCount = 0;
+		onEditorReadyCalls = [];
+		portableTextProps.current = null;
+		vi.mocked(fetchRevisions).mockImplementation(async () => makeRevisionList());
+		vi.mocked(diffVersion).mockImplementation(({ revisions, index }) => ({
+			hasPrevious: index + 1 < revisions.length,
+			fields: [],
+			slug: null,
+			changes: [],
+		}));
+	});
+
+	it("shows a version in place of the editor and comes back to the unsaved edits", async () => {
+		const screen = await renderRevisionEditor();
+		await screen.getByLabelText("Title").fill("Unsaved title");
+		expect(portableTextMountCount).toBe(1);
+
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await expect.element(screen.getByRole("article", { name: /^Version from/ })).toBeVisible();
+		await expect.element(screen.getByLabelText("Title")).not.toBeVisible();
+		await expect.element(screen.getByTestId("portable-text-editor")).not.toBeVisible();
+
+		await screen.getByRole("button", { name: "Back to editing" }).click();
+		await expect.element(screen.getByLabelText("Title")).toBeVisible();
+		await expect.element(screen.getByLabelText("Title")).toHaveValue("Unsaved title");
+		expect(versionCanvas()).toBeNull();
+		expect(portableTextMountCount).toBe(1);
+	});
+
+	it("switches versions without drawing the canvas again, so its images don't reload", async () => {
+		const screen = await renderRevisionEditor();
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		const canvas = screen.getByRole("article", { name: /^Version from/ });
+		await expect.element(canvas).toBeVisible();
+		const shown = canvas.element();
+
+		await screen.getByRole("button", { name: "View rev-draft" }).click();
+		await expect.element(screen.getByText("Current version", { exact: true })).toBeVisible();
+		expect(canvas.element()).toBe(shown);
+	});
+
+	it("shows each version on its own when one of them can't be shown", async () => {
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		unreadableVersion = /October 1/;
+		try {
+			const screen = await renderRevisionEditor();
+			const failed = screen.getByText("This version can't be shown.");
+			await screen.getByRole("button", { name: "View rev-draft" }).click();
+			await expect.element(screen.getByRole("article", { name: /^Version from/ })).toBeVisible();
+
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			await expect.element(failed).toBeVisible();
+
+			await screen.getByRole("button", { name: "View rev-draft" }).click();
+			await expect.element(screen.getByRole("article", { name: /^Version from/ })).toBeVisible();
+			await expect.element(failed).not.toBeInTheDocument();
+		} finally {
+			unreadableVersion = null;
+			consoleError.mockRestore();
+		}
+	});
+
+	it("sends a pending autosave before showing a version and holds autosave while it is shown", async () => {
+		vi.useFakeTimers();
+		try {
+			const onAutosave = vi.fn();
+			const screen = await renderRevisionEditor({ onAutosave });
+			await screen.getByLabelText("Title").fill("Typed just now");
+			await vi.advanceTimersByTimeAsync(500);
+			expect(onAutosave).not.toHaveBeenCalled();
+
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			expect(onAutosave).toHaveBeenCalledOnce();
+			expect(onAutosave).toHaveBeenLastCalledWith(
+				expect.objectContaining({ data: expect.objectContaining({ title: "Typed just now" }) }),
+			);
+
+			await screen.getByLabelText("Slug").fill("edited-while-viewing");
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(onAutosave).toHaveBeenCalledOnce();
+
+			await screen.getByRole("button", { name: "Back to editing" }).click();
+			await vi.advanceTimersByTimeAsync(2000);
+			expect(onAutosave).toHaveBeenCalledTimes(2);
+			expect(onAutosave).toHaveBeenLastCalledWith(
+				expect.objectContaining({ slug: "edited-while-viewing" }),
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("names who edited since the live version in the publish confirmation", async () => {
+		vi.mocked(fetchRevisionEditors).mockResolvedValue([{ id: "user-maya", name: "Maya Chen" }]);
+		const screen = await renderRevisionEditor({ onPublish: vi.fn() });
+		await screen.getByRole("button", { name: "Publish changes", exact: true }).click();
+		const dialog = screen.getByRole("dialog", { name: "Publish changes?" });
+
+		await expect.element(dialog.getByText("Edited by Maya Chen", { exact: true })).toBeVisible();
+		expect(fetchRevisionEditors).toHaveBeenCalledWith(
+			"posts",
+			"item-1",
+			expect.objectContaining({ since: "rev-old" }),
+		);
+	});
+
+	it("pauses saving and publishing while a version is shown", async () => {
+		const onSave = vi.fn();
+		const onPublish = vi.fn();
+		const screen = await renderRevisionEditor({
+			onSave,
+			onPublish,
+			item: makeRevisionItem({ status: "draft", liveRevisionId: null }),
+		});
+		await screen.getByLabelText("Title").fill("Unsaved title");
+		const save = screen.getByRole("button", { name: "Save", exact: true }).first();
+		const publish = screen.getByRole("button", { name: "Publish now", exact: true });
+		await expect.element(save).toBeEnabled();
+		await expect.element(publish).toBeEnabled();
+
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+		await expect.element(save).toBeDisabled();
+		await expect.element(publish).toBeDisabled();
+
+		await screen.getByLabelText("Slug").fill("typed-slug");
+		await userEvent.keyboard("{Enter}");
+		expect(onSave).not.toHaveBeenCalled();
+
+		await screen.getByRole("button", { name: "Back to editing" }).click();
+		await expect.element(save).toBeEnabled();
+		await expect.element(publish).toBeEnabled();
+	});
+
+	it("leaves the version with Escape, but not while the restore dialog is open", async () => {
+		const screen = await renderRevisionEditor();
+		const opener = screen.getByRole("button", { name: "View rev-old" });
+		await opener.click();
+		await screen.getByRole("button", { name: "Restore", exact: true }).click();
+		const dialog = screen.getByRole("dialog", { name: "Restore this version?" });
+		await expect.element(dialog).toBeVisible();
+
+		await userEvent.keyboard("{Escape}");
+		await expect.element(dialog).not.toBeInTheDocument();
+		await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+
+		await userEvent.keyboard("{Escape}");
+		await expect
+			.element(screen.getByRole("button", { name: "Back to editing" }))
+			.not.toBeInTheDocument();
+		await expect.element(screen.getByLabelText("Title")).toBeVisible();
+		await expect.element(opener).toHaveFocus();
+	});
+
+	it("loads a restored version that arrives after the editor was told to reload", async () => {
+		vi.mocked(restoreRevision).mockResolvedValue(
+			makeRevisionItem({
+				draftRevisionId: "rev-restored",
+				data: { title: "Old title", content: textBlocks("Old body") },
+			}),
+		);
+		function Host() {
+			const [item, setItem] = React.useState(makeRevisionItem());
+			const [resetToken, setResetToken] = React.useState(0);
+			return (
+				<ContentEditor
+					{...revisionEditorProps()}
+					item={item}
+					itemResetToken={resetToken}
+					onRevisionRestored={async (restored) => {
+						setResetToken((token) => token + 1);
+						await new Promise((resolve) => setTimeout(resolve, 50));
+						setItem(restored);
+					}}
+				/>
+			);
+		}
+		const screen = await render(<Host />, { wrapper: Toasty });
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await screen.getByRole("button", { name: "Restore", exact: true }).click();
+		screen
+			.getByRole("dialog", { name: "Restore this version?" })
+			.getByRole("button", { name: "Restore", exact: true })
+			.element()
+			.click();
+
+		await expect.element(screen.getByLabelText("Title")).toHaveValue("Old title");
+		await expect
+			.element(screen.getByTestId("portable-text-editor"))
+			.toHaveAttribute("data-content", "Old body");
+		await expect
+			.element(screen.getByRole("status", { name: "Version to focus" }))
+			.toHaveTextContent("rev-restored");
+	});
+
+	it.each([
+		["with a draft", makeRevisionItem(), "Your draft will be replaced with the version from"],
+		[
+			"without a draft",
+			makeRevisionItem({ draftRevisionId: null, liveRevisionId: "rev-draft" }),
+			"becomes your draft. The live site won't change until you publish.",
+		],
+		[
+			"that is scheduled",
+			makeRevisionItem({ scheduledAt: "2026-10-20T09:00:00.000Z" }),
+			"the restored version goes live at the scheduled time.",
+		],
+	])("says what restoring does to an entry %s", async (_, item, description) => {
+		const screen = await renderRevisionEditor({ item });
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await screen.getByRole("button", { name: "Restore", exact: true }).click();
+
+		await expect
+			.element(
+				screen
+					.getByRole("dialog", { name: "Restore this version?" })
+					.getByText(description, { exact: false }),
+			)
+			.toBeVisible();
+	});
+
+	it("offers nothing to restore for a version that matches the current one", async () => {
+		vi.mocked(fetchRevisions).mockImplementation(async () => {
+			const list = makeRevisionList();
+			const current = list.items[0]!;
+			return { ...list, items: list.items.map((item) => ({ ...item, data: { ...current.data } })) };
+		});
+		const screen = await renderRevisionEditor();
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+
+		await expect.element(screen.getByText("Same as current version")).toBeVisible();
+		expect(screen.getByRole("button", { name: "Restore", exact: true }).query()).toBeNull();
+	});
+
+	it("replaces unsaved edits when a host reloads the restored entry without a reset", async () => {
+		vi.mocked(restoreRevision).mockResolvedValue(
+			makeRevisionItem({
+				draftRevisionId: "rev-restored",
+				data: { title: "Old title", content: textBlocks("Old body") },
+			}),
+		);
+		function Host() {
+			const [item, setItem] = React.useState(makeRevisionItem());
+			return (
+				<ContentEditor
+					{...revisionEditorProps()}
+					item={item}
+					onRevisionRestored={(restored) => setItem(restored)}
+				/>
+			);
+		}
+		const screen = await render(<Host />, { wrapper: Toasty });
+		await screen.getByLabelText("Title").fill("Unsaved title");
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await screen.getByRole("button", { name: "Restore", exact: true }).click();
+		const dialog = screen.getByRole("dialog", { name: "Restore this version?" });
+		await expect
+			.element(dialog.getByText("Your unsaved changes will be lost.", { exact: false }))
+			.toBeVisible();
+		dialog.getByRole("button", { name: "Restore", exact: true }).element().click();
+
+		await expect.element(screen.getByLabelText("Title")).toHaveValue("Old title");
+		await expect
+			.element(screen.getByTestId("portable-text-editor"))
+			.toHaveAttribute("data-content", "Old body");
+		expect(portableTextMountCount).toBe(2);
+	});
+
+	it("loads the restored version for a host that only listens for the restore", async () => {
+		const restored = makeRevisionItem({
+			draftRevisionId: "rev-restored",
+			data: { title: "Old title", content: textBlocks("Old body") },
+		});
+		let stored = makeRevisionItem();
+		vi.mocked(restoreRevision).mockImplementation(async () => {
+			stored = restored;
+			return restored;
+		});
+		const onRevisionRestored = vi.fn();
+		function Host() {
+			const { data } = useQuery({
+				queryKey: ["content", "posts", stored.id],
+				queryFn: async () => stored,
+			});
+			if (!data) return null;
+			return (
+				<ContentEditor
+					{...revisionEditorProps()}
+					item={data}
+					onRevisionRestored={onRevisionRestored}
+				/>
+			);
+		}
+		const screen = await render(<Host />, { wrapper: Toasty });
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await screen.getByRole("button", { name: "Restore", exact: true }).click();
+		screen
+			.getByRole("dialog", { name: "Restore this version?" })
+			.getByRole("button", { name: "Restore", exact: true })
+			.element()
+			.click();
+
+		await expect.element(screen.getByLabelText("Title")).toHaveValue("Old title");
+		await expect
+			.element(screen.getByRole("button", { name: "Back to editing" }))
+			.not.toBeInTheDocument();
+		expect(onRevisionRestored).toHaveBeenCalledWith(restored);
+	});
+
+	it("goes back to the restored body, not the replaced one, when Esc is pressed while it loads", async () => {
+		const restored = makeRevisionItem({
+			draftRevisionId: "rev-restored",
+			data: { title: "Old title", content: textBlocks("Old body") },
+		});
+		let stored = makeRevisionItem();
+		let loadRestored = () => {};
+		const restoredLoaded = new Promise<void>((resolve) => {
+			loadRestored = resolve;
+		});
+		vi.mocked(restoreRevision).mockImplementation(async () => {
+			stored = restored;
+			return restored;
+		});
+		function Host() {
+			const { data } = useQuery({
+				queryKey: ["content", "posts", stored.id],
+				queryFn: async () => {
+					const item = stored;
+					if (item === restored) await restoredLoaded;
+					return item;
+				},
+			});
+			if (!data) return null;
+			return <ContentEditor {...revisionEditorProps()} item={data} onRevisionRestored={vi.fn()} />;
+		}
+		const screen = await render(<Host />, { wrapper: Toasty });
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await screen.getByRole("button", { name: "Restore", exact: true }).click();
+		const dialog = screen.getByRole("dialog", { name: "Restore this version?" });
+		dialog.getByRole("button", { name: "Restore", exact: true }).element().click();
+		await expect.element(dialog).not.toBeInTheDocument();
+
+		await userEvent.keyboard("{Escape}");
+		loadRestored();
+
+		await expect
+			.element(screen.getByRole("button", { name: "Back to editing" }))
+			.not.toBeInTheDocument();
+		await expect
+			.element(screen.getByTestId("portable-text-editor"))
+			.toHaveAttribute("data-content", "Old body");
+	});
+
+	it("lets the writer carry on when the restored entry can't be loaded", async () => {
+		vi.mocked(restoreRevision).mockResolvedValue(
+			makeRevisionItem({ draftRevisionId: "rev-restored" }),
+		);
+		const screen = await renderRevisionEditor({
+			onRevisionRestored: () => Promise.reject(new Error("The entry couldn't be loaded.")),
+		});
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await screen.getByRole("button", { name: "Restore", exact: true }).click();
+		const dialog = screen.getByRole("dialog", { name: "Restore this version?" });
+		dialog.getByRole("button", { name: "Restore", exact: true }).element().click();
+
+		await expect.element(dialog.getByText("The entry couldn't be loaded.")).toBeVisible();
+		dialog.getByRole("button", { name: "Cancel" }).element().click();
+		await expect
+			.element(screen.getByRole("button", { name: "Restore", exact: true }))
+			.toBeEnabled();
+		await screen.getByRole("button", { name: "View rev-draft" }).click();
+		await expect.element(screen.getByText("Current version", { exact: true })).toBeVisible();
+	});
+
+	it("keeps the body editor mounted when a save reloads the entry behind newer typing", async () => {
+		const props = revisionEditorProps();
+		const screen = await render(<ContentEditor {...props} itemResetToken={0} />, {
+			wrapper: Toasty,
+		});
+		await expect
+			.element(screen.getByTestId("portable-text-editor"))
+			.toHaveAttribute("data-content", "Draft body");
+		const onChange = portableTextProps.current?.onChange as (value: unknown) => void;
+		onChange(textBlocks("Saved body, and more"));
+		await expect.element(screen.getByRole("button", { name: "Save", exact: true })).toBeEnabled();
+
+		await screen.rerender(
+			<ContentEditor
+				{...props}
+				item={makeRevisionItem({
+					draftRevisionId: "rev-saved",
+					updatedAt: "2026-10-02T14:00:00Z",
+					data: { title: "Saved title", content: textBlocks("Saved body") },
+				})}
+				itemResetToken={1}
+			/>,
+		);
+		await expect.element(screen.getByLabelText("Title")).toHaveValue("Saved title");
+		expect(portableTextMountCount).toBe(1);
+	});
+
+	it("goes back to editing when another entry opens while a version is shown", async () => {
+		const props = revisionEditorProps();
+		const screen = await render(<ContentEditor {...props} />, { wrapper: Toasty });
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+
+		await screen.rerender(<ContentEditor {...props} item={makeRevisionItem({ id: "item-2" })} />);
+		await expect
+			.element(screen.getByRole("button", { name: "Back to editing" }))
+			.not.toBeInTheDocument();
+		await expect.element(screen.getByLabelText("Title")).toBeVisible();
+	});
+
+	it("steps between versions from the bar when the list is in the closed phone sheet", async () => {
+		await page.viewport(390, 844);
+		const media = installMatchMedia(true);
+		try {
+			const screen = await renderRevisionEditor();
+			await screen.getByRole("button", { name: "Settings" }).click();
+			await screen.getByRole("button", { name: "View rev-draft" }).click();
+			await expect
+				.element(screen.getByRole("navigation", { name: "Settings" }))
+				.not.toBeInTheDocument();
+
+			const heading = screen.getByRole("heading", { level: 2 });
+			await expect.element(heading).toHaveFocus();
+			await expect.element(screen.getByText("Maya Chen", { exact: true })).toBeVisible();
+			const older = screen.getByRole("button", { name: "Older version" });
+			const newer = screen.getByRole("button", { name: "Newer version" });
+			await expect.element(newer).toBeDisabled();
+			expect(screen.getByRole("button", { name: "Restore", exact: true }).query()).toBeNull();
+
+			await older.click();
+			await expect.element(screen.getByText("Sam Rivera", { exact: true })).toBeVisible();
+			await expect.element(older).toBeDisabled();
+			await expect.element(newer).toBeEnabled();
+			await expect.element(heading).toHaveFocus();
+			await expect
+				.element(screen.getByRole("button", { name: "Restore", exact: true }))
+				.toBeVisible();
+			await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+		} finally {
+			media.restore();
+			await page.viewport(1280, 800);
+		}
+	});
+
+	it("goes back to where the editor was scrolled on a phone", async () => {
+		await page.viewport(390, 844);
+		const media = installMatchMedia(true);
+		const tallPage = document.createElement("style");
+		tallPage.textContent = `
+			[data-emdash-editor-canvas] { height: 400px; overflow-y: auto; }
+			[data-emdash-editor-canvas] .emdash-editor-page { min-height: 3000px; }
+		`;
+		document.head.append(tallPage);
+		try {
+			const screen = await renderRevisionEditor();
+			const canvas = document.querySelector<HTMLElement>("[data-emdash-editor-canvas]")!;
+			canvas.scrollTop = 500;
+			screen.getByRole("button", { name: "Settings" }).element().click();
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			const back = screen.getByRole("button", { name: "Back to editing" });
+			await expect.element(back).toBeVisible();
+
+			back.element().click();
+			await expect.element(screen.getByRole("button", { name: "Settings" })).toHaveFocus();
+			expect(canvas.scrollTop).toBe(500);
+		} finally {
+			tallPage.remove();
+			media.restore();
+			await page.viewport(1280, 800);
+		}
+	});
+
+	it("goes back to editing before the outline moves to a heading", async () => {
+		outlineClicks.editorVisible.length = 0;
+		const screen = await renderRevisionEditor();
+		await screen.getByRole("button", { name: "View rev-old" }).click();
+		await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+
+		await screen.getByRole("button", { name: "Outline heading" }).click();
+		expect(outlineClicks.editorVisible).toEqual([true]);
+		await expect
+			.element(screen.getByRole("button", { name: "Back to editing" }))
+			.not.toBeInTheDocument();
+	});
+
+	it("lets Escape close the phone sheet before it leaves the version", async () => {
+		const media = installMatchMedia(true);
+		try {
+			const screen = await renderRevisionEditor();
+			const settings = screen.getByRole("button", { name: "Settings" });
+			await settings.click();
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			await expect.element(screen.getByRole("heading", { level: 2 })).toHaveFocus();
+
+			await settings.click();
+			await expect
+				.element(screen.getByRole("navigation", { name: "Settings" }))
+				.toBeInTheDocument();
+			await userEvent.keyboard("{Escape}");
+			await expect
+				.element(screen.getByRole("navigation", { name: "Settings" }))
+				.not.toBeInTheDocument();
+			await expect.element(screen.getByRole("button", { name: "Older version" })).toBeVisible();
+
+			screen.getByRole("heading", { level: 2 }).element().focus();
+			await userEvent.keyboard("{Escape}");
+			await expect
+				.element(screen.getByRole("button", { name: "Older version" }))
+				.not.toBeInTheDocument();
+			await expect.element(settings).toHaveFocus();
+		} finally {
+			media.restore();
+		}
+	});
+
+	it("turns changes back on and moves focus to a change picked from the list", async () => {
+		const screen = await renderRevisionEditor();
+		await screen.getByRole("button", { name: "View rev-draft" }).click();
+		const toggle = screen.getByRole("switch", { name: "Show changes" });
+		await toggle.click();
+		await expect.element(toggle).not.toBeChecked();
+		await expect
+			.element(screen.getByRole("article", { name: /^Version from/ }))
+			.toHaveAttribute("data-show-changes", "false");
+
+		await screen.getByRole("button", { name: "Go to change" }).click();
+		await expect.element(toggle).toBeChecked();
+		await expect.element(screen.getByText("Changed paragraph")).toHaveFocus();
+	});
+
+	describe("when the version list reloads", () => {
+		function renderWithClient(props: Partial<ContentEditorProps> = {}) {
+			const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+			function Wrapper({ children }: React.PropsWithChildren) {
+				return (
+					<QueryClientProvider client={queryClient}>
+						<Toasty>{children}</Toasty>
+					</QueryClientProvider>
+				);
+			}
+			const result = render(<ContentEditor {...revisionEditorProps(props)} />, {
+				wrapper: Wrapper,
+			});
+			return { queryClient, result };
+		}
+
+		function revisionEntry(id: string): RevisionListItem {
+			return {
+				id,
+				collection: "posts",
+				entryId: "item-1",
+				data: { title: id },
+				authorId: "user-sam",
+				author: { id: "user-sam", name: `Author of ${id}` },
+				createdAt: "2026-09-20 10:00:00",
+			};
+		}
+
+		function listOf(ids: string[], total: number): RevisionListResponse {
+			return { items: ids.map(revisionEntry), total };
+		}
+
+		function serveLists(partial: RevisionListResponse, full: RevisionListResponse) {
+			vi.mocked(fetchRevisions).mockImplementation(async (_collection, _id, options) =>
+				options?.limit === 100 ? full : partial,
+			);
+		}
+
+		it("follows to the draft an autosave makes from the published version being shown", async () => {
+			const item = makeRevisionItem({ draftRevisionId: null, liveRevisionId: "rev-draft" });
+			const { queryClient, result } = renderWithClient({ item });
+			const screen = await result;
+			await screen.getByRole("button", { name: "View rev-draft" }).click();
+			await expect.element(screen.getByText("Current version", { exact: true })).toBeVisible();
+
+			const draft = { ...revisionEntry("rev-new-draft"), author: { id: "u", name: "Ana Diaz" } };
+			queryClient.setQueriesData<RevisionListResponse>({ queryKey: ["revisions"] }, (list) =>
+				list
+					? withAutosavedDraft(list, {
+							draft,
+							previousDraftId: null,
+							previousIsAutosave: false,
+							liveRevisionId: "rev-draft",
+							limit: 21,
+						})
+					: list,
+			);
+			await screen.rerender(
+				<ContentEditor
+					{...revisionEditorProps({ item: { ...item, draftRevisionId: "rev-new-draft" } })}
+				/>,
+			);
+
+			await expect.element(screen.getByText("Ana Diaz", { exact: true })).toBeVisible();
+			await expect.element(screen.getByText("Current version", { exact: true })).toBeVisible();
+			await vi.waitFor(() =>
+				expect(document.querySelector('p[role="status"][aria-live="polite"]')?.textContent).toMatch(
+					/^Viewing the version from .* by .*Ana Diaz/,
+				),
+			);
+		});
+
+		it("asks for the shorter list again when the full one fails to load", async () => {
+			vi.mocked(fetchRevisions).mockImplementation(async (_collection, _id, options) => {
+				if (options?.limit === 100) throw new Error("Failed to fetch revisions");
+				return listOf(["rev-draft", "rev-old", "rev-older"], 4);
+			});
+			const { queryClient, result } = renderWithClient();
+			const screen = await result;
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+
+			vi.mocked(fetchRevisions).mockImplementation(async (_collection, _id, options) => {
+				if (options?.limit === 100) throw new Error("Failed to fetch revisions");
+				return listOf(["rev-new", "rev-draft", "rev-old"], 5);
+			});
+			await queryClient.invalidateQueries({ queryKey: ["revisions"] });
+
+			await expect
+				.element(screen.getByRole("button", { name: "Back to editing" }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(screen.getByText("Couldn't load this version", { exact: false }))
+				.toBeInTheDocument();
+			await expect
+				.element(screen.getByRole("status", { name: "Versions requested" }))
+				.toHaveTextContent("21");
+		});
+
+		it("loads the rest of the list for a version newer saves push to its end", async () => {
+			serveLists(listOf(["rev-draft", "rev-old", "rev-older"], 4), listOf([], 0));
+			const { queryClient, result } = renderWithClient();
+			const screen = await result;
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			const toggle = screen.getByRole("switch", { name: "Show changes" });
+			await expect.element(toggle).toBeVisible();
+
+			serveLists(
+				listOf(["rev-new", "rev-draft", "rev-old"], 5),
+				listOf(["rev-new", "rev-draft", "rev-old", "rev-older", "rev-oldest"], 5),
+			);
+			await queryClient.invalidateQueries({ queryKey: ["revisions"] });
+
+			await vi.waitFor(() =>
+				expect(fetchRevisions).toHaveBeenCalledWith(
+					"posts",
+					"item-1",
+					expect.objectContaining({ limit: 100 }),
+				),
+			);
+			await vi.waitFor(() =>
+				expect(vi.mocked(diffVersion).mock.lastCall?.[0].revisions).toHaveLength(5),
+			);
+			await expect.element(toggle).toBeVisible();
+			const withoutPredecessor = vi
+				.mocked(diffVersion)
+				.mock.calls.filter(([input]) => input.index + 1 >= input.revisions.length);
+			expect(withoutPredecessor).toEqual([]);
+		});
+
+		it("finds a version newer saves push out of the loaded list", async () => {
+			serveLists(listOf(["rev-draft", "rev-old", "rev-older"], 4), listOf([], 0));
+			const { queryClient, result } = renderWithClient();
+			const screen = await result;
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			await expect.element(screen.getByText("Author of rev-old", { exact: true })).toBeVisible();
+
+			serveLists(
+				listOf(["rev-new-2", "rev-new", "rev-draft"], 6),
+				listOf(["rev-new-2", "rev-new", "rev-draft", "rev-old", "rev-older", "rev-oldest"], 6),
+			);
+			await queryClient.invalidateQueries({ queryKey: ["revisions"] });
+
+			await vi.waitFor(() =>
+				expect(fetchRevisions).toHaveBeenCalledWith(
+					"posts",
+					"item-1",
+					expect.objectContaining({ limit: 100 }),
+				),
+			);
+			await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+			await expect.element(screen.getByText("Author of rev-old", { exact: true })).toBeVisible();
+			expect(document.body.textContent).not.toContain("no longer available");
+		});
+
+		it("compares again when a version's data changes under the same id", async () => {
+			const { queryClient, result } = renderWithClient();
+			const screen = await result;
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			await expect.element(screen.getByRole("button", { name: "Back to editing" })).toBeVisible();
+
+			queryClient.setQueriesData<RevisionListResponse>({ queryKey: ["revisions"] }, (list) =>
+				list
+					? {
+							...list,
+							items: list.items.map((item) =>
+								item.id === "rev-old"
+									? { ...item, data: { ...item.data, title: "Merged title" } }
+									: item,
+							),
+						}
+					: list,
+			);
+
+			await vi.waitFor(() => {
+				const input = vi.mocked(diffVersion).mock.lastCall?.[0];
+				expect(input?.revisions[input.index]?.data).toMatchObject({ title: "Merged title" });
+			});
+		});
+
+		it("goes back to editing when the versions can't be loaded", async () => {
+			vi.mocked(fetchRevisions).mockRejectedValue(new Error("Failed to fetch revisions"));
+			const { result } = renderWithClient();
+			const screen = await result;
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+
+			await expect.element(screen.getByLabelText("Title")).toBeVisible();
+			await expect
+				.element(screen.getByRole("status").filter({ hasText: "Couldn't load this version" }))
+				.toBeInTheDocument();
+		});
+
+		it("goes back to editing when the shown version is no longer listed", async () => {
+			const { queryClient, result } = renderWithClient();
+			const screen = await result;
+			await screen.getByRole("button", { name: "View rev-old" }).click();
+			await expect.element(screen.getByText("Sam Rivera", { exact: true })).toBeVisible();
+
+			vi.mocked(fetchRevisions).mockImplementation(async () => ({
+				items: makeRevisionList().items.slice(0, 1),
+				total: 1,
+			}));
+			await queryClient.invalidateQueries({ queryKey: ["revisions"] });
+
+			await expect
+				.element(screen.getByRole("button", { name: "Back to editing" }))
+				.not.toBeInTheDocument();
+			await expect.element(screen.getByLabelText("Title")).toBeVisible();
+			await expect
+				.element(screen.getByRole("status").filter({ hasText: "no longer available" }))
+				.toBeInTheDocument();
+		});
+	});
+});

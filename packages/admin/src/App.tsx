@@ -1,0 +1,200 @@
+/**
+ * EmDash Admin React Application
+ *
+ * This is the main entry point for the admin SPA.
+ * Uses TanStack Router for client-side routing and TanStack Query for data fetching.
+ *
+ * Plugin admin components are passed via the pluginAdmins prop and made
+ * available throughout the app via PluginAdminContext.
+ */
+
+import { LinkProvider, Toasty, type LinkComponentProps } from "@cloudflare/kumo";
+import { i18n } from "@lingui/core";
+import type { Messages } from "@lingui/core";
+import { I18nProvider } from "@lingui/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Link, RouterProvider, type LinkProps } from "@tanstack/react-router";
+import * as React from "react";
+
+import { ThemeProvider } from "./components/ThemeProvider";
+import { AdminBrandingProvider, type AdminBranding } from "./lib/admin-branding-context";
+import { refetchCurrentUserOnForbidden } from "./lib/api/current-user";
+import { AuthProviderProvider, type AuthProviders } from "./lib/auth-provider-context";
+import { PluginAdminProvider, type PluginAdmins } from "./lib/plugin-context";
+import { getLoadedDateLocale, waitForDateLocale } from "./locales/date-locale.js";
+import { LocaleDirectionProvider } from "./locales/index.js";
+import { KumoTranslationsProvider } from "./locales/KumoTranslationsProvider.js";
+import { createAdminRouter } from "./router";
+
+// Create a query client
+const queryClient = new QueryClient({
+	defaultOptions: {
+		queries: {
+			staleTime: 1000 * 60, // 1 minute
+			retry: 1,
+		},
+	},
+});
+
+refetchCurrentUserOnForbidden(queryClient);
+
+// Create the router with query client context
+const router = createAdminRouter(queryClient);
+const ADMIN_BASEPATH = "/_emdash/admin";
+const DATE_LOCALE_BOOT_TIMEOUT_MS = 3000;
+
+export function normalizeAdminHref(href: string): string {
+	if (href === ADMIN_BASEPATH) return "/";
+	if (href.startsWith(`${ADMIN_BASEPATH}/`)) return href.slice(ADMIN_BASEPATH.length);
+	if (href.startsWith(`${ADMIN_BASEPATH}?`) || href.startsWith(`${ADMIN_BASEPATH}#`)) {
+		return `/${href.slice(ADMIN_BASEPATH.length)}`;
+	}
+	if (href.startsWith("/_emdash/")) return "";
+	return href;
+}
+
+function getAnchorHref(destination: string, routerDestination: string): string {
+	if (routerDestination.startsWith("/") && !routerDestination.startsWith("//")) {
+		if (
+			routerDestination === "/" ||
+			routerDestination.startsWith("/?") ||
+			routerDestination.startsWith("/#")
+		) {
+			return `${ADMIN_BASEPATH}${routerDestination.slice(1)}`;
+		}
+		return `${ADMIN_BASEPATH}${routerDestination}`;
+	}
+	return destination;
+}
+
+export const KumoRouterLink = React.forwardRef<HTMLAnchorElement, LinkComponentProps>(
+	({ href, to, target, download, children, ...props }, ref) => {
+		const destination = href ?? to ?? "";
+		const hasSearchOrHash = destination.includes("?") || destination.includes("#");
+		const routerDestination = normalizeAdminHref(destination);
+		const isRouterPath = routerDestination.startsWith("/") && !routerDestination.startsWith("//");
+		const shouldUseAnchor = !isRouterPath || hasSearchOrHash || target || download != null;
+		const linkProps = props as LinkComponentProps & {
+			"aria-current"?: React.AriaAttributes["aria-current"];
+			"data-active"?: boolean | string;
+			"data-kumo-component"?: string;
+		};
+		const ariaCurrent =
+			linkProps["aria-current"] ?? (linkProps["data-active"] ? "page" : undefined);
+
+		if (shouldUseAnchor) {
+			const anchorHref =
+				hasSearchOrHash && !target && download == null
+					? getAnchorHref(destination, routerDestination)
+					: destination;
+			return (
+				<a ref={ref} href={anchorHref} target={target} download={download} {...props}>
+					{children}
+				</a>
+			);
+		}
+
+		return (
+			<Link
+				// eslint-disable-next-line typescript/no-unsafe-type-assertion -- Kumo provides runtime hrefs; TanStack requires literal route types.
+				{...(props as Omit<LinkProps, "to" | "children">)}
+				ref={ref}
+				// eslint-disable-next-line typescript/no-unsafe-type-assertion -- Kumo provides runtime hrefs; TanStack requires literal route types.
+				to={routerDestination as "/"}
+				aria-current={ariaCurrent}
+				// A parent crumb's path contains the current page, which the router counts as active.
+				activeOptions={
+					linkProps["data-kumo-component"] === "Breadcrumbs" ? { exact: true } : undefined
+				}
+			>
+				{children}
+			</Link>
+		);
+	},
+);
+
+KumoRouterLink.displayName = "KumoRouterLink";
+
+export interface AdminAppProps {
+	/** Plugin admin modules keyed by plugin ID */
+	pluginAdmins?: PluginAdmins;
+	/** Auth provider UI modules keyed by provider ID */
+	authProviders?: AuthProviders;
+	/** Configured admin white-label branding (logo, site name) */
+	adminBranding?: AdminBranding;
+	/** Active locale code */
+	locale?: string;
+	/** Compiled Lingui messages for the active locale */
+	messages?: Messages;
+}
+
+/**
+ * Main Admin Application
+ */
+const EMPTY_PLUGINS: PluginAdmins = {};
+const EMPTY_AUTH_PROVIDERS: AuthProviders = {};
+const EMPTY_ADMIN_BRANDING: AdminBranding = {};
+
+export function AdminApp({
+	pluginAdmins = EMPTY_PLUGINS,
+	authProviders = EMPTY_AUTH_PROVIDERS,
+	adminBranding = EMPTY_ADMIN_BRANDING,
+	locale = "en",
+	messages = {},
+}: AdminAppProps) {
+	// Date locales can't be serialized from the server, so the first render waits
+	// for the active one. Otherwise calendars would render with the US week start
+	// and then shift. The timeout keeps a stalled request from blocking the admin.
+	const [dateLocaleReady, setDateLocaleReady] = React.useState(
+		() => getLoadedDateLocale(locale) !== undefined,
+	);
+	React.useEffect(() => {
+		if (dateLocaleReady) return;
+		let active = true;
+		void (async () => {
+			await waitForDateLocale(locale, DATE_LOCALE_BOOT_TIMEOUT_MS);
+			if (active) setDateLocaleReady(true);
+		})();
+		return () => {
+			active = false;
+		};
+	}, [locale, dateLocaleReady]);
+
+	React.useEffect(() => {
+		if (dateLocaleReady) document.getElementById("emdash-boot-loader")?.remove();
+	}, [dateLocaleReady]);
+
+	const i18nInitialized = React.useRef(false);
+	if (!i18nInitialized.current) {
+		i18n.loadAndActivate({ locale, messages });
+		i18nInitialized.current = true;
+	}
+
+	if (!dateLocaleReady) return null;
+
+	return (
+		<ThemeProvider>
+			<I18nProvider i18n={i18n}>
+				<LocaleDirectionProvider>
+					<KumoTranslationsProvider>
+						<Toasty>
+							<AdminBrandingProvider adminBranding={adminBranding}>
+								<AuthProviderProvider authProviders={authProviders}>
+									<PluginAdminProvider pluginAdmins={pluginAdmins}>
+										<QueryClientProvider client={queryClient}>
+											<LinkProvider component={KumoRouterLink}>
+												<RouterProvider router={router} />
+											</LinkProvider>
+										</QueryClientProvider>
+									</PluginAdminProvider>
+								</AuthProviderProvider>
+							</AdminBrandingProvider>
+						</Toasty>
+					</KumoTranslationsProvider>
+				</LocaleDirectionProvider>
+			</I18nProvider>
+		</ThemeProvider>
+	);
+}
+
+export default AdminApp;

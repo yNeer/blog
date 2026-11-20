@@ -1,0 +1,1669 @@
+/**
+ * Forms Plugin - Admin UI
+ *
+ * React components for the forms admin pages and dashboard widget.
+ * Communicates with the plugin's API routes via fetch.
+ */
+
+import { Badge, Button, Checkbox, Input, InputArea, Loader, Select } from "@cloudflare/kumo";
+import { LinguiContext } from "@lingui/react";
+import {
+	Plus,
+	Trash,
+	Copy,
+	Pause,
+	Play,
+	PencilSimple,
+	Star as StarIcon,
+	Eye,
+	Export,
+	Envelope,
+	ListBullets,
+	ArrowLeft,
+} from "@phosphor-icons/react";
+import type { PluginAdminExports } from "emdash";
+import { apiFetch as baseFetch, getErrorMessage, parseApiResponse } from "emdash/plugin-utils";
+import * as React from "react";
+
+import {
+	FORMS_LOAD_FAILED,
+	SUBMISSIONS_LOAD_FAILED,
+	formsLoadError,
+	submissionsLoadError,
+	writeError,
+} from "./admin-errors.js";
+import type { FieldCondition } from "./types.js";
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+const API = "/_emdash/api/plugins/emdash-forms";
+
+const NON_ALNUM_PATTERN = /[^a-z0-9]+/g;
+const LEADING_TRAILING_SEP = /^-|-$/g;
+const LEADING_UNDERSCORE_TRIM = /^_|_$/g;
+const LEADING_DIGIT = /^(\d)/;
+
+// =============================================================================
+// API Helpers
+// =============================================================================
+
+/** POST to a forms plugin API route with CSRF header. */
+function apiFetch(route: string, body?: unknown): Promise<Response> {
+	return baseFetch(`${API}/${route}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body ?? {}),
+	});
+}
+
+/**
+ * POST a write route. On a non-ok response or a thrown error, reports a message
+ * through `onError` (403 becomes a permission message) and returns null.
+ */
+async function apiWrite(
+	route: string,
+	body: unknown,
+	fallback: string,
+	onError: (message: string) => void,
+): Promise<Response | null> {
+	onError("");
+	try {
+		const res = await apiFetch(route, body);
+		if (res.ok) return res;
+		onError(writeError(res, fallback));
+	} catch {
+		onError(fallback);
+	}
+	return null;
+}
+
+// =============================================================================
+// Types (mirrors plugin types, kept minimal for admin use)
+// =============================================================================
+
+interface FormItem {
+	id: string;
+	name: string;
+	slug: string;
+	status: "active" | "paused";
+	submissionCount: number;
+	lastSubmissionAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+	pages: FormPage[];
+	settings: FormSettings;
+}
+
+interface FormPage {
+	title?: string;
+	fields: FormField[];
+}
+
+interface FormField {
+	id: string;
+	type: string;
+	label: string;
+	name: string;
+	placeholder?: string;
+	helpText?: string;
+	required: boolean;
+	validation?: Record<string, unknown>;
+	options?: Array<{ label: string; value: string }>;
+	defaultValue?: string;
+	condition?: FieldCondition;
+	width: "full" | "half";
+}
+
+interface EditorField extends FormField {
+	conditionFieldId?: string;
+}
+
+interface FormSettings {
+	confirmationMessage: string;
+	redirectUrl?: string;
+	notifyEmails: string[];
+	digestEnabled: boolean;
+	digestHour: number;
+	autoresponder?: { subject: string; body: string } | null;
+	webhookUrl?: string;
+	retentionDays: number;
+	spamProtection: "none" | "honeypot" | "turnstile";
+	submitLabel: string;
+}
+
+interface SubmissionItem {
+	id: string;
+	formId: string;
+	data: Record<string, unknown>;
+	status: "new" | "read" | "archived";
+	starred: boolean;
+	notes?: string;
+	createdAt: string;
+	meta: {
+		country: string | null;
+	};
+}
+
+// =============================================================================
+// Shared Helpers
+// =============================================================================
+
+function EmptyState({
+	icon: Icon,
+	title,
+	description,
+	action,
+}: {
+	icon: React.ElementType;
+	title: string;
+	description: string;
+	action?: React.ReactNode;
+}) {
+	return (
+		<div className="flex flex-col items-center justify-center py-16 text-center">
+			<Icon className="h-10 w-10 text-muted-foreground/50 mb-3" />
+			<h3 className="font-medium text-muted-foreground">{title}</h3>
+			<p className="text-sm text-muted-foreground/70 mt-1 max-w-sm">{description}</p>
+			{action && <div className="mt-4">{action}</div>}
+		</div>
+	);
+}
+
+function formatDate(iso: string): string {
+	return new Date(iso).toLocaleDateString(undefined, {
+		year: "numeric",
+		month: "short",
+		day: "numeric",
+	});
+}
+
+function formatDateTime(iso: string): string {
+	return new Date(iso).toLocaleString(undefined, {
+		year: "numeric",
+		month: "short",
+		day: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
+}
+
+function useEditorI18n() {
+	// Older hosts may load a separate Lingui context for plugin source.
+	return React.useContext(LinguiContext)?.i18n ?? { _: (message: string) => message };
+}
+
+function autoName(label: string): string {
+	return label
+		.toLowerCase()
+		.replace(NON_ALNUM_PATTERN, "_")
+		.replace(LEADING_UNDERSCORE_TRIM, "")
+		.replace(LEADING_DIGIT, "_$1");
+}
+
+function autoSlugify(value: string): string {
+	return value.toLowerCase().replace(NON_ALNUM_PATTERN, "-").replace(LEADING_TRAILING_SEP, "");
+}
+
+function stringifyValue(value: unknown): string {
+	if (value == null) return "";
+	if (typeof value === "string") return value;
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	return JSON.stringify(value);
+}
+
+// =============================================================================
+// Forms List Page
+// =============================================================================
+
+function FormsListPage() {
+	const [forms, setForms] = React.useState<FormItem[]>([]);
+	const [loading, setLoading] = React.useState(true);
+	const [error, setError] = React.useState<string | null>(null);
+	const [actionError, setActionError] = React.useState<string | null>(null);
+	const [editingForm, setEditingForm] = React.useState<FormItem | null>(null);
+	const [creating, setCreating] = React.useState(false);
+
+	const loadForms = React.useCallback(async () => {
+		try {
+			const res = await apiFetch("forms/list");
+			if (!res.ok) {
+				setError(formsLoadError(res));
+				return;
+			}
+			const data = await parseApiResponse<{ items: FormItem[] }>(res);
+			setForms(data.items);
+		} catch {
+			setError(FORMS_LOAD_FAILED);
+		} finally {
+			setLoading(false);
+		}
+	}, []);
+
+	React.useEffect(() => {
+		void loadForms();
+	}, [loadForms]);
+
+	const handleToggleStatus = async (form: FormItem) => {
+		const newStatus = form.status === "active" ? "paused" : "active";
+		const res = await apiWrite(
+			"forms/update",
+			{ id: form.id, status: newStatus },
+			"Failed to update form",
+			setActionError,
+		);
+		if (res) await loadForms();
+	};
+
+	const handleDuplicate = async (form: FormItem) => {
+		const res = await apiWrite(
+			"forms/duplicate",
+			{ id: form.id },
+			"Failed to duplicate form",
+			setActionError,
+		);
+		if (res) await loadForms();
+	};
+
+	const handleDelete = async (form: FormItem) => {
+		if (!confirm(`Delete "${form.name}" and all its submissions?`)) return;
+		const res = await apiWrite(
+			"forms/delete",
+			{ id: form.id, deleteSubmissions: true },
+			"Failed to delete form",
+			setActionError,
+		);
+		if (res) await loadForms();
+	};
+
+	if (editingForm || creating) {
+		return (
+			<FormEditor
+				form={editingForm}
+				onSave={async () => {
+					setEditingForm(null);
+					setCreating(false);
+					await loadForms();
+				}}
+				onCancel={() => {
+					setEditingForm(null);
+					setCreating(false);
+				}}
+			/>
+		);
+	}
+
+	if (loading) {
+		return (
+			<div className="flex items-center justify-center py-16">
+				<Loader />
+			</div>
+		);
+	}
+
+	if (error) {
+		return (
+			<div className="rounded-lg border border-destructive/50 bg-destructive/5 p-4 text-sm text-destructive">
+				{error}
+			</div>
+		);
+	}
+
+	return (
+		<div className="space-y-6">
+			<div className="flex items-center justify-between">
+				<div>
+					<h1 className="text-3xl font-bold">Forms</h1>
+					<p className="text-muted-foreground mt-1">Create and manage forms</p>
+				</div>
+				<Button icon={<Plus />} onClick={() => setCreating(true)}>
+					New Form
+				</Button>
+			</div>
+
+			{actionError && (
+				<div
+					role="alert"
+					className="rounded-lg border border-destructive/50 bg-destructive/5 p-4 text-sm text-destructive"
+				>
+					{actionError}
+				</div>
+			)}
+
+			{forms.length === 0 ? (
+				<EmptyState
+					icon={ListBullets}
+					title="No forms yet"
+					description="Create your first form to start collecting submissions."
+					action={
+						<Button icon={<Plus />} onClick={() => setCreating(true)}>
+							Create Form
+						</Button>
+					}
+				/>
+			) : (
+				<div className="border rounded-lg overflow-x-auto">
+					<table className="w-full text-sm">
+						<thead>
+							<tr className="border-b bg-muted/50">
+								<th className="text-start p-3 font-medium">Name</th>
+								<th className="text-start p-3 font-medium">Slug</th>
+								<th className="text-start p-3 font-medium">Status</th>
+								<th className="text-end p-3 font-medium">Submissions</th>
+								<th className="text-start p-3 font-medium">Last Submission</th>
+								<th className="text-end p-3 font-medium">Actions</th>
+							</tr>
+						</thead>
+						<tbody>
+							{forms.map((form) => (
+								<tr key={form.id} className="border-b last:border-0 hover:bg-muted/30">
+									<td className="p-3 font-medium">{form.name}</td>
+									<td className="p-3 text-muted-foreground font-mono text-xs">{form.slug}</td>
+									<td className="p-3">
+										<Badge variant={form.status === "active" ? "success" : "warning"}>
+											{form.status}
+										</Badge>
+									</td>
+									<td className="p-3 text-end tabular-nums">{form.submissionCount}</td>
+									<td className="p-3 text-muted-foreground">
+										{form.lastSubmissionAt ? formatDate(form.lastSubmissionAt) : "Never"}
+									</td>
+									<td className="p-3">
+										<div className="flex items-center justify-end gap-1">
+											<Button
+												variant="ghost"
+												shape="square"
+												onClick={() => setEditingForm(form)}
+												aria-label="Edit"
+											>
+												<PencilSimple className="h-4 w-4" />
+											</Button>
+											<Button
+												variant="ghost"
+												shape="square"
+												onClick={() => void handleToggleStatus(form)}
+												aria-label={form.status === "active" ? "Pause" : "Resume"}
+											>
+												{form.status === "active" ? (
+													<Pause className="h-4 w-4" />
+												) : (
+													<Play className="h-4 w-4" />
+												)}
+											</Button>
+											<Button
+												variant="ghost"
+												shape="square"
+												onClick={() => void handleDuplicate(form)}
+												aria-label="Duplicate"
+											>
+												<Copy className="h-4 w-4" />
+											</Button>
+											<Button
+												variant="ghost"
+												shape="square"
+												onClick={() => void handleDelete(form)}
+												aria-label="Delete"
+												className="text-destructive"
+											>
+												<Trash className="h-4 w-4" />
+											</Button>
+										</div>
+									</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+			)}
+		</div>
+	);
+}
+
+// =============================================================================
+// Form Editor (used for both create and edit)
+// =============================================================================
+
+const FIELD_TYPES = [
+	"text",
+	"email",
+	"textarea",
+	"number",
+	"tel",
+	"url",
+	"date",
+	"select",
+	"radio",
+	"checkbox",
+	"checkbox-group",
+	"file",
+	"hidden",
+] as const;
+
+const FIELD_TYPE_ITEMS = FIELD_TYPES.map((t) => ({ label: t, value: t }));
+
+const SPAM_ITEMS = [
+	{ label: "None", value: "none" },
+	{ label: "Honeypot", value: "honeypot" },
+	{ label: "Turnstile", value: "turnstile" },
+];
+
+const WIDTH_ITEMS = [
+	{ label: "Full", value: "full" },
+	{ label: "Half", value: "half" },
+];
+
+function FormEditor({
+	form,
+	onSave,
+	onCancel,
+}: {
+	form: FormItem | null;
+	onSave: () => void;
+	onCancel: () => void;
+}) {
+	const i18n = useEditorI18n();
+	const [name, setName] = React.useState(form?.name ?? "");
+	const [slug, setSlug] = React.useState(form?.slug ?? "");
+	const [fields, setFields] = React.useState<EditorField[]>(() => {
+		const initialFields = form?.pages[0]?.fields ?? [];
+		return initialFields.map((field) => ({
+			...field,
+			conditionFieldId: field.condition
+				? initialFields.find((controller) => controller.name === field.condition?.field)?.id
+				: undefined,
+		}));
+	});
+	const [settings, setSettings] = React.useState<Partial<FormSettings>>(form?.settings ?? {});
+	const [autoresponderEnabled, setAutoresponderEnabled] = React.useState(
+		form?.settings.autoresponder != null,
+	);
+	const [autoresponderDraft, setAutoresponderDraft] = React.useState(
+		form?.settings.autoresponder ?? { subject: "", body: "" },
+	);
+	const [saving, setSaving] = React.useState(false);
+	const [error, setError] = React.useState<string | null>(null);
+	const [turnstileStatus, setTurnstileStatus] = React.useState<{
+		hasSiteKey: boolean;
+		hasSecretKey: boolean;
+	} | null>(null);
+
+	const spamProtection = settings.spamProtection ?? "honeypot";
+
+	React.useEffect(() => {
+		if (spamProtection !== "turnstile") return;
+		void (async () => {
+			try {
+				const res = await apiFetch("settings/turnstile-status");
+				if (res.ok) {
+					setTurnstileStatus(await parseApiResponse(res));
+				}
+			} catch {
+				// ignore — warning just won't show
+			}
+		})();
+	}, [spamProtection]);
+
+	const isNew = !form;
+
+	const handleNameChange = (value: string) => {
+		setName(value);
+		if (isNew) {
+			setSlug(autoSlugify(value));
+		}
+	};
+
+	const addField = () => {
+		setFields((prev) => [
+			...prev,
+			{
+				id: crypto.randomUUID(),
+				type: "text",
+				label: "",
+				name: "",
+				required: false,
+				width: "full" as const,
+			},
+		]);
+	};
+
+	const updateField = (index: number, updates: Partial<EditorField>) => {
+		setFields((prev) =>
+			prev.map((field, i) => {
+				const updated = i === index ? { ...field, ...updates } : field;
+				if (
+					updates.name !== undefined &&
+					updated.condition &&
+					updated.conditionFieldId === prev[index]?.id
+				) {
+					return { ...updated, condition: { ...updated.condition, field: updates.name } };
+				}
+				return updated;
+			}),
+		);
+	};
+
+	const removeField = (index: number) => {
+		setFields((prev) =>
+			prev
+				.filter((_, i) => i !== index)
+				.map((field) =>
+					field.conditionFieldId === prev[index]?.id
+						? { ...field, condition: undefined, conditionFieldId: undefined }
+						: field,
+				),
+		);
+	};
+
+	const moveField = (index: number, direction: -1 | 1) => {
+		const target = index + direction;
+		if (target < 0 || target >= fields.length) return;
+		setFields((prev) => {
+			const next = [...prev];
+			[next[index], next[target]] = [next[target]!, next[index]!];
+			return next;
+		});
+	};
+
+	const handleSave = async () => {
+		if (!name.trim() || !slug.trim()) {
+			setError("Name and slug are required");
+			return;
+		}
+		if (fields.length === 0) {
+			setError("At least one field is required");
+			return;
+		}
+		for (const f of fields) {
+			if (!f.label.trim() || !f.name.trim()) {
+				setError("All fields must have a label and name");
+				return;
+			}
+		}
+
+		if (
+			autoresponderEnabled &&
+			(!autoresponderDraft.subject.trim() || !autoresponderDraft.body.trim())
+		) {
+			setError(i18n._("Autoresponder subject and body are required"));
+			return;
+		}
+
+		setSaving(true);
+		setError(null);
+
+		const savedSettings = {
+			...settings,
+			autoresponder: autoresponderEnabled ? autoresponderDraft : form ? null : undefined,
+		};
+		const savedFields = fields.map(({ conditionFieldId: _controllerId, ...field }) => field);
+		const payload = form
+			? {
+					id: form.id,
+					name,
+					slug,
+					pages: [{ fields: savedFields }],
+					settings: savedSettings,
+				}
+			: {
+					name,
+					slug,
+					pages: [{ fields: savedFields }],
+					settings: {
+						confirmationMessage: "Thank you for your submission.",
+						notifyEmails: [],
+						digestEnabled: false,
+						digestHour: 9,
+						retentionDays: 0,
+						spamProtection: "honeypot",
+						submitLabel: "Submit",
+						...savedSettings,
+					},
+				};
+
+		try {
+			const route = form ? "forms/update" : "forms/create";
+			const res = await apiFetch(route, payload);
+			if (!res.ok) {
+				setError(await getErrorMessage(res, "Failed to save form"));
+				return;
+			}
+			onSave();
+		} catch {
+			setError("Failed to save form");
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	return (
+		<div className="space-y-6">
+			<div className="flex items-center gap-3">
+				<Button variant="ghost" shape="square" onClick={onCancel} aria-label="Back">
+					<ArrowLeft className="h-5 w-5 rtl:-scale-x-100" />
+				</Button>
+				<div>
+					<h1 className="text-3xl font-bold">{form ? "Edit Form" : "New Form"}</h1>
+					{form && <p className="text-muted-foreground mt-0.5 text-sm">Editing: {form.name}</p>}
+				</div>
+			</div>
+
+			{error && (
+				<div className="rounded-lg border border-destructive/50 bg-destructive/5 p-3 text-sm text-destructive">
+					{error}
+				</div>
+			)}
+
+			{/* Name & Slug */}
+			<div className="grid grid-cols-2 gap-4">
+				<Input
+					label="Name"
+					value={name}
+					onChange={(e) => handleNameChange(e.target.value)}
+					placeholder="Contact Form"
+				/>
+				<Input
+					label="Slug"
+					value={slug}
+					onChange={(e) => setSlug(e.target.value)}
+					placeholder="contact-form"
+				/>
+			</div>
+
+			{/* Fields */}
+			<div>
+				<div className="flex items-center justify-between mb-3">
+					<h2 className="text-lg font-semibold">Fields</h2>
+					<Button variant="outline" icon={<Plus />} onClick={addField}>
+						Add Field
+					</Button>
+				</div>
+
+				{fields.length === 0 ? (
+					<div className="border border-dashed rounded-lg p-8 text-center text-sm text-muted-foreground">
+						No fields yet. Click "Add Field" to get started.
+					</div>
+				) : (
+					<div className="space-y-3">
+						{fields.map((field, index) => (
+							<FieldRow
+								key={field.id}
+								field={field}
+								fields={fields}
+								index={index}
+								total={fields.length}
+								onChange={(updates) => updateField(index, updates)}
+								onRemove={() => removeField(index)}
+								onMove={(dir) => moveField(index, dir)}
+							/>
+						))}
+					</div>
+				)}
+			</div>
+
+			{/* Settings */}
+			<div>
+				<h2 className="text-lg font-semibold mb-3">Settings</h2>
+				<div className="grid grid-cols-2 gap-4">
+					<Input
+						label="Confirmation Message"
+						value={settings.confirmationMessage ?? "Thank you for your submission."}
+						onChange={(e) =>
+							setSettings((s) => ({
+								...s,
+								confirmationMessage: e.target.value,
+							}))
+						}
+					/>
+					<Input
+						label="Submit Button Label"
+						value={settings.submitLabel ?? "Submit"}
+						onChange={(e) => setSettings((s) => ({ ...s, submitLabel: e.target.value }))}
+					/>
+					<div>
+						<Select
+							label="Spam Protection"
+							hideLabel={false}
+							value={spamProtection}
+							onValueChange={(v) =>
+								setSettings((s) => ({
+									...s,
+									spamProtection: (v ?? "honeypot") as FormSettings["spamProtection"],
+								}))
+							}
+							items={SPAM_ITEMS}
+						/>
+					</div>
+					{spamProtection === "turnstile" &&
+						turnstileStatus &&
+						(!turnstileStatus.hasSiteKey || !turnstileStatus.hasSecretKey) && (
+							<div className="col-span-2 rounded-lg border border-yellow-500/50 bg-yellow-500/5 p-3 text-sm text-yellow-200">
+								Turnstile requires a site key and secret key.{" "}
+								{!turnstileStatus.hasSiteKey && !turnstileStatus.hasSecretKey
+									? "Neither is configured."
+									: !turnstileStatus.hasSiteKey
+										? "Site key is missing."
+										: "Secret key is missing."}{" "}
+								Set them in the plugin settings.
+							</div>
+						)}
+					<Input
+						label="Retention (days, 0 = forever)"
+						type="number"
+						value={String(settings.retentionDays ?? 0)}
+						onChange={(e) =>
+							setSettings((s) => ({
+								...s,
+								retentionDays: parseInt(e.target.value) || 0,
+							}))
+						}
+					/>
+					<Checkbox
+						label={i18n._("Daily digest")}
+						checked={settings.digestEnabled ?? false}
+						onCheckedChange={(checked) => setSettings((s) => ({ ...s, digestEnabled: checked }))}
+					/>
+					{settings.digestEnabled && (
+						<Select
+							label={i18n._("Digest hour (UTC)")}
+							hideLabel={false}
+							value={String(settings.digestHour ?? 9)}
+							onValueChange={(v) => setSettings((s) => ({ ...s, digestHour: Number(v ?? 9) }))}
+							items={Array.from({ length: 24 }, (_, hour) => ({
+								label: `${String(hour).padStart(2, "0")}:00`,
+								value: String(hour),
+							}))}
+						/>
+					)}
+					<p className="col-span-2 text-sm text-kumo-subtle">
+						{i18n._(
+							"Send a daily summary to the notification recipients instead of an email for each submission. Email must be configured.",
+						)}
+					</p>
+					<div className="col-span-2 space-y-3">
+						<Checkbox
+							label={i18n._("Send an autoresponder")}
+							checked={autoresponderEnabled}
+							onCheckedChange={setAutoresponderEnabled}
+						/>
+						<p className="text-sm text-kumo-subtle">
+							{i18n._(
+								"Send a reply to the first email field in the form. Email must be configured.",
+							)}
+						</p>
+						{autoresponderEnabled && (
+							<>
+								<Input
+									label={i18n._("Autoresponder subject")}
+									value={autoresponderDraft.subject}
+									onChange={(e) =>
+										setAutoresponderDraft((draft) => ({ ...draft, subject: e.target.value }))
+									}
+								/>
+								<InputArea
+									label={i18n._("Autoresponder body")}
+									value={autoresponderDraft.body}
+									onChange={(e) =>
+										setAutoresponderDraft((draft) => ({ ...draft, body: e.target.value }))
+									}
+								/>
+							</>
+						)}
+					</div>
+					<div className="col-span-2">
+						<Input
+							label={i18n._("Webhook URL (optional)")}
+							type="url"
+							value={settings.webhookUrl ?? ""}
+							onChange={(e) => setSettings((s) => ({ ...s, webhookUrl: e.target.value }))}
+						/>
+					</div>
+					<div className="col-span-2">
+						<Input
+							label="Redirect URL (optional)"
+							type="url"
+							value={settings.redirectUrl ?? ""}
+							onChange={(e) => setSettings((s) => ({ ...s, redirectUrl: e.target.value }))}
+							placeholder="https://example.com/thank-you"
+						/>
+					</div>
+				</div>
+			</div>
+
+			{/* Actions */}
+			<div className="flex items-center gap-3 pt-4 border-t">
+				<Button onClick={() => void handleSave()} disabled={saving}>
+					{saving && <Loader />}
+					{form ? "Save Changes" : "Create Form"}
+				</Button>
+				<Button variant="outline" onClick={onCancel}>
+					Cancel
+				</Button>
+			</div>
+		</div>
+	);
+}
+
+// =============================================================================
+// Field Row (inline field editor within FormEditor)
+// =============================================================================
+
+function FieldRow({
+	field,
+	fields,
+	index,
+	total,
+	onChange,
+	onRemove,
+	onMove,
+}: {
+	field: EditorField;
+	fields: EditorField[];
+	index: number;
+	total: number;
+	onChange: (updates: Partial<EditorField>) => void;
+	onRemove: () => void;
+	onMove: (direction: -1 | 1) => void;
+}) {
+	const i18n = useEditorI18n();
+	const conditionFields = fields.filter(
+		(f) =>
+			f.id !== field.id &&
+			((f.name && !["checkbox-group", "file"].includes(f.type)) || f.id === field.conditionFieldId),
+	);
+	const conditionItems = [
+		{ label: i18n._("Always visible"), value: "" },
+		...conditionFields.map((f) => ({
+			label: f.name ? `${f.label} (${f.name})` : f.label || i18n._("Unnamed field"),
+			value: `id:${f.id}`,
+		})),
+	];
+	const conditionValue = field.conditionFieldId
+		? `id:${field.conditionFieldId}`
+		: field.condition
+			? `name:${field.condition.field}`
+			: "";
+	if (field.condition && !conditionItems.some((item) => item.value === conditionValue)) {
+		conditionItems.push({ label: field.condition.field, value: conditionValue });
+	}
+	const needsOptions = ["select", "radio", "checkbox-group"].includes(field.type);
+
+	const handleLabelChange = (label: string) => {
+		const updates: Partial<FormField> = { label };
+		if (!field.name || field.name === autoName(field.label)) {
+			updates.name = autoName(label);
+		}
+		onChange(updates);
+	};
+
+	return (
+		<div className="border rounded-lg p-3 space-y-3">
+			<div className="flex items-start gap-2">
+				<span className="text-xs text-muted-foreground font-mono w-6 text-center pt-8">
+					{index + 1}
+				</span>
+				<div className="flex-1 space-y-2">
+					<div className="grid grid-cols-2 gap-2">
+						<Input
+							label="Label"
+							value={field.label}
+							onChange={(e) => handleLabelChange(e.target.value)}
+						/>
+						<Input
+							label="Name"
+							value={field.name}
+							onChange={(e) => onChange({ name: e.target.value })}
+						/>
+					</div>
+					<div className="flex items-end gap-4">
+						<Select
+							label="Type"
+							hideLabel={false}
+							value={field.type}
+							onValueChange={(v) => onChange({ type: v ?? "text" })}
+							items={FIELD_TYPE_ITEMS}
+						/>
+						<Select
+							label="Width"
+							hideLabel={false}
+							value={field.width}
+							onValueChange={(v) => onChange({ width: v ?? "full" })}
+							items={WIDTH_ITEMS}
+						/>
+						<div className="flex h-9 items-center">
+							<Checkbox
+								label="Required"
+								checked={field.required}
+								onCheckedChange={(checked) => onChange({ required: checked })}
+							/>
+						</div>
+					</div>
+				</div>
+				<div className="flex items-center gap-0.5 pt-6">
+					<Button
+						variant="ghost"
+						shape="square"
+						onClick={() => onMove(-1)}
+						disabled={index === 0}
+						aria-label="Move up"
+					>
+						&#9650;
+					</Button>
+					<Button
+						variant="ghost"
+						shape="square"
+						onClick={() => onMove(1)}
+						disabled={index === total - 1}
+						aria-label="Move down"
+					>
+						&#9660;
+					</Button>
+					<Button
+						variant="ghost"
+						shape="square"
+						onClick={onRemove}
+						aria-label="Remove"
+						className="text-destructive"
+					>
+						<Trash className="h-3.5 w-3.5" />
+					</Button>
+				</div>
+			</div>
+
+			<div className="ms-8 grid grid-cols-1 sm:grid-cols-2 gap-3">
+				{(["text", "email", "textarea", "number", "tel", "url"].includes(field.type) ||
+					(field.type === "select" && field.required)) && (
+					<Input
+						label={i18n._("Placeholder")}
+						value={field.placeholder ?? ""}
+						onChange={(e) => onChange({ placeholder: e.target.value })}
+					/>
+				)}
+				{field.type !== "hidden" && (
+					<Input
+						label={i18n._("Help text")}
+						value={field.helpText ?? ""}
+						onChange={(e) => onChange({ helpText: e.target.value })}
+					/>
+				)}
+				{!["checkbox", "checkbox-group", "file"].includes(field.type) && (
+					<Input
+						label={i18n._("Default value")}
+						value={field.defaultValue ?? ""}
+						onChange={(e) => onChange({ defaultValue: e.target.value })}
+					/>
+				)}
+			</div>
+			<div className="ms-8 grid grid-cols-1 sm:grid-cols-3 gap-3">
+				<Select
+					label={i18n._("Show when field")}
+					hideLabel={false}
+					value={conditionValue}
+					items={conditionItems}
+					onValueChange={(value) => {
+						if (!value) {
+							onChange({ condition: undefined, conditionFieldId: undefined });
+							return;
+						}
+						const controller = conditionFields.find((f) => `id:${f.id}` === value);
+						if (!controller) return;
+						onChange({
+							conditionFieldId: controller.id,
+							condition: {
+								field: controller.name,
+								op: field.condition?.op ?? "filled",
+								value: field.condition?.value ?? "",
+							},
+						});
+					}}
+				/>
+				{field.condition && (
+					<>
+						<Select
+							label={i18n._("Condition operator")}
+							hideLabel={false}
+							value={field.condition.op}
+							items={[
+								{ label: i18n._("Equals"), value: "eq" },
+								{ label: i18n._("Does not equal"), value: "neq" },
+								{ label: i18n._("Is filled"), value: "filled" },
+								{ label: i18n._("Is empty"), value: "empty" },
+							]}
+							onValueChange={(op) =>
+								onChange({
+									condition: { ...field.condition!, op: (op ?? "eq") as FieldCondition["op"] },
+								})
+							}
+						/>
+						{["eq", "neq"].includes(field.condition.op) && (
+							<Input
+								label={i18n._("Condition value")}
+								value={field.condition.value ?? ""}
+								onChange={(e) =>
+									onChange({ condition: { ...field.condition!, value: e.target.value } })
+								}
+							/>
+						)}
+					</>
+				)}
+			</div>
+
+			{needsOptions && (
+				<OptionsEditor
+					options={field.options ?? []}
+					onChange={(options) => onChange({ options })}
+				/>
+			)}
+		</div>
+	);
+}
+
+function OptionsEditor({
+	options,
+	onChange,
+}: {
+	options: Array<{ label: string; value: string }>;
+	onChange: (options: Array<{ label: string; value: string }>) => void;
+}) {
+	const addOption = () => onChange([...options, { label: "", value: "" }]);
+	const updateOption = (index: number, updates: Partial<{ label: string; value: string }>) => {
+		const next = options.map((o, i) => {
+			if (i !== index) return o;
+			const updated = { ...o, ...updates };
+			if (updates.label && (!o.value || o.value === autoName(o.label))) {
+				updated.value = autoName(updates.label);
+			}
+			return updated;
+		});
+		onChange(next);
+	};
+	const removeOption = (index: number) => onChange(options.filter((_, i) => i !== index));
+
+	return (
+		<div className="ms-8 space-y-1">
+			<span className="text-xs text-muted-foreground">Options:</span>
+			{options.map((opt, i) => (
+				<div key={i} className="flex items-center gap-2">
+					<Input
+						value={opt.label}
+						onChange={(e) => updateOption(i, { label: e.target.value })}
+						placeholder="Label"
+					/>
+					<Input
+						value={opt.value}
+						onChange={(e) => updateOption(i, { value: e.target.value })}
+						placeholder="value"
+					/>
+					<Button
+						variant="ghost"
+						shape="square"
+						onClick={() => removeOption(i)}
+						className="text-destructive"
+						aria-label="Remove option"
+					>
+						<Trash className="h-3 w-3" />
+					</Button>
+				</div>
+			))}
+			<button
+				type="button"
+				onClick={addOption}
+				className="text-xs text-muted-foreground hover:text-foreground"
+			>
+				+ Add option
+			</button>
+		</div>
+	);
+}
+
+// =============================================================================
+// Submissions Page
+// =============================================================================
+
+function latestSubmittedForm(forms: FormItem[]): FormItem | undefined {
+	let latest: FormItem | undefined;
+	for (const form of forms) {
+		if (form.submissionCount === 0) continue;
+		if (!latest || (form.lastSubmissionAt ?? "") > (latest.lastSubmissionAt ?? "")) {
+			latest = form;
+		}
+	}
+	return latest ?? forms[0];
+}
+
+function SubmissionsPage() {
+	const [forms, setForms] = React.useState<FormItem[]>([]);
+	const [selectedFormId, setSelectedFormId] = React.useState<string>("");
+	const [submissions, setSubmissions] = React.useState<SubmissionItem[]>([]);
+	const [canManage, setCanManage] = React.useState(false);
+	const [statusFilter, setStatusFilter] = React.useState<string>("");
+	const [loading, setLoading] = React.useState(true);
+	const [subsLoading, setSubsLoading] = React.useState(false);
+	const [selectedSub, setSelectedSub] = React.useState<SubmissionItem | null>(null);
+	const [error, setError] = React.useState<string | null>(null);
+	const [subsError, setSubsError] = React.useState<string | null>(null);
+	const [actionError, setActionError] = React.useState<string | null>(null);
+
+	React.useEffect(() => {
+		void (async () => {
+			try {
+				const res = await apiFetch("forms/list");
+				if (!res.ok) {
+					setError(formsLoadError(res));
+					return;
+				}
+				const data = await parseApiResponse<{ items: FormItem[] }>(res);
+				setForms(data.items);
+				const initialForm = latestSubmittedForm(data.items);
+				if (initialForm) {
+					setSelectedFormId(initialForm.id);
+				}
+			} catch {
+				setError(FORMS_LOAD_FAILED);
+			} finally {
+				setLoading(false);
+			}
+		})();
+	}, []);
+
+	React.useEffect(() => {
+		if (!selectedFormId) return;
+		let stale = false;
+		setSubsLoading(true);
+		setCanManage(false);
+		setSubsError(null);
+		setActionError(null);
+		setSelectedSub(null);
+		void (async () => {
+			try {
+				const body: Record<string, unknown> = {
+					formId: selectedFormId,
+					limit: 50,
+				};
+				if (statusFilter) body.status = statusFilter;
+				const res = await apiFetch("submissions/list", body);
+				if (stale) return;
+				if (!res.ok) {
+					setSubmissions([]);
+					setSubsError(submissionsLoadError(res));
+					return;
+				}
+				const data = await parseApiResponse<{
+					items: SubmissionItem[];
+					canManage?: boolean;
+				}>(res);
+				if (stale) return;
+				setSubmissions(data.items);
+				setCanManage(data.canManage === true);
+			} catch {
+				if (stale) return;
+				setSubmissions([]);
+				setSubsError(SUBMISSIONS_LOAD_FAILED);
+			} finally {
+				if (!stale) setSubsLoading(false);
+			}
+		})();
+		return () => {
+			stale = true;
+		};
+	}, [selectedFormId, statusFilter]);
+
+	const handleToggleStar = async (sub: SubmissionItem) => {
+		const res = await apiWrite(
+			"submissions/update",
+			{ id: sub.id, starred: !sub.starred },
+			"Failed to update submission",
+			setActionError,
+		);
+		if (res) {
+			setSubmissions((prev) =>
+				prev.map((s) => (s.id === sub.id ? { ...s, starred: !s.starred } : s)),
+			);
+			if (selectedSub?.id === sub.id) setSelectedSub({ ...selectedSub, starred: !sub.starred });
+		}
+	};
+
+	const handleMarkRead = async (sub: SubmissionItem) => {
+		const newStatus = sub.status === "new" ? "read" : sub.status === "read" ? "archived" : "new";
+		const res = await apiWrite(
+			"submissions/update",
+			{ id: sub.id, status: newStatus },
+			"Failed to update submission",
+			setActionError,
+		);
+		if (res) {
+			setSubmissions((prev) =>
+				prev.map((s) => (s.id === sub.id ? { ...s, status: newStatus } : s)),
+			);
+			if (selectedSub?.id === sub.id) setSelectedSub({ ...selectedSub, status: newStatus });
+		}
+	};
+
+	const handleDelete = async (sub: SubmissionItem) => {
+		if (!confirm("Delete this submission?")) return;
+		const res = await apiWrite(
+			"submissions/delete",
+			{ id: sub.id },
+			"Failed to delete submission",
+			setActionError,
+		);
+		if (res) {
+			setSubmissions((prev) => prev.filter((s) => s.id !== sub.id));
+			if (selectedSub?.id === sub.id) setSelectedSub(null);
+		}
+	};
+
+	const handleExport = async (format: "csv" | "json") => {
+		if (!selectedFormId) return;
+		const res = await apiWrite(
+			"submissions/export",
+			{ formId: selectedFormId, format },
+			"Failed to export submissions",
+			setActionError,
+		);
+		if (!res) return;
+		try {
+			const data = await parseApiResponse<{ data: string; filename?: string }>(res);
+			const blob = new Blob([format === "csv" ? data.data : JSON.stringify(data.data, null, 2)], {
+				type: format === "csv" ? "text/csv" : "application/json",
+			});
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement("a");
+			a.href = url;
+			a.download = data.filename ?? `submissions.${format}`;
+			a.click();
+			URL.revokeObjectURL(url);
+		} catch {
+			setActionError("Failed to export submissions");
+		}
+	};
+
+	if (loading) {
+		return (
+			<div className="flex items-center justify-center py-16">
+				<Loader />
+			</div>
+		);
+	}
+
+	if (error) {
+		return (
+			<div className="space-y-6">
+				<h1 className="text-3xl font-bold">Submissions</h1>
+				<div className="rounded-lg border border-destructive/50 bg-destructive/5 p-4 text-sm text-destructive">
+					{error}
+				</div>
+			</div>
+		);
+	}
+
+	if (forms.length === 0) {
+		return (
+			<div className="space-y-6">
+				<h1 className="text-3xl font-bold">Submissions</h1>
+				<EmptyState
+					icon={Envelope}
+					title="No forms yet"
+					description="Create a form first, then submissions will appear here."
+				/>
+			</div>
+		);
+	}
+
+	const selectedForm = forms.find((f) => f.id === selectedFormId);
+	const formItems = forms.map((f) => ({ label: f.name, value: f.id }));
+	const statusItems = [
+		{ label: "All Status", value: "" },
+		{ label: "New", value: "new" },
+		{ label: "Read", value: "read" },
+		{ label: "Archived", value: "archived" },
+	];
+
+	return (
+		<div className="space-y-6">
+			<div className="flex items-center justify-between">
+				<h1 className="text-3xl font-bold">Submissions</h1>
+				{canManage && (
+					<div className="flex items-center gap-2">
+						<Button
+							variant="outline"
+							icon={<Export />}
+							onClick={() => void handleExport("csv")}
+							disabled={submissions.length === 0}
+						>
+							CSV
+						</Button>
+						<Button
+							variant="outline"
+							icon={<Export />}
+							onClick={() => void handleExport("json")}
+							disabled={submissions.length === 0}
+						>
+							JSON
+						</Button>
+					</div>
+				)}
+			</div>
+
+			{actionError && (
+				<div
+					role="alert"
+					className="rounded-lg border border-destructive/50 bg-destructive/5 p-4 text-sm text-destructive"
+				>
+					{actionError}
+				</div>
+			)}
+
+			{/* Filters */}
+			<div className="flex items-center gap-3">
+				<div className="w-56">
+					<Select
+						value={selectedFormId}
+						onValueChange={(v) => setSelectedFormId(v ?? "")}
+						items={formItems}
+						aria-label="Select form"
+					/>
+				</div>
+				<div className="w-40">
+					<Select
+						value={statusFilter}
+						onValueChange={(v) => setStatusFilter(v ?? "")}
+						items={statusItems}
+						aria-label="Filter by status"
+					/>
+				</div>
+				{selectedForm && (
+					<span className="text-sm text-muted-foreground">
+						{selectedForm.submissionCount} total
+					</span>
+				)}
+			</div>
+
+			<div className="flex gap-6">
+				{/* Submissions table */}
+				<div className="flex-1 min-w-0">
+					{subsLoading ? (
+						<div className="flex items-center justify-center py-8">
+							<Loader />
+						</div>
+					) : subsError ? (
+						<div
+							role="alert"
+							className="rounded-lg border border-destructive/50 bg-destructive/5 p-4 text-sm text-destructive"
+						>
+							{subsError}
+						</div>
+					) : submissions.length === 0 ? (
+						<EmptyState
+							icon={Envelope}
+							title="No submissions"
+							description={
+								statusFilter
+									? "No submissions match the current filter."
+									: "This form hasn't received any submissions yet."
+							}
+						/>
+					) : (
+						<div className="border rounded-lg overflow-x-auto">
+							<table className="w-full text-sm">
+								<thead>
+									<tr className="border-b bg-muted/50">
+										<th className="w-8 p-3" />
+										<th className="text-start p-3 font-medium">Date</th>
+										<th className="text-start p-3 font-medium">Preview</th>
+										<th className="text-start p-3 font-medium">Status</th>
+										{canManage && <th className="text-end p-3 font-medium">Actions</th>}
+									</tr>
+								</thead>
+								<tbody>
+									{submissions.map((sub) => {
+										const previewValues = Object.entries(sub.data)
+											.filter(([, v]) => typeof v === "string" && v.length > 0)
+											.slice(0, 2)
+											.map(([, v]) => String(v))
+											.join(" / ");
+
+										return (
+											<tr
+												key={sub.id}
+												className={`border-b last:border-0 hover:bg-muted/30 cursor-pointer ${
+													selectedSub?.id === sub.id ? "bg-muted/50" : ""
+												}`}
+												onClick={() => setSelectedSub(sub)}
+											>
+												<td className="p-3">
+													{canManage ? (
+														<button
+															type="button"
+															onClick={(e) => {
+																e.stopPropagation();
+																void handleToggleStar(sub);
+															}}
+															className="text-yellow-500 hover:text-yellow-600"
+														>
+															{sub.starred ? (
+																<StarIcon className="h-4 w-4" weight="fill" />
+															) : (
+																<StarIcon className="h-4 w-4" />
+															)}
+														</button>
+													) : (
+														<span className="text-yellow-500" aria-hidden="true">
+															<StarIcon
+																className="h-4 w-4"
+																weight={sub.starred ? "fill" : "regular"}
+															/>
+														</span>
+													)}
+												</td>
+												<td className="p-3 text-muted-foreground whitespace-nowrap">
+													{formatDate(sub.createdAt)}
+												</td>
+												<td className="p-3 truncate max-w-xs">
+													{previewValues || (
+														<span className="text-muted-foreground italic">Empty</span>
+													)}
+												</td>
+												<td className="p-3">
+													<Badge
+														variant={
+															sub.status === "new"
+																? "success"
+																: sub.status === "archived"
+																	? "default"
+																	: "warning"
+														}
+													>
+														{sub.status}
+													</Badge>
+												</td>
+												{canManage && (
+													<td className="p-3 text-end">
+														<div className="flex items-center justify-end gap-1">
+															<Button
+																variant="ghost"
+																shape="square"
+																onClick={(e: React.MouseEvent) => {
+																	e.stopPropagation();
+																	void handleMarkRead(sub);
+																}}
+																aria-label="Toggle status"
+															>
+																<Eye className="h-4 w-4" />
+															</Button>
+															<Button
+																variant="ghost"
+																shape="square"
+																className="text-destructive"
+																onClick={(e: React.MouseEvent) => {
+																	e.stopPropagation();
+																	void handleDelete(sub);
+																}}
+																aria-label="Delete"
+															>
+																<Trash className="h-4 w-4" />
+															</Button>
+														</div>
+													</td>
+												)}
+											</tr>
+										);
+									})}
+								</tbody>
+							</table>
+						</div>
+					)}
+				</div>
+
+				{/* Detail panel */}
+				{selectedSub && (
+					<div className="w-80 shrink-0 border rounded-lg p-4 space-y-4 self-start sticky top-4">
+						<div className="flex items-center justify-between">
+							<h3 className="font-semibold">Submission Detail</h3>
+							<Badge
+								variant={
+									selectedSub.status === "new"
+										? "success"
+										: selectedSub.status === "archived"
+											? "default"
+											: "warning"
+								}
+							>
+								{selectedSub.status}
+							</Badge>
+						</div>
+						<p className="text-xs text-muted-foreground">{formatDateTime(selectedSub.createdAt)}</p>
+
+						<dl className="space-y-2">
+							{Object.entries(selectedSub.data).map(([key, value]) => (
+								<div key={key}>
+									<dt className="text-xs font-medium text-muted-foreground">{key}</dt>
+									<dd className="text-sm mt-0.5 break-words">{stringifyValue(value)}</dd>
+								</div>
+							))}
+						</dl>
+
+						{selectedSub.meta.country && (
+							<p className="text-xs text-muted-foreground">Country: {selectedSub.meta.country}</p>
+						)}
+
+						{selectedSub.notes && (
+							<div>
+								<dt className="text-xs font-medium text-muted-foreground">Notes</dt>
+								<dd className="text-sm mt-0.5">{selectedSub.notes}</dd>
+							</div>
+						)}
+					</div>
+				)}
+			</div>
+		</div>
+	);
+}
+
+// =============================================================================
+// Dashboard Widget
+// =============================================================================
+
+function RecentSubmissionsWidget() {
+	const [forms, setForms] = React.useState<FormItem[]>([]);
+	const [submissions, setSubmissions] = React.useState<SubmissionItem[]>([]);
+	const [loading, setLoading] = React.useState(true);
+	const [error, setError] = React.useState<string | null>(null);
+
+	React.useEffect(() => {
+		void (async () => {
+			let failure = FORMS_LOAD_FAILED;
+			try {
+				const formsRes = await apiFetch("forms/list");
+				if (!formsRes.ok) {
+					setError(formsLoadError(formsRes));
+					return;
+				}
+				const formsData = await parseApiResponse<{ items: FormItem[] }>(formsRes);
+				setForms(formsData.items);
+
+				const latestForm = latestSubmittedForm(formsData.items);
+				if (latestForm) {
+					failure = SUBMISSIONS_LOAD_FAILED;
+					const subsRes = await apiFetch("submissions/list", {
+						formId: latestForm.id,
+						limit: 5,
+					});
+					if (!subsRes.ok) {
+						setError(submissionsLoadError(subsRes));
+						return;
+					}
+					const subsData = await parseApiResponse<{
+						items: SubmissionItem[];
+					}>(subsRes);
+					setSubmissions(subsData.items);
+				}
+			} catch {
+				setError(failure);
+			} finally {
+				setLoading(false);
+			}
+		})();
+	}, []);
+
+	if (loading) {
+		return (
+			<div className="flex items-center justify-center py-4">
+				<Loader />
+			</div>
+		);
+	}
+
+	if (error) {
+		return <div className="text-center text-sm text-muted-foreground py-4">{error}</div>;
+	}
+
+	if (forms.length === 0) {
+		return (
+			<div className="text-center text-sm text-muted-foreground py-4">No forms configured</div>
+		);
+	}
+
+	if (submissions.length === 0) {
+		return <div className="text-center text-sm text-muted-foreground py-4">No submissions yet</div>;
+	}
+
+	const formMap = new Map(forms.map((f) => [f.id, f.name]));
+
+	return (
+		<div className="space-y-2">
+			{submissions.map((sub) => {
+				const preview = Object.values(sub.data)
+					.filter((v) => typeof v === "string" && v.length > 0)
+					.slice(0, 1)
+					.map(String)
+					.join("");
+
+				return (
+					<div key={sub.id} className="flex items-center justify-between text-xs">
+						<div className="flex items-center gap-2 min-w-0">
+							<Badge variant={sub.status === "new" ? "success" : "default"}>{sub.status}</Badge>
+							<span className="truncate">{preview || formMap.get(sub.formId) || "Submission"}</span>
+						</div>
+						<span className="text-muted-foreground whitespace-nowrap ms-2">
+							{formatDate(sub.createdAt)}
+						</span>
+					</div>
+				);
+			})}
+		</div>
+	);
+}
+
+// =============================================================================
+// Exports
+// =============================================================================
+
+export const pages: PluginAdminExports["pages"] = {
+	"/": FormsListPage,
+	"/submissions": SubmissionsPage,
+};
+
+export const widgets: PluginAdminExports["widgets"] = {
+	"recent-submissions": RecentSubmissionsWidget,
+};

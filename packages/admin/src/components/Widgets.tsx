@@ -1,0 +1,1149 @@
+/**
+ * Widgets page component
+ *
+ * Manage widget areas and widgets with drag-and-drop support.
+ * Available widgets can be dragged from the palette into widget areas.
+ * Widgets within an area can be reordered via drag-and-drop.
+ */
+
+import {
+	Button,
+	Input,
+	Label,
+	LayerDialog,
+	Select,
+	Switch,
+	useKumoToastManager,
+} from "@cloudflare/kumo";
+import {
+	DndContext,
+	DragOverlay,
+	type CollisionDetection,
+	type DragEndEvent,
+	type DragStartEvent,
+	KeyboardSensor,
+	closestCenter,
+	rectIntersection,
+	useSensor,
+	useSensors,
+	useDraggable,
+	useDroppable,
+	PointerSensor,
+} from "@dnd-kit/core";
+import {
+	SortableContext,
+	sortableKeyboardCoordinates,
+	verticalListSortingStrategy,
+	useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import type { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
+import { useLingui } from "@lingui/react/macro";
+import { Plus, DotsSixVertical, Trash, CaretDown } from "@phosphor-icons/react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import * as React from "react";
+
+import {
+	fetchManifest,
+	fetchWidgetAreas,
+	fetchWidgetComponents,
+	fetchMenus,
+	createWidgetArea,
+	createWidget,
+	updateWidget,
+	deleteWidget,
+	deleteWidgetArea,
+	reorderWidgets,
+	type WidgetArea,
+	type Widget,
+	type WidgetComponent,
+	type CreateWidgetAreaInput,
+	type CreateWidgetInput,
+	type UpdateWidgetInput,
+} from "../lib/api";
+import { ApiResponseError } from "../lib/api/client.js";
+import {
+	guardUnsavedInput,
+	revealErrors,
+	useSingleFlight,
+	useTakenValue,
+} from "../lib/dialog-form.js";
+import { getPluginBlocks } from "../lib/pluginBlocks";
+import { CaretNext } from "./ArrowIcons.js";
+import { ConfirmDialog } from "./ConfirmDialog.js";
+import { DialogError, getMutationError } from "./DialogError.js";
+import { GalleryDetailPanel } from "./editor/GalleryDetailPanel";
+import type { GalleryAttributes } from "./editor/GalleryNode";
+import { ImageDetailPanel, type ImageAttributes } from "./editor/ImageDetailPanel";
+import {
+	PortableTextEditor,
+	type BlockSidebarPanel,
+	type PluginBlockDef,
+} from "./PortableTextEditor";
+
+/** Palette item types that can be dragged into areas */
+interface PaletteItemData {
+	source: "palette";
+	widgetInput: CreateWidgetInput;
+	label: string;
+}
+
+/** Identifies an existing widget being reordered */
+interface ExistingWidgetData {
+	source: "area";
+	areaName: string;
+}
+
+type DragItemData = PaletteItemData | ExistingWidgetData;
+
+function isPaletteItem(data: DragItemData): data is PaletteItemData {
+	return data.source === "palette";
+}
+
+/** Built-in widget types available in the palette */
+const BUILTIN_WIDGETS: Array<{
+	id: string;
+	label: MessageDescriptor;
+	description: MessageDescriptor;
+	input: CreateWidgetInput;
+}> = [
+	{
+		id: "palette-content",
+		label: msg`Content Block`,
+		description: msg`Rich text content`,
+		input: { type: "content" },
+	},
+	{
+		id: "palette-menu",
+		label: msg`Menu`,
+		description: msg`Display a navigation menu`,
+		input: { type: "menu" },
+	},
+];
+
+/**
+ * Localized labels/descriptions for built-in core widget components. The server
+ * (packages/core/src/widgets/components.ts) ships these in English as stable
+ * data; the admin maps them to translated strings client-side, the same way
+ * error codes are localized. Plugin-provided components fall back to their
+ * server-provided strings.
+ */
+interface CoreWidgetMeta {
+	label: MessageDescriptor;
+	description: MessageDescriptor;
+	/** Prop-field labels keyed by prop key; `options` localizes select choices by option value. */
+	props?: Record<string, { label: MessageDescriptor; options?: Record<string, MessageDescriptor> }>;
+}
+
+const CORE_WIDGET_META: Record<string, CoreWidgetMeta> = {
+	"core:recent-posts": {
+		label: msg`Recent Posts`,
+		description: msg`Display a list of recent posts`,
+		props: {
+			count: { label: msg`Number of posts` },
+			showThumbnails: { label: msg`Show thumbnails` },
+			showDate: { label: msg`Show date` },
+			urlTemplate: { label: msg`URL template (e.g. /blog/:slug)` },
+		},
+	},
+	"core:categories": {
+		label: msg`Categories`,
+		description: msg`Display category list`,
+		props: {
+			showCount: { label: msg`Show post count` },
+			hierarchical: { label: msg`Show hierarchy` },
+		},
+	},
+	"core:tags": {
+		label: msg`Tags`,
+		description: msg`Display tag cloud`,
+		props: {
+			showCount: { label: msg`Show count` },
+			limit: { label: msg`Maximum tags` },
+		},
+	},
+	"core:search": {
+		label: msg`Search`,
+		description: msg`Search form`,
+		props: {
+			placeholder: { label: msg`Placeholder text` },
+		},
+	},
+	"core:archives": {
+		label: msg`Archives`,
+		description: msg`Monthly/yearly archives`,
+		props: {
+			type: {
+				label: msg`Group by`,
+				options: { monthly: msg`Monthly`, yearly: msg`Yearly` },
+			},
+			limit: { label: msg`Limit` },
+		},
+	},
+};
+
+const WIDGET_AREA_NAME_PATTERN = /^[a-z0-9-]+$/;
+
+type CreateAreaField = "name" | "label";
+
+function createAreaProblems(
+	name: string,
+	label: string,
+): Partial<Record<CreateAreaField, MessageDescriptor>> {
+	const problems: Partial<Record<CreateAreaField, MessageDescriptor>> = {};
+	const trimmedName = name.trim();
+	if (!trimmedName) problems.name = msg`Enter a name.`;
+	else if (!WIDGET_AREA_NAME_PATTERN.test(trimmedName)) {
+		problems.name = msg`Use lowercase letters, numbers, and hyphens.`;
+	}
+	if (!label.trim()) problems.label = msg`Enter a label.`;
+	return problems;
+}
+
+function isConflict(error: unknown): boolean {
+	return error instanceof ApiResponseError && error.code === "CONFLICT";
+}
+
+export function Widgets() {
+	const { t } = useLingui();
+	const queryClient = useQueryClient();
+	const toastManager = useKumoToastManager();
+	const [isCreateAreaOpen, setIsCreateAreaOpen] = React.useState(false);
+	const createAreaFormId = React.useId();
+	const createAreaFormRef = React.useRef<HTMLFormElement>(null);
+	const [newAreaName, setNewAreaName] = React.useState("");
+	const [newAreaLabel, setNewAreaLabel] = React.useState("");
+	const [newAreaDescription, setNewAreaDescription] = React.useState("");
+	const [createAreaSubmitted, setCreateAreaSubmitted] = React.useState(false);
+	const takenAreaName = useTakenValue(newAreaName.trim());
+	const [activeId, setActiveId] = React.useState<string | null>(null);
+	const [activeDragData, setActiveDragData] = React.useState<DragItemData | null>(null);
+	const [expandedWidgets, setExpandedWidgets] = React.useState<Set<string>>(new Set());
+	const [blockSidebarPanel, setBlockSidebarPanel] = React.useState<BlockSidebarPanel | null>(null);
+	// Track palette drag source across the full drag lifecycle (including drop animation)
+	const draggingFromPaletteRef = React.useRef(false);
+
+	const handleBlockSidebarOpen = React.useCallback((panel: BlockSidebarPanel) => {
+		setBlockSidebarPanel((prev) => {
+			// Close any existing panel before opening a new one so only one is ever active
+			prev?.onClose();
+			return panel;
+		});
+	}, []);
+
+	const handleBlockSidebarClose = React.useCallback(() => {
+		setBlockSidebarPanel((prev) => {
+			prev?.onClose();
+			return null;
+		});
+	}, []);
+
+	const { data: areas = [], isLoading } = useQuery({
+		queryKey: ["widget-areas"],
+		queryFn: fetchWidgetAreas,
+	});
+
+	const { data: components = [] } = useQuery({
+		queryKey: ["widget-components"],
+		queryFn: fetchWidgetComponents,
+	});
+
+	const { data: manifest } = useQuery({
+		queryKey: ["manifest"],
+		queryFn: fetchManifest,
+	});
+
+	const pluginBlocks = React.useMemo(() => (manifest ? getPluginBlocks(manifest) : []), [manifest]);
+
+	const createAreaMutation = useMutation({
+		mutationFn: createWidgetArea,
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ["widget-areas"] });
+			setIsCreateAreaOpen(false);
+			toastManager.add({ title: t`Widget area created` });
+		},
+		onError: (error, input) => {
+			if (!isConflict(error) || !takenAreaName.stillHolds(input.name)) return;
+			revealErrors(createAreaFormRef.current, () => {
+				setCreateAreaSubmitted(true);
+				takenAreaName.take(input.name, error);
+			});
+		},
+	});
+	const submitCreateArea = useSingleFlight((input: CreateWidgetAreaInput) =>
+		createAreaMutation.mutateAsync(input),
+	);
+
+	const createWidgetMutation = useMutation({
+		mutationFn: ({ areaName, input }: { areaName: string; input: CreateWidgetInput }) =>
+			createWidget(areaName, input),
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ["widget-areas"] });
+			toastManager.add({ title: t`Widget added` });
+		},
+		onError: (error: Error) => {
+			toastManager.add({
+				title: t`Error adding widget`,
+				description: error.message,
+				variant: "error",
+			});
+		},
+	});
+
+	const handleCreateAreaOpenChange = (open: boolean) => {
+		setIsCreateAreaOpen(open);
+		if (!open) return;
+		setNewAreaName("");
+		setNewAreaLabel("");
+		setNewAreaDescription("");
+		setCreateAreaSubmitted(false);
+		takenAreaName.reset();
+		createAreaMutation.reset();
+	};
+
+	const areaProblems = createAreaProblems(newAreaName, newAreaLabel);
+	if (takenAreaName.isTaken) {
+		areaProblems.name = msg`Another widget area already uses this name. Enter a different one.`;
+	}
+	const areaErrors = createAreaSubmitted ? areaProblems : {};
+
+	const handleCreateArea = (e: React.FormEvent<HTMLFormElement>) => {
+		e.preventDefault();
+		if (createAreaMutation.isPending) return;
+		if (Object.keys(areaProblems).length > 0) {
+			revealErrors(e.currentTarget, () => setCreateAreaSubmitted(true));
+			return;
+		}
+		submitCreateArea({
+			name: newAreaName.trim(),
+			label: newAreaLabel.trim(),
+			description: newAreaDescription,
+		});
+	};
+
+	const sensors = useSensors(
+		useSensor(PointerSensor, {
+			activationConstraint: { distance: 8 },
+		}),
+		useSensor(KeyboardSensor, {
+			coordinateGetter: sortableKeyboardCoordinates,
+		}),
+	);
+
+	// Custom collision detection: palette items use rectIntersection (anywhere
+	// over the area counts) and only match area:* droppables. Existing widgets
+	// use closestCenter for precise reorder positioning.
+	const collisionDetection: CollisionDetection = React.useCallback((args) => {
+		const dragData = args.active.data.current as DragItemData | undefined;
+		if (dragData && isPaletteItem(dragData)) {
+			// Only consider area droppables, use generous rect intersection
+			const areaContainers = args.droppableContainers.filter((c) =>
+				String(c.id).startsWith("area:"),
+			);
+			return rectIntersection({ ...args, droppableContainers: areaContainers });
+		}
+		return closestCenter(args);
+	}, []);
+
+	const handleDragStart = (event: DragStartEvent) => {
+		const id = String(event.active.id);
+		const data = (event.active.data.current as DragItemData) ?? null;
+		setActiveId(id);
+		setActiveDragData(data);
+		draggingFromPaletteRef.current = data !== null && isPaletteItem(data);
+	};
+
+	const reorderMutation = useMutation({
+		mutationFn: ({ areaName, widgetIds }: { areaName: string; widgetIds: string[] }) =>
+			reorderWidgets(areaName, widgetIds),
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ["widget-areas"] });
+		},
+		onError: (error: Error) => {
+			toastManager.add({
+				title: t`Error reordering widgets`,
+				description: error.message,
+				variant: "error",
+			});
+		},
+	});
+
+	const handleDragEnd = (event: DragEndEvent) => {
+		const { active, over } = event;
+		const dragData = active.data.current as DragItemData | undefined;
+
+		setActiveId(null);
+		setActiveDragData(null);
+
+		if (!over || !dragData) return;
+
+		// Case 1: Dragging from palette into an area
+		if (isPaletteItem(dragData)) {
+			const overId = String(over.id);
+			// The drop target is a widget area (droppable id = "area:{name}")
+			if (overId.startsWith("area:")) {
+				const areaName = overId.slice(5);
+				createWidgetMutation.mutate({
+					areaName,
+					input: dragData.widgetInput,
+				});
+			}
+			return;
+		}
+
+		// Case 2: Reordering within an area
+		if (active.id === over.id) return;
+
+		const sourceArea = areas.find((area) => area.widgets?.some((w) => w.id === active.id));
+		if (!sourceArea?.widgets) return;
+
+		const oldIndex = sourceArea.widgets.findIndex((w) => w.id === active.id);
+		const newIndex = sourceArea.widgets.findIndex((w) => w.id === over.id);
+		if (oldIndex === -1 || newIndex === -1) return;
+
+		const newWidgets = [...sourceArea.widgets];
+		const [movedWidget] = newWidgets.splice(oldIndex, 1);
+		if (!movedWidget) return;
+		newWidgets.splice(newIndex, 0, movedWidget);
+
+		reorderMutation.mutate({
+			areaName: sourceArea.name,
+			widgetIds: newWidgets.map((w) => w.id),
+		});
+	};
+
+	const toggleWidget = (widgetId: string) => {
+		setExpandedWidgets((prev) => {
+			const next = new Set(prev);
+			if (next.has(widgetId)) {
+				next.delete(widgetId);
+			} else {
+				next.add(widgetId);
+			}
+			return next;
+		});
+	};
+
+	// Build the palette label for the drag overlay
+	const activePaletteLabel =
+		activeDragData && isPaletteItem(activeDragData) ? activeDragData.label : null;
+	// Find the existing widget being dragged for overlay
+	const activeWidget =
+		activeId && activeDragData && !isPaletteItem(activeDragData)
+			? areas.flatMap((a) => a.widgets ?? []).find((w) => w.id === activeId)
+			: null;
+
+	if (isLoading) {
+		return (
+			<div className="flex items-center justify-center h-64">
+				<div className="text-kumo-subtle">{t`Loading widgets...`}</div>
+			</div>
+		);
+	}
+
+	return (
+		<>
+			<DndContext
+				sensors={sensors}
+				collisionDetection={collisionDetection}
+				onDragStart={handleDragStart}
+				onDragEnd={handleDragEnd}
+			>
+				<div className="space-y-6">
+					<div className="flex items-center justify-between">
+						<div>
+							<h1 className="text-2xl font-semibold leading-tight">{t`Widgets`}</h1>
+							<p className="mt-1 text-sm leading-5 text-pretty text-kumo-subtle">
+								{t`Manage content widgets in your widget areas`}
+							</p>
+						</div>
+						<LayerDialog.Root
+							open={isCreateAreaOpen}
+							{...guardUnsavedInput(
+								newAreaName !== "" || newAreaLabel !== "" || newAreaDescription !== "",
+								handleCreateAreaOpenChange,
+							)}
+							dismissDisabled={createAreaMutation.isPending}
+						>
+							<LayerDialog.Trigger
+								render={(props) => (
+									<Button {...props} icon={<Plus />}>
+										{t`Add Widget Area`}
+									</Button>
+								)}
+							/>
+							<LayerDialog.Content>
+								<LayerDialog.Title>{t`Create Widget Area`}</LayerDialog.Title>
+								<LayerDialog.Description>
+									{t`A widget area is a place in your theme, such as a sidebar, that holds widgets.`}
+								</LayerDialog.Description>
+								<LayerDialog.Body>
+									<form
+										ref={createAreaFormRef}
+										id={createAreaFormId}
+										noValidate
+										onSubmit={handleCreateArea}
+										className="grid gap-5"
+									>
+										<Input
+											dir="ltr"
+											label={t`Name`}
+											name="name"
+											required
+											placeholder="sidebar"
+											value={newAreaName}
+											onChange={(e) => setNewAreaName(e.target.value)}
+											error={areaErrors.name && t(areaErrors.name)}
+											aria-invalid={areaErrors.name ? true : undefined}
+										/>
+										<Input
+											label={t`Label`}
+											name="label"
+											required
+											placeholder={t`Main Sidebar`}
+											value={newAreaLabel}
+											onChange={(e) => setNewAreaLabel(e.target.value)}
+											error={areaErrors.label && t(areaErrors.label)}
+											aria-invalid={areaErrors.label ? true : undefined}
+										/>
+										<Input
+											label={t`Description`}
+											name="description"
+											placeholder={t`Appears on posts and pages`}
+											value={newAreaDescription}
+											onChange={(e) => setNewAreaDescription(e.target.value)}
+										/>
+										<DialogError
+											message={getMutationError(
+												takenAreaName.unlessTaken(createAreaMutation.error),
+											)}
+										/>
+									</form>
+								</LayerDialog.Body>
+								<LayerDialog.Actions dismissLabel={t`Cancel`}>
+									<LayerDialog.Action
+										type="submit"
+										form={createAreaFormId}
+										disabled={createAreaMutation.isPending}
+									>
+										{createAreaMutation.isPending ? t`Creating...` : t`Create`}
+									</LayerDialog.Action>
+								</LayerDialog.Actions>
+							</LayerDialog.Content>
+						</LayerDialog.Root>
+					</div>
+
+					<div className="overflow-x-auto">
+						<div className="min-w-[768px] grid grid-cols-12 gap-6">
+							{/* Available Widgets (draggable palette) */}
+							<div className="col-span-4">
+								<div className="rounded-lg border bg-kumo-base p-6 space-y-4">
+									<h2 className="text-xl font-semibold">{t`Available Widgets`}</h2>
+									<p className="text-sm text-kumo-subtle">{t`Drag widgets into an area to add them`}</p>
+									<div className="space-y-2">
+										{BUILTIN_WIDGETS.map((item) => (
+											<DraggablePaletteItem
+												key={item.id}
+												id={item.id}
+												label={t(item.label)}
+												description={t(item.description)}
+												widgetInput={{ ...item.input, title: t(item.label) }}
+											/>
+										))}
+										{components.map((comp) => {
+											const meta = CORE_WIDGET_META[comp.id];
+											const label = meta ? t(meta.label) : comp.label;
+											const description = meta ? t(meta.description) : comp.description;
+											return (
+												<DraggablePaletteItem
+													key={`palette-comp-${comp.id}`}
+													id={`palette-comp-${comp.id}`}
+													label={label}
+													description={description}
+													widgetInput={{
+														type: "component",
+														title: label,
+														componentId: comp.id,
+													}}
+												/>
+											);
+										})}
+									</div>
+								</div>
+							</div>
+
+							{/* Widget Areas (droppable + sortable) */}
+							<div className="col-span-8 space-y-4">
+								{areas.length === 0 ? (
+									<div className="rounded-lg border bg-kumo-base p-12 text-center">
+										<p className="text-kumo-subtle">{t`No widget areas yet. Create one to get started.`}</p>
+									</div>
+								) : (
+									areas.map((area) => (
+										<WidgetAreaPanel
+											key={area.id}
+											area={area}
+											expandedWidgets={expandedWidgets}
+											onToggleWidget={toggleWidget}
+											isDraggingPalette={activeDragData !== null && isPaletteItem(activeDragData)}
+											components={components}
+											pluginBlocks={pluginBlocks}
+											onBlockSidebarOpen={handleBlockSidebarOpen}
+											onBlockSidebarClose={handleBlockSidebarClose}
+										/>
+									))
+								)}
+							</div>
+						</div>
+					</div>
+				</div>
+
+				{/* Drag overlay — no drop animation for palette items (source stays in place).
+			    Use ref because state is cleared in handleDragEnd before animation runs. */}
+				<DragOverlay dropAnimation={draggingFromPaletteRef.current ? null : undefined}>
+					{activePaletteLabel ? (
+						<div className="rounded border bg-kumo-base p-3 shadow-lg opacity-90">
+							<div className="font-medium">{activePaletteLabel}</div>
+						</div>
+					) : activeWidget ? (
+						<div className="rounded border bg-kumo-base p-3 shadow-lg opacity-90">
+							<div className="flex items-center gap-2">
+								<DotsSixVertical className="h-4 w-4 text-kumo-subtle" />
+								<span className="font-medium">{activeWidget.title || t`Untitled Widget`}</span>
+								<span className="text-xs text-kumo-subtle">({activeWidget.type})</span>
+							</div>
+						</div>
+					) : null}
+				</DragOverlay>
+
+				{/* A single block-sidebar panel for the whole page — ensures only one is ever
+			    open at a time, preventing stacked fixed overlays and duplicated window listeners. */}
+				{blockSidebarPanel?.type === "image" && (
+					<ImageDetailPanel
+						attributes={blockSidebarPanel.attrs as unknown as ImageAttributes}
+						onUpdate={(attrs) => blockSidebarPanel.onUpdate(attrs)}
+						onReplace={(attrs) =>
+							blockSidebarPanel.onReplace(attrs as unknown as Record<string, unknown>)
+						}
+						onDelete={() => {
+							blockSidebarPanel.onDelete();
+							setBlockSidebarPanel(null);
+						}}
+						onClose={handleBlockSidebarClose}
+					/>
+				)}
+			</DndContext>
+			{blockSidebarPanel?.type === "gallery" && (
+				<GalleryDetailPanel
+					attributes={blockSidebarPanel.attrs as unknown as GalleryAttributes}
+					onUpdate={(attrs) => blockSidebarPanel.onUpdate(attrs)}
+					onDelete={() => {
+						blockSidebarPanel.onDelete();
+						setBlockSidebarPanel(null);
+					}}
+					onClose={handleBlockSidebarClose}
+				/>
+			)}
+		</>
+	);
+}
+
+/** A draggable item in the available widgets palette */
+function DraggablePaletteItem({
+	id,
+	label,
+	description,
+	widgetInput,
+}: {
+	id: string;
+	label: string;
+	description?: string;
+	widgetInput: CreateWidgetInput;
+}) {
+	const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+		id,
+		data: {
+			source: "palette",
+			widgetInput,
+			label,
+		} satisfies PaletteItemData,
+	});
+
+	return (
+		<div
+			ref={setNodeRef}
+			{...attributes}
+			{...listeners}
+			className={`p-3 rounded border cursor-grab active:cursor-grabbing select-none ${
+				isDragging ? "opacity-50" : "hover:bg-kumo-tint"
+			}`}
+		>
+			<div className="font-medium">{label}</div>
+			{description && <div className="text-sm text-kumo-subtle">{description}</div>}
+		</div>
+	);
+}
+
+function WidgetAreaPanel({
+	area,
+	expandedWidgets,
+	onToggleWidget,
+	isDraggingPalette,
+	components,
+	pluginBlocks,
+	onBlockSidebarOpen,
+	onBlockSidebarClose,
+}: {
+	area: WidgetArea;
+	expandedWidgets: Set<string>;
+	onToggleWidget: (id: string) => void;
+	isDraggingPalette: boolean;
+	components: WidgetComponent[];
+	pluginBlocks: PluginBlockDef[];
+	onBlockSidebarOpen: (panel: BlockSidebarPanel) => void;
+	onBlockSidebarClose: () => void;
+}) {
+	const { t } = useLingui();
+	const queryClient = useQueryClient();
+	const toastManager = useKumoToastManager();
+	const [deleteAreaName, setDeleteAreaName] = React.useState<string | null>(null);
+
+	// Make the area a droppable target for palette items
+	const { setNodeRef: setDropRef, isOver } = useDroppable({
+		id: `area:${area.name}`,
+	});
+
+	const deleteAreaMutation = useMutation({
+		mutationFn: deleteWidgetArea,
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ["widget-areas"] });
+			setDeleteAreaName(null);
+			toastManager.add({ title: t`Widget area deleted` });
+		},
+	});
+
+	const hasWidgets = area.widgets && area.widgets.length > 0;
+
+	return (
+		<div
+			className={`rounded-lg border bg-kumo-base transition-colors ${isOver ? "ring-2 ring-kumo-brand" : ""}`}
+		>
+			<div className="p-4 border-b flex items-center justify-between">
+				<div>
+					<h3 className="text-lg font-semibold">{area.label}</h3>
+					{area.description && <p className="text-sm text-kumo-subtle">{area.description}</p>}
+				</div>
+				<Button
+					variant="ghost"
+					size="sm"
+					onClick={() => setDeleteAreaName(area.name)}
+					aria-label={t`Delete ${area.label} widget area`}
+				>
+					<Trash className="h-4 w-4" />
+				</Button>
+			</div>
+
+			<div ref={setDropRef} className="p-4 space-y-2 min-h-[80px]">
+				{hasWidgets ? (
+					<SortableContext
+						items={area.widgets!.map((w) => w.id)}
+						strategy={verticalListSortingStrategy}
+					>
+						{area.widgets!.map((widget) => (
+							<WidgetItem
+								key={widget.id}
+								widget={widget}
+								areaName={area.name}
+								isExpanded={expandedWidgets.has(widget.id)}
+								onToggle={() => onToggleWidget(widget.id)}
+								components={components}
+								pluginBlocks={pluginBlocks}
+								onBlockSidebarOpen={onBlockSidebarOpen}
+								onBlockSidebarClose={onBlockSidebarClose}
+							/>
+						))}
+					</SortableContext>
+				) : null}
+				{/* Drop zone hint — shown when dragging a palette item */}
+				{isDraggingPalette && (
+					<div
+						className={`text-center py-4 rounded border-2 border-dashed transition-colors ${
+							isOver
+								? "border-kumo-brand bg-kumo-brand/5 text-kumo-link"
+								: "border-kumo-subtle/30 text-kumo-subtle"
+						}`}
+					>
+						{isOver ? t`Drop to add widget` : t`Drag here to add`}
+					</div>
+				)}
+				{!hasWidgets && !isDraggingPalette && (
+					<div className="text-center py-8 text-kumo-subtle">{t`Drag widgets here to add them`}</div>
+				)}
+			</div>
+
+			<ConfirmDialog
+				open={deleteAreaName === area.name}
+				onClose={() => {
+					setDeleteAreaName(null);
+					deleteAreaMutation.reset();
+				}}
+				title={t`Delete Widget Area?`}
+				description={t`This will delete the widget area and all its widgets. This action cannot be undone.`}
+				confirmLabel={t`Delete`}
+				pendingLabel={t`Deleting...`}
+				isPending={deleteAreaMutation.isPending}
+				error={deleteAreaMutation.error}
+				onConfirm={() => deleteAreaMutation.mutate(area.name)}
+			/>
+		</div>
+	);
+}
+
+function WidgetItem({
+	widget,
+	areaName,
+	isExpanded,
+	onToggle,
+	components,
+	pluginBlocks,
+	onBlockSidebarOpen,
+	onBlockSidebarClose,
+}: {
+	widget: Widget;
+	areaName: string;
+	isExpanded: boolean;
+	onToggle: () => void;
+	components: WidgetComponent[];
+	pluginBlocks: PluginBlockDef[];
+	onBlockSidebarOpen: (panel: BlockSidebarPanel) => void;
+	onBlockSidebarClose: () => void;
+}) {
+	const { t } = useLingui();
+	const queryClient = useQueryClient();
+	const toastManager = useKumoToastManager();
+	const [isDeleteOpen, setIsDeleteOpen] = React.useState(false);
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: widget.id,
+		data: {
+			source: "area",
+			areaName,
+		} satisfies ExistingWidgetData,
+	});
+
+	const style = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+	};
+
+	const deleteMutation = useMutation({
+		mutationFn: () => deleteWidget(areaName, widget.id),
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ["widget-areas"] });
+			setIsDeleteOpen(false);
+			toastManager.add({ title: t`Widget deleted` });
+		},
+	});
+
+	const updateMutation = useMutation({
+		mutationFn: (input: UpdateWidgetInput) => updateWidget(areaName, widget.id, input),
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ["widget-areas"] });
+			toastManager.add({ title: t`Widget updated` });
+		},
+		onError: (error: Error) => {
+			toastManager.add({
+				title: t`Error updating widget`,
+				description: error.message,
+				variant: "error",
+			});
+		},
+	});
+
+	return (
+		<div
+			ref={setNodeRef}
+			style={style}
+			className={`rounded border bg-kumo-base p-3 ${isDragging ? "opacity-50" : ""}`}
+		>
+			<div className="flex items-center gap-2">
+				<button
+					{...attributes}
+					{...listeners}
+					className="cursor-grab active:cursor-grabbing"
+					aria-label={t`Drag to reorder ${widget.title ?? t`widget`}`}
+				>
+					<DotsSixVertical className="h-4 w-4 text-kumo-subtle" />
+				</button>
+				<button onClick={onToggle} className="flex-1 text-start" aria-expanded={isExpanded}>
+					<div className="flex items-center gap-2">
+						{isExpanded ? <CaretDown className="h-4 w-4" /> : <CaretNext className="h-4 w-4" />}
+						<span className="font-medium">{widget.title || t`Untitled Widget`}</span>
+						<span className="text-xs text-kumo-subtle">({widget.type})</span>
+					</div>
+				</button>
+				<Button
+					variant="ghost"
+					size="sm"
+					onClick={() => setIsDeleteOpen(true)}
+					aria-label={t`Delete ${widget.title ?? t`widget`}`}
+				>
+					<Trash className="h-4 w-4" />
+				</Button>
+			</div>
+
+			{isExpanded && (
+				<WidgetEditor
+					widget={widget}
+					components={components}
+					pluginBlocks={pluginBlocks}
+					onSave={(input) => updateMutation.mutate(input)}
+					isSaving={updateMutation.isPending}
+					onBlockSidebarOpen={onBlockSidebarOpen}
+					onBlockSidebarClose={onBlockSidebarClose}
+				/>
+			)}
+
+			<ConfirmDialog
+				open={isDeleteOpen}
+				onClose={() => {
+					setIsDeleteOpen(false);
+					deleteMutation.reset();
+				}}
+				title={t`Delete widget?`}
+				description={t`"${widget.title || t`Untitled Widget`}" will be removed from this widget area. This action cannot be undone.`}
+				confirmLabel={t`Delete`}
+				pendingLabel={t`Deleting...`}
+				isPending={deleteMutation.isPending}
+				error={deleteMutation.error}
+				onConfirm={() => deleteMutation.mutate()}
+			/>
+		</div>
+	);
+}
+
+/** Inline editor form for a widget, rendered when the widget is expanded */
+function WidgetEditor({
+	widget,
+	components,
+	pluginBlocks,
+	onSave,
+	isSaving,
+	onBlockSidebarOpen,
+	onBlockSidebarClose,
+}: {
+	widget: Widget;
+	components: WidgetComponent[];
+	pluginBlocks: PluginBlockDef[];
+	onSave: (input: UpdateWidgetInput) => void;
+	isSaving: boolean;
+	onBlockSidebarOpen: (panel: BlockSidebarPanel) => void;
+	onBlockSidebarClose: () => void;
+}) {
+	const { t } = useLingui();
+	const [title, setTitle] = React.useState(widget.title ?? "");
+	const [content, setContent] = React.useState<unknown[]>(
+		Array.isArray(widget.content) ? widget.content : [],
+	);
+	const [menuName, setMenuName] = React.useState(widget.menuName ?? "");
+	const [componentId, setComponentId] = React.useState(widget.componentId ?? "");
+	const [componentProps, setComponentProps] = React.useState<Record<string, unknown>>(
+		widget.componentProps ?? {},
+	);
+
+	const { data: menus = [] } = useQuery({
+		queryKey: ["menus"],
+		queryFn: () => fetchMenus(),
+		enabled: widget.type === "menu",
+	});
+
+	const selectedComponent = components.find((c) => c.id === componentId);
+
+	const handleSave = () => {
+		const input: UpdateWidgetInput = { title };
+		if (widget.type === "content") {
+			input.content = content;
+		} else if (widget.type === "menu") {
+			input.menuName = menuName;
+		} else if (widget.type === "component") {
+			input.componentId = componentId;
+			input.componentProps = componentProps;
+		}
+		onSave(input);
+	};
+
+	return (
+		<div className="mt-3 p-3 bg-kumo-tint rounded space-y-4">
+			<Input
+				label={t`Title`}
+				value={title}
+				onChange={(e) => setTitle(e.target.value)}
+				placeholder={t`Widget title`}
+			/>
+
+			{widget.type === "content" && (
+				<div>
+					<Label className="text-sm font-medium mb-2 block">{t`Content`}</Label>
+					<PortableTextEditor
+						value={content as Parameters<typeof PortableTextEditor>[0]["value"]}
+						onChange={(value) => setContent(value)}
+						minimal
+						placeholder={t`Write widget content...`}
+						pluginBlocks={pluginBlocks}
+						onBlockSidebarOpen={onBlockSidebarOpen}
+						onBlockSidebarClose={onBlockSidebarClose}
+					/>
+				</div>
+			)}
+
+			{widget.type === "menu" && (
+				<Select
+					label={t`Menu`}
+					value={menuName}
+					onValueChange={(v) => setMenuName(v ?? "")}
+					items={Object.fromEntries(menus.map((m) => [m.name, m.label || m.name]))}
+				>
+					<Select.Option value="">{t`Select a menu...`}</Select.Option>
+					{menus.map((m) => (
+						<Select.Option key={m.name} value={m.name}>
+							{m.label || m.name}
+						</Select.Option>
+					))}
+				</Select>
+			)}
+
+			{widget.type === "component" && (
+				<>
+					<Select
+						label={t`Component`}
+						value={componentId}
+						onValueChange={(v) => {
+							setComponentId(v ?? "");
+							// Reset props when component changes
+							if (v !== componentId) {
+								const comp = components.find((c) => c.id === v);
+								if (comp) {
+									const defaults: Record<string, unknown> = {};
+									for (const [key, def] of Object.entries(comp.props)) {
+										defaults[key] = def.default ?? "";
+									}
+									setComponentProps(defaults);
+								} else {
+									setComponentProps({});
+								}
+							}
+						}}
+						items={Object.fromEntries(
+							components.map((c) => {
+								const meta = CORE_WIDGET_META[c.id];
+								return [c.id, meta ? t(meta.label) : c.label];
+							}),
+						)}
+					>
+						<Select.Option value="">{t`Select a component...`}</Select.Option>
+						{components.map((c) => {
+							const meta = CORE_WIDGET_META[c.id];
+							return (
+								<Select.Option key={c.id} value={c.id}>
+									{meta ? t(meta.label) : c.label}
+								</Select.Option>
+							);
+						})}
+					</Select>
+
+					{selectedComponent &&
+						Object.entries(selectedComponent.props).map(([key, def]) => (
+							<ComponentPropField
+								key={key}
+								componentId={selectedComponent.id}
+								propKey={key}
+								def={def}
+								value={componentProps[key] ?? def.default ?? ""}
+								onChange={(v) => setComponentProps((prev) => ({ ...prev, [key]: v }))}
+							/>
+						))}
+				</>
+			)}
+
+			<div className="flex justify-end">
+				<Button size="sm" onClick={handleSave} disabled={isSaving}>
+					{isSaving ? t`Saving...` : t`Save`}
+				</Button>
+			</div>
+		</div>
+	);
+}
+
+/** Renders a single prop field for a component widget based on PropDef type */
+function ComponentPropField({
+	componentId,
+	propKey,
+	def,
+	value,
+	onChange,
+}: {
+	componentId: string;
+	propKey: string;
+	def: WidgetComponent["props"][string];
+	value: unknown;
+	onChange: (value: unknown) => void;
+}) {
+	const { t } = useLingui();
+	// Localize built-in core widget prop labels/options; fall back to the
+	// server-provided string for plugin-registered components.
+	const propMeta = CORE_WIDGET_META[componentId]?.props?.[propKey];
+	const label = propMeta ? t(propMeta.label) : def.label;
+	const optionLabel = (optValue: string, fallback: string) => {
+		const descriptor = propMeta?.options?.[optValue];
+		return descriptor ? t(descriptor) : fallback;
+	};
+	switch (def.type) {
+		case "string":
+			return (
+				<Input
+					label={label}
+					value={typeof value === "string" ? value : ""}
+					onChange={(e) => onChange(e.target.value)}
+				/>
+			);
+		case "number":
+			return (
+				<Input
+					label={label}
+					type="number"
+					value={typeof value === "number" ? value : ""}
+					onChange={(e) => onChange(Number(e.target.value))}
+				/>
+			);
+		case "boolean":
+			return <Switch label={label} checked={Boolean(value)} onCheckedChange={onChange} />;
+		case "select": {
+			const items: Record<string, string> = {};
+			for (const opt of def.options ?? []) {
+				items[opt.value] = optionLabel(opt.value, opt.label);
+			}
+			return (
+				<Select
+					label={label}
+					value={typeof value === "string" ? value : ""}
+					onValueChange={(v) => onChange(v ?? "")}
+					items={items}
+				>
+					{def.options?.map((opt) => (
+						<Select.Option key={opt.value} value={opt.value}>
+							{optionLabel(opt.value, opt.label)}
+						</Select.Option>
+					))}
+				</Select>
+			);
+		}
+		default:
+			return (
+				<Input
+					label={label}
+					value={typeof value === "string" ? value : ""}
+					onChange={(e) => onChange(e.target.value)}
+				/>
+			);
+	}
+}

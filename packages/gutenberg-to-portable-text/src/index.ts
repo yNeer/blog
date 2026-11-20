@@ -1,0 +1,598 @@
+/**
+ * Gutenberg to Portable Text Converter
+ *
+ * Converts WordPress Gutenberg block content to Portable Text format.
+ * Uses @wordpress/block-serialization-default-parser to parse the hybrid
+ * HTML+JSON format that WordPress uses.
+ */
+
+import { parse } from "@wordpress/block-serialization-default-parser";
+
+import { createBlockScanner } from "./block-elements.js";
+import { extractText, parseInlineContent, parseInlineParagraphs } from "./inline.js";
+import { table as tableTransformer } from "./transformers/core.js";
+import { getTransformer } from "./transformers/index.js";
+import type {
+	GutenbergBlock,
+	PortableTextBlock,
+	ConvertOptions,
+	TransformContext,
+} from "./types.js";
+
+// Regex patterns for HTML parsing and conversion
+const WORD_CHARACTER_PATTERN = /\w/;
+const TABLE_BLOCK_CONTENT_PATTERN = /<(?:img|h[1-6]|ul|ol|pre|blockquote|hr)\b/i;
+const MERGED_CELL_PATTERN = /\b(?:colspan|rowspan)\s*=\s*(?:["']\s*)?(?:[2-9]|[1-9]\d)/i;
+const TABLE_ROW_TAG_PATTERN = /<tr\b/gi;
+const TABLE_CELL_TAG_PATTERN = /<t[dh]\b/gi;
+const TABLE_ROW_END_TAG_PATTERN = /<\/tr>/gi;
+const TABLE_CELL_END_TAG_PATTERN = /<\/t[dh]>/gi;
+const BLOCK_END_INSIDE_CELL_PATTERN = /<\/(?:p|div)>(?!\s*<\/(?:p|div|t[dh])>)/gi;
+const BLOCK_START_INSIDE_CELL_PATTERN =
+	/(?<!(?:<(?:t[dh]|p|div)\b[^>]*>|<br\s*\/?>)\s*)<(?:p|div)\b/gi;
+const ALL_WHITESPACE_PATTERN = /\s+/g;
+// Attributes are read as whole quoted values or single characters. Each part can match a
+// given character in only one way and none spans a `<`, so a tag that never closes costs
+// linear time instead of quadratic backtracking. The link's quoted `href` is capture 1.
+const LINKED_IMAGE_PATTERN =
+	/<a(?=\s)(?:[^<>"'\s]|\s(?!href=)|"[^"<]*"|'[^'<]*')*\shref=("[^"<]+"|'[^'<]+')(?:[^<>"']|"[^"<]*"|'[^'<]*')*>\s*<img(\s(?:[^<>"']|"[^"<]*"|'[^'<]*')*)>\s*<\/a>/gu;
+const STANDALONE_IMAGE_PATTERN = /<img\s(?:[^<>"']|"[^"<]*"|'[^'<]*')*>/gu;
+const IMG_TAG_PATTERN = /<img[^>]+>/i;
+const SRC_ATTR_PATTERN = /src=["']([^"']+)["']/i;
+const ALT_ATTR_PATTERN = /alt=["']([^"']*)["']/i;
+const LIST_ITEM_PATTERN = /<li[^>]*>([\s\S]*?)<\/li>/gu;
+const CODE_TAG_PATTERN = /<code[^>]*>([\s\S]*?)<\/code>/i;
+const CODE_LANGUAGE_PATTERN = /<code[^>]*\sclass=["'][^"']*language-([^\s"']+)/i;
+const BR_TAG_PATTERN = /<br\s*\/?>/giu;
+const HTML_TAG_PATTERN = /<[^>]+>/g;
+const FIGCAPTION_TAG_PATTERN = /<figcaption[^>]*>([\s\S]*?)<\/figcaption>/i;
+const AMP_ENTITY_PATTERN = /&amp;/g;
+const LESS_THAN_ENTITY_PATTERN = /&lt;/g;
+const GREATER_THAN_ENTITY_PATTERN = /&gt;/g;
+const QUOTE_ENTITY_PATTERN = /&quot;/g;
+const APOS_ENTITY_PATTERN = /&#039;/g;
+const NUMERIC_AMP_ENTITY_PATTERN = /&#0?38;/g;
+const HEX_AMP_ENTITY_PATTERN = /&#x26;/gi;
+const NBSP_ENTITY_PATTERN = /&nbsp;/g;
+
+// Re-export types
+export type {
+	GutenbergBlock,
+	PortableTextBlock,
+	PortableTextTextBlock,
+	PortableTextImageBlock,
+	PortableTextCodeBlock,
+	PortableTextEmbedBlock,
+	PortableTextGalleryBlock,
+	PortableTextColumnsBlock,
+	PortableTextBreakBlock,
+	PortableTextHtmlBlock,
+	PortableTextButtonBlock,
+	PortableTextButtonsBlock,
+	PortableTextCoverBlock,
+	PortableTextFileBlock,
+	PortableTextPullquoteBlock,
+	PortableTextSpan,
+	PortableTextMarkDef,
+	ConvertOptions,
+	BlockTransformer,
+	TransformContext,
+} from "./types.js";
+
+// Re-export transformers for customization
+export { defaultTransformers, fallbackTransformer } from "./transformers/index.js";
+export * as coreTransformers from "./transformers/core.js";
+export * as embedTransformers from "./transformers/embed.js";
+
+// Re-export inline utilities
+export {
+	parseInlineContent,
+	extractText,
+	extractAlt,
+	extractCaption,
+	extractSrc,
+} from "./inline.js";
+
+/**
+ * Default key generator
+ */
+function createKeyGenerator(): () => string {
+	let counter = 0;
+	return () => {
+		counter++;
+		return `key-${counter}-${Math.random().toString(36).substring(2, 7)}`;
+	};
+}
+
+/**
+ * Normalize parsed blocks from the WP parser into our GutenbergBlock type.
+ * The WP parser returns `attrs: Record<string, any> | null`, so we normalize
+ * null attrs to empty objects and recursively process innerBlocks.
+ */
+function normalizeBlocks(blocks: ReturnType<typeof parse>): GutenbergBlock[] {
+	return blocks.map(
+		(block): GutenbergBlock => ({
+			blockName: block.blockName,
+			attrs: (block.attrs ?? {}) satisfies Record<string, unknown>,
+			innerHTML: block.innerHTML,
+			innerBlocks: normalizeBlocks(block.innerBlocks),
+			innerContent: block.innerContent,
+		}),
+	);
+}
+
+/**
+ * Convert WordPress Gutenberg content to Portable Text
+ *
+ * @param content - WordPress post content (HTML with Gutenberg block comments)
+ * @param options - Conversion options
+ * @returns Array of Portable Text blocks
+ *
+ * @example
+ * ```ts
+ * const portableText = gutenbergToPortableText(`
+ *   <!-- wp:paragraph -->
+ *   <p>Hello <strong>world</strong>!</p>
+ *   <!-- /wp:paragraph -->
+ * `);
+ * // → [{ _type: "block", style: "normal", children: [...] }]
+ * ```
+ */
+export function gutenbergToPortableText(
+	content: string,
+	options: ConvertOptions = {},
+): PortableTextBlock[] {
+	// Handle empty content
+	if (!content || !content.trim()) {
+		return [];
+	}
+
+	// Check if content has Gutenberg blocks
+	const hasBlocks = content.includes("<!-- wp:");
+
+	if (!hasBlocks) {
+		// Classic editor content - treat as HTML
+		return htmlToPortableText(content, options);
+	}
+
+	// Parse Gutenberg blocks
+	const blocks = normalizeBlocks(parse(content));
+
+	// Create key generator
+	const generateKey = options.keyGenerator || createKeyGenerator();
+
+	// Create transform context
+	const context = createTransformContext(options, generateKey);
+
+	// Transform blocks
+	return blocks.flatMap((block) => transformBlock(block, options, context));
+}
+
+/**
+ * Convert plain HTML (classic editor) to Portable Text
+ */
+export function htmlToPortableText(
+	html: string,
+	options: ConvertOptions = {},
+): PortableTextBlock[] {
+	const generateKey = options.keyGenerator || createKeyGenerator();
+	const blocks: PortableTextBlock[] = [];
+
+	// Split on block-level elements (including standalone img tags)
+	let lastIndex = 0;
+	let match;
+
+	const tables = findClassicTables(html);
+	let nextTable = 0;
+	// Tables that would lose content are skipped here and read as plain HTML by the scan below.
+	const pushTablesBefore = (end: number) => {
+		while (nextTable < tables.length && tables[nextTable]!.start < end) {
+			const table = tables[nextTable++]!;
+			if (table.start < lastIndex || table.nested) continue;
+			const tableBlocks = classicTableToPortableText(
+				html.slice(table.start, table.end),
+				options,
+				generateKey,
+			);
+			if (tableBlocks.length === 0) continue;
+
+			pushParagraphs(blocks, html.slice(lastIndex, table.start), generateKey);
+			blocks.push(...tableBlocks);
+			lastIndex = table.end;
+		}
+	};
+
+	const nextBlockElement = createBlockScanner(html);
+	let scanFrom = 0;
+	while ((match = nextBlockElement(scanFrom)) !== null) {
+		scanFrom = match.index + match.html.length;
+		pushTablesBefore(match.index);
+		if (lastIndex > match.index) {
+			// A table took in this element: resume the scan after the table.
+			scanFrom = lastIndex;
+			continue;
+		}
+
+		const fullMatch = match.html;
+		const tag = match.tag.toLowerCase();
+		const content = match.content;
+
+		// Handle text between matches
+		pushParagraphs(blocks, html.slice(lastIndex, match.index), generateKey);
+		lastIndex = match.index + match.html.length;
+
+		// Check for standalone <img> tag (not wrapped in figure/p)
+		if (fullMatch.toLowerCase().startsWith("<img")) {
+			const srcMatch = fullMatch.match(SRC_ATTR_PATTERN);
+			const altMatch = fullMatch.match(ALT_ATTR_PATTERN);
+			if (srcMatch?.[1]) {
+				const imgUrl = decodeUrlEntities(srcMatch[1]);
+				blocks.push({
+					_type: "image",
+					_key: generateKey(),
+					asset: {
+						_type: "reference",
+						_ref: imgUrl,
+						url: imgUrl,
+					},
+					alt: altMatch?.[1],
+				});
+			}
+			continue;
+		}
+
+		// Transform based on tag
+		switch (tag) {
+			case "p":
+			case "div": {
+				// Extract any images first (including those wrapped in <a> tags)
+				// Match: <a...><img...></a> or standalone <img...>
+				// Track positions of linked images so we don't double-process
+				const linkedImgPositions: Array<{ start: number; end: number }> = [];
+
+				// First extract linked images
+				let linkedMatch;
+				while ((linkedMatch = LINKED_IMAGE_PATTERN.exec(content)) !== null) {
+					const linkUrl = decodeUrlEntities(linkedMatch[1]!.slice(1, -1));
+					const imgAttrs = linkedMatch[2]!;
+					const srcMatch = imgAttrs.match(SRC_ATTR_PATTERN);
+					const altMatch = imgAttrs.match(ALT_ATTR_PATTERN);
+					if (srcMatch?.[1]) {
+						const imgUrl = decodeUrlEntities(srcMatch[1]);
+						blocks.push({
+							_type: "image",
+							_key: generateKey(),
+							asset: {
+								_type: "reference",
+								_ref: imgUrl,
+								url: imgUrl,
+							},
+							alt: altMatch?.[1],
+							link: linkUrl,
+						});
+					}
+					linkedImgPositions.push({
+						start: linkedMatch.index,
+						end: linkedMatch.index + linkedMatch[0].length,
+					});
+				}
+
+				// Then extract standalone images (not inside <a> tags)
+				let imgMatch;
+				while ((imgMatch = STANDALONE_IMAGE_PATTERN.exec(content)) !== null) {
+					// Skip if this image is inside a linked image we already processed
+					const isLinked = linkedImgPositions.some(
+						(pos) => imgMatch!.index >= pos.start && imgMatch!.index < pos.end,
+					);
+					if (isLinked) continue;
+
+					const srcMatch = imgMatch[0].match(SRC_ATTR_PATTERN);
+					const altMatch = imgMatch[0].match(ALT_ATTR_PATTERN);
+					if (srcMatch?.[1]) {
+						const imgUrl = decodeUrlEntities(srcMatch[1]);
+						blocks.push({
+							_type: "image",
+							_key: generateKey(),
+							asset: {
+								_type: "reference",
+								_ref: imgUrl,
+								url: imgUrl,
+							},
+							alt: altMatch?.[1],
+						});
+					}
+				}
+
+				// Then handle the text content (with images and image links stripped)
+				const textContent = content
+					.replace(LINKED_IMAGE_PATTERN, "") // Remove linked images
+					.replace(STANDALONE_IMAGE_PATTERN, ""); // Remove standalone images
+				pushParagraphs(blocks, textContent, generateKey);
+				break;
+			}
+
+			case "h1":
+			case "h2":
+			case "h3":
+			case "h4":
+			case "h5":
+			case "h6": {
+				const { children, markDefs } = parseInlineContent(content, generateKey);
+				blocks.push({
+					_type: "block",
+					_key: generateKey(),
+					style: tag,
+					children,
+					markDefs: markDefs.length > 0 ? markDefs : undefined,
+				});
+				break;
+			}
+
+			case "blockquote": {
+				const { children, markDefs } = parseInlineContent(content, generateKey);
+				blocks.push({
+					_type: "block",
+					_key: generateKey(),
+					style: "blockquote",
+					children,
+					markDefs: markDefs.length > 0 ? markDefs : undefined,
+				});
+				break;
+			}
+
+			case "pre": {
+				// Extract code content
+				const codeMatch = content.match(CODE_TAG_PATTERN);
+				const code = codeMatch?.[1] || content;
+				// Classic editor content often uses <br> for the newlines inside a code block
+				const withNewlines = code.replace(BR_TAG_PATTERN, "\n");
+				const language = content.match(CODE_LANGUAGE_PATTERN)?.[1];
+				blocks.push({
+					_type: "code",
+					_key: generateKey(),
+					code: decodeHtmlEntities(withNewlines),
+					...(language ? { language } : {}),
+				});
+				break;
+			}
+
+			case "ul":
+			case "ol": {
+				const listItem = tag === "ol" ? "number" : "bullet";
+				let liMatch;
+				while ((liMatch = LIST_ITEM_PATTERN.exec(content)) !== null) {
+					const liContent = liMatch[1] || "";
+					const { children, markDefs } = parseInlineContent(liContent, generateKey);
+					blocks.push({
+						_type: "block",
+						_key: generateKey(),
+						style: "normal",
+						listItem,
+						level: 1,
+						children,
+						markDefs: markDefs.length > 0 ? markDefs : undefined,
+					});
+				}
+				break;
+			}
+
+			case "hr": {
+				blocks.push({
+					_type: "break",
+					_key: generateKey(),
+					style: "lineBreak",
+				});
+				break;
+			}
+
+			case "figure": {
+				// Check for image
+				const imgMatch = content.match(IMG_TAG_PATTERN);
+				if (imgMatch) {
+					const srcMatch = imgMatch[0].match(SRC_ATTR_PATTERN);
+					const altMatch = imgMatch[0].match(ALT_ATTR_PATTERN);
+					const captionMatch = content.match(FIGCAPTION_TAG_PATTERN);
+					const imgUrl = srcMatch?.[1] ? decodeUrlEntities(srcMatch[1]) : "";
+
+					blocks.push({
+						_type: "image",
+						_key: generateKey(),
+						asset: {
+							_type: "reference",
+							_ref: imgUrl,
+							url: imgUrl || undefined,
+						},
+						alt: altMatch?.[1],
+						caption: captionMatch?.[1]?.replace(HTML_TAG_PATTERN, "").trim(),
+					});
+				}
+				break;
+			}
+		}
+	}
+	pushTablesBefore(html.length);
+
+	// Handle remaining text
+	pushParagraphs(blocks, html.slice(lastIndex), generateKey);
+
+	return blocks;
+}
+
+/**
+ * Add text as paragraph blocks, one per run of text between blank lines.
+ * Classic-editor posts mark paragraphs only with blank lines: WordPress adds
+ * the `<p>` tags when it displays a post (`wpautop`).
+ */
+function pushParagraphs(
+	blocks: PortableTextBlock[],
+	html: string,
+	generateKey: () => string,
+): void {
+	for (const { children, markDefs } of parseInlineParagraphs(html, generateKey)) {
+		blocks.push({
+			_type: "block",
+			_key: generateKey(),
+			style: "normal",
+			children,
+			markDefs: markDefs.length > 0 ? markDefs : undefined,
+		});
+	}
+}
+
+/**
+ * Create transform context for recursive block transformation
+ */
+function createTransformContext(
+	options: ConvertOptions,
+	generateKey: () => string,
+): TransformContext {
+	const context: TransformContext = {
+		generateKey,
+		parseInlineContent: (html: string) => parseInlineContent(html, generateKey),
+		transformBlocks: (blocks: GutenbergBlock[]) =>
+			blocks.flatMap((block) => transformBlock(block, options, context)),
+	};
+	return context;
+}
+
+interface ClassicTable {
+	start: number;
+	end: number;
+	nested: boolean;
+}
+
+/**
+ * Find each `<table` start tag outside HTML comments in source order, with the first `</table>`
+ * after it. A table whose span holds the start of another one ends at the inner table's end tag,
+ * so it is marked as nested and never converted itself. Searches with `indexOf` only: a regular
+ * expression for the span backtracks polynomially on unclosed tags.
+ */
+function findClassicTables(html: string): ClassicTable[] {
+	const tables: ClassicTable[] = [];
+	let tagEnd = -1;
+	let close = -1;
+	let commentStart = html.indexOf("<!--");
+	let commentEnd = -1;
+	for (
+		let start = html.indexOf("<table");
+		start !== -1;
+		start = html.indexOf("<table", start + 1)
+	) {
+		while (commentStart !== -1 && commentStart < start) {
+			// `<!-->` and `<!--->` end at their own `>`, as HTML parses them.
+			const commentClose = html.indexOf("-->", commentStart + 2);
+			if (commentClose === -1) return tables;
+			commentEnd = commentClose + 3;
+			commentStart = html.indexOf("<!--", commentEnd);
+		}
+		if (start < commentEnd) continue;
+		if (WORD_CHARACTER_PATTERN.test(html.charAt(start + 6))) continue;
+		if (tagEnd < start + 6) tagEnd = html.indexOf(">", start + 6);
+		if (tagEnd === -1) break;
+		if (close <= tagEnd) close = html.indexOf("</table>", tagEnd + 1);
+		if (close === -1) break;
+		const previous = tables.at(-1);
+		if (previous && start < previous.end) previous.nested = true;
+		tables.push({ start, end: close + "</table>".length, nested: false });
+	}
+	return tables;
+}
+
+/**
+ * Convert a classic-editor `<table>` with the `core/table` transformer, or return no blocks
+ * when the result would lose part of the table. The transformer emits text-only cells without
+ * colspan or rowspan, needs end tags on rows and cells, and skips text outside the rows it
+ * reads, such as a caption or footer rows.
+ */
+function classicTableToPortableText(
+	html: string,
+	options: ConvertOptions,
+	generateKey: () => string,
+): PortableTextBlock[] {
+	const rowTags = html.match(TABLE_ROW_TAG_PATTERN)?.length ?? 0;
+	const cellTags = html.match(TABLE_CELL_TAG_PATTERN)?.length ?? 0;
+	if (
+		TABLE_BLOCK_CONTENT_PATTERN.test(html) ||
+		MERGED_CELL_PATTERN.test(html) ||
+		// The transformer's row and cell patterns rescan the rest of the table from every start
+		// tag that has no end tag.
+		(html.match(TABLE_ROW_END_TAG_PATTERN)?.length ?? 0) < rowTags ||
+		(html.match(TABLE_CELL_END_TAG_PATTERN)?.length ?? 0) < cellTags
+	) {
+		return [];
+	}
+
+	// Cells keep inline content only, so paragraphs in one cell are separated by a line break.
+	const cellHtml = html
+		.replace(BLOCK_END_INSIDE_CELL_PATTERN, "$&<br>")
+		.replace(BLOCK_START_INSIDE_CELL_PATTERN, "<br>$&");
+	const block: GutenbergBlock = {
+		blockName: "core/table",
+		attrs: {},
+		innerHTML: cellHtml,
+		innerBlocks: [],
+		innerContent: [cellHtml],
+	};
+	const converted = tableTransformer(block, options, createTransformContext(options, generateKey));
+	const table = converted[0];
+	if (table?._type !== "table") {
+		return [];
+	}
+
+	const cells = table.rows.flatMap((row) => row.cells);
+	const cellText = cells.flatMap((cell) => cell.content.map((span) => span.text)).join("");
+	const withoutWhitespace = (text: string) => text.replace(ALL_WHITESPACE_PATTERN, "");
+	const keepsEverything =
+		table.rows.length === rowTags &&
+		cells.length === cellTags &&
+		withoutWhitespace(cellText) === withoutWhitespace(extractText(html));
+	return keepsEverything ? converted : [];
+}
+
+/**
+ * Transform a single block
+ */
+function transformBlock(
+	block: GutenbergBlock,
+	options: ConvertOptions,
+	context: TransformContext,
+): PortableTextBlock[] {
+	const transformer = getTransformer(block.blockName, options.customTransformers);
+	return transformer(block, options, context);
+}
+
+/**
+ * Decode HTML entities
+ */
+function decodeHtmlEntities(html: string): string {
+	return html
+		.replace(LESS_THAN_ENTITY_PATTERN, "<")
+		.replace(GREATER_THAN_ENTITY_PATTERN, ">")
+		.replace(AMP_ENTITY_PATTERN, "&")
+		.replace(QUOTE_ENTITY_PATTERN, '"')
+		.replace(APOS_ENTITY_PATTERN, "'")
+		.replace(NUMERIC_AMP_ENTITY_PATTERN, "&") // &#038; or &#38;
+		.replace(HEX_AMP_ENTITY_PATTERN, "&") // &#x26;
+		.replace(NBSP_ENTITY_PATTERN, " ");
+}
+
+/**
+ * Decode HTML entities in URLs (used for image src attributes)
+ */
+function decodeUrlEntities(url: string): string {
+	return url
+		.replace(AMP_ENTITY_PATTERN, "&")
+		.replace(NUMERIC_AMP_ENTITY_PATTERN, "&")
+		.replace(HEX_AMP_ENTITY_PATTERN, "&");
+}
+
+/**
+ * Parse Gutenberg blocks without converting to Portable Text
+ * Useful for inspection and debugging
+ */
+export function parseGutenbergBlocks(content: string): GutenbergBlock[] {
+	if (!content || !content.trim()) {
+		return [];
+	}
+	return normalizeBlocks(parse(content));
+}

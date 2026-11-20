@@ -1,0 +1,398 @@
+/**
+ * Portable helpers shared by the platform image-endpoint modules.
+ *
+ * EmDash wraps Astro's image endpoint (`image.endpoint`) so that source bytes
+ * for EmDash media are read straight from the storage adapter instead of being
+ * fetched over HTTP. The platform endpoint modules (Node: sharp via
+ * `astro:assets`; Cloudflare: the `IMAGES` binding) do the actual transform;
+ * this module holds the platform-agnostic bits they share: recognizing an
+ * EmDash media URL and validating transform query params.
+ *
+ * Kept free of `astro:*` / `virtual:emdash/*` imports so it stays in the
+ * precompiled package and can be unit-tested directly.
+ */
+
+import mime from "mime/lite";
+
+import { INTERNAL_MEDIA_PREFIX } from "./normalize.js";
+
+/** Output formats the wrapped endpoint can produce on Cloudflare. */
+export const ALLOWED_TRANSFORM_FORMATS = ["webp", "avif", "jpeg", "png"] as const;
+
+/** Default output format -- broad support, strong compression. */
+export const DEFAULT_TRANSFORM_FORMAT: ImageTransformFormat = "webp";
+
+/**
+ * Default output quality for lossy formats (WebP/AVIF/JPEG) when the request
+ * doesn't specify one. Matches the default Cloudflare applies to URL-based
+ * image transformations. The Images *binding* applies no default of its own
+ * and encodes near-losslessly when quality is omitted (a 2048px WebP comes
+ * out ~900 KB instead of ~100 KB), so the endpoint sends an explicit quality
+ * for lossy output. PNG is exempt: an explicit PNG quality switches the
+ * binding to lossy PNG8, which is not a safe default for a lossless format.
+ */
+export const DEFAULT_TRANSFORM_QUALITY = 85;
+
+/** Upper bound for a requested dimension; caps the work a single request asks for. */
+export const MAX_TRANSFORM_DIMENSION = 4000;
+
+/** Weak prefix on an ETag, stripped for weak comparison per RFC 7232. */
+const WEAK_ETAG_PREFIX = /^W\//;
+
+/**
+ * Strip surrounding whitespace and the weak prefix from an ETag value for
+ * weak comparison. Defined at module scope so it is not recreated per request.
+ */
+function stripWeakEtagPrefix(value: string): string {
+	return value.trim().replace(WEAK_ETAG_PREFIX, "");
+}
+
+/** A format string accepted by {@link ImageTransformOptions.format}. */
+export type ImageTransformFormat = (typeof ALLOWED_TRANSFORM_FORMATS)[number];
+
+/** Validated options for a single transform. */
+export interface ImageTransformOptions {
+	width?: number;
+	height?: number;
+	format: ImageTransformFormat;
+	/**
+	 * Explicitly-requested quality (1-100), or `undefined` when the request
+	 * carried no `q`. Callers apply their own default per format (see
+	 * {@link DEFAULT_TRANSFORM_QUALITY}); lossless PNG deliberately gets none.
+	 */
+	quality?: number;
+}
+
+/** Long-lived cache for content-addressed image URLs. */
+export const IMMUTABLE_IMAGE_CACHE = "public, max-age=31536000, immutable";
+
+/** Cache policy for media keys that Replace original may overwrite. */
+export const MUTABLE_MEDIA_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+
+/** Route cache lifetime for media responses; replace and delete purge them sooner. */
+export const MEDIA_ROUTE_CACHE_MAX_AGE = 31_536_000;
+
+/** Route cache tag for the original file and every variant of a storage key. */
+export function mediaCacheTag(storageKey: string): string {
+	return `emdash:media:${storageKey}`;
+}
+
+/** Cloudflare drops tags longer than 1024 characters but still caches the response. */
+export function isCacheableMediaKey(storageKey: string): boolean {
+	return isSafeTransformKey(storageKey) && mediaCacheTag(storageKey).length <= 1024;
+}
+
+/**
+ * Whether media of this type and key can be in the route cache, so deleting its file needs a purge.
+ * Storage backends that infer the served type from the key's extension can serve an image even
+ * when the stored MIME type is not one.
+ */
+export function isRouteCachedMedia(storageKey: string, mimeType: string): boolean {
+	if (!isCacheableMediaKey(storageKey)) return false;
+	return mimeType.startsWith("image/") || (mime.getType(storageKey) ?? "").startsWith("image/");
+}
+
+/** Cache only plain local source URLs; preview queries still reach the transformer unchanged. */
+export function isCacheableMediaSource(href: string | null, requestUrl: URL): boolean {
+	const key = matchInternalMediaKey(href);
+	if (!key) return false;
+	const pathname = `${INTERNAL_MEDIA_PREFIX}${key}`;
+	return href === pathname || href === `${requestUrl.origin}${pathname}`;
+}
+
+/** Store the current response in the route cache only when its tag can be purged. */
+export function cacheMediaResponse(
+	cache: { enabled: boolean; set(options: { maxAge: number; tags: string[] }): void } | undefined,
+	storageKey: string,
+): void {
+	if (!cache?.enabled || !isCacheableMediaKey(storageKey)) return;
+	cache.set({ maxAge: MEDIA_ROUTE_CACHE_MAX_AGE, tags: [mediaCacheTag(storageKey)] });
+}
+
+/**
+ * Query parameters of an image endpoint URL, in the order Astro's `getURL`
+ * writes them. Stock-service endpoints redirect to this order without changing
+ * the source `href` value.
+ */
+const CANONICAL_TRANSFORM_PARAMS = ["href", "w", "h", "q", "f", "fit", "position", "background"];
+
+/**
+ * The canonical query for an image endpoint request, or `null` when the
+ * request already uses it. Known parameters keep their first value (the one
+ * the endpoint reads) in canonical order, followed by the parameters named in
+ * the adapter's `assetQueryParams` with the request's own values; everything
+ * else is dropped.
+ */
+export function canonicalTransformSearch(
+	url: URL,
+	assetQueryParams?: URLSearchParams,
+): string | null {
+	const params = url.searchParams;
+	const names = [...CANONICAL_TRANSFORM_PARAMS];
+	for (const name of assetQueryParams?.keys() ?? []) {
+		if (!names.includes(name)) names.push(name);
+	}
+	const canonical = new URLSearchParams();
+	for (const name of names) {
+		const value = params.get(name);
+		if (value !== null) canonical.append(name, value);
+	}
+	// Compared as serialized text: Workers Cache keys on the raw URL, so an
+	// equal query with different percent-encoding would be a separate entry.
+	const search = canonical.toString();
+	return search === url.search.slice(1) ? null : search;
+}
+
+/** `301` to the canonical form of an image endpoint URL. */
+export function canonicalTransformRedirect(url: URL, search: string): Response {
+	return new Response(null, {
+		status: 301,
+		headers: { Location: `${url.pathname}?${search}` },
+	});
+}
+
+/**
+ * Format a Date as an HTTP-date (RFC 7231).
+ */
+export function formatHttpDate(date: Date): string {
+	return date.toUTCString();
+}
+
+/**
+ * Build a weak validator from representation metadata. Weak because it is based
+ * on size and modification time rather than a content hash. Keeps the same
+ * shape for stored files and derived transforms so replacements change the tag.
+ */
+export function makeWeakEtag(size: number, lastModified?: Date, suffix?: string): string {
+	let value = String(size);
+	if (lastModified) value += `-${lastModified.getTime()}`;
+	if (suffix) value += `-${suffix}`;
+	return `W/"${value}"`;
+}
+
+/**
+ * Build a canonical fingerprint of the transform query params that affect the
+ * derived /_image bytes. Used as the suffix of a transform's weak ETag.
+ */
+export function getTransformFingerprint(params: URLSearchParams): string {
+	const parts: string[] = [];
+	const append = (name: string) => {
+		const value = params.get(name);
+		if (value !== null) parts.push(`${name}=${value}`);
+	};
+	append("w");
+	append("h");
+	append("f");
+	append("q");
+	append("fit");
+	return parts.join("&");
+}
+
+/**
+ * Check whether a request's preconditions are satisfied for the given
+ * representation. Returns true when the client already has the current version.
+ */
+export function isNotModified(
+	request: Request,
+	size: number,
+	lastModified?: Date,
+	suffix?: string,
+): boolean {
+	const etag = makeWeakEtag(size, lastModified, suffix);
+	const ifNoneMatch = request.headers.get("If-None-Match");
+	if (ifNoneMatch !== null) {
+		if (ifNoneMatch.trim() === "*") return true;
+		// If-None-Match uses weak comparison: "W/" prefixes are ignored.
+		const requestedTags = ifNoneMatch.split(",").map(stripWeakEtagPrefix);
+		return requestedTags.includes(stripWeakEtagPrefix(etag));
+	}
+	const ifModifiedSince = request.headers.get("If-Modified-Since");
+	if (ifModifiedSince !== null && lastModified) {
+		const since = Date.parse(ifModifiedSince);
+		if (!Number.isNaN(since)) {
+			// HTTP-date has one-second precision; round the stored time down so
+			// a Last-Modified header replayed as If-Modified-Since always matches.
+			return Math.floor(lastModified.getTime() / 1000) * 1000 <= since;
+		}
+	}
+	return false;
+}
+
+/**
+ * Headers that make a mutable representation conditionally cacheable.
+ */
+export function validatorHeaders(
+	size: number,
+	lastModified?: Date,
+	suffix?: string,
+): Record<string, string> {
+	const headers: Record<string, string> = {
+		ETag: makeWeakEtag(size, lastModified, suffix),
+	};
+	if (lastModified) {
+		headers["Last-Modified"] = formatHttpDate(lastModified);
+	}
+	return headers;
+}
+
+/**
+ * Raster types safe to render inline. Anything else (SVG, PDF, ...) is served
+ * as an attachment so it can't execute as an active document. Mirrors the
+ * `/_emdash/api/media/file/{key}` route's allowlist.
+ */
+const SAFE_INLINE_IMAGE_TYPES = new Set([
+	"image/jpeg",
+	"image/png",
+	"image/gif",
+	"image/webp",
+	"image/avif",
+	"image/bmp",
+	"image/x-icon",
+]);
+
+/**
+ * Headers for streaming **original** stored bytes (the no-transform fallback).
+ * Carries the same stored-XSS protections as the media file route: a sandbox
+ * CSP, `nosniff`, and `Content-Disposition: attachment` for anything not on the
+ * inline raster allowlist (so a stored SVG can't run scripts in the site
+ * origin). Transformed output is always generated raster and doesn't need this.
+ */
+export function originalMediaHeaders(
+	contentType: string,
+	size?: number,
+	lastModified?: Date,
+): Record<string, string> {
+	return {
+		"Content-Type": contentType,
+		"Cache-Control": MUTABLE_MEDIA_CACHE_CONTROL,
+		"X-Content-Type-Options": "nosniff",
+		"Content-Security-Policy":
+			"sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'",
+		"Content-Disposition": SAFE_INLINE_IMAGE_TYPES.has(contentType) ? "inline" : "attachment",
+		...(size !== undefined ? validatorHeaders(size, lastModified) : {}),
+	};
+}
+
+/** Storage keys safe to serve: the flat `{ulid}{ext}` shape, no slashes/traversal. */
+const SAFE_STORAGE_KEY = /^[A-Za-z0-9._-]+$/;
+
+/** Plain decimal digits only -- rejects "1e3", "0x10", "+5", whitespace. */
+const DECIMAL_DIGITS = /^\d+$/;
+const NUMERIC_QUALITY = /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i;
+const QUALITY_PRESETS: Record<string, number> = { low: 25, mid: 50, high: 80, max: 100 };
+
+/** Whether a storage key is safe to resolve against the storage backend. */
+export function isSafeTransformKey(key: string): boolean {
+	return SAFE_STORAGE_KEY.test(key);
+}
+
+/**
+ * If `href` points at the internal EmDash media route
+ * (`/_emdash/api/media/file/{key}`) with a safe key, return the key; otherwise
+ * `null` (the endpoint then delegates to the stock image endpoint for bundled
+ * assets, allowed remote, and `publicUrl` media).
+ *
+ * The component absolutizes same-origin media (Astro only optimizes absolute,
+ * remote-allowed URLs), so `href` is typically `https://site/_emdash/...` but
+ * may be relative. We match on the **pathname** only and never fetch `href` —
+ * the key is read from our own storage — so the host is irrelevant and can't be
+ * an SSRF vector. A dummy base resolves both absolute and relative forms and
+ * strips any query/fragment.
+ */
+export function matchInternalMediaKey(href: string | null | undefined): string | null {
+	if (!href) return null;
+	let pathname: string;
+	try {
+		pathname = new URL(href, "http://localhost").pathname;
+	} catch {
+		return null;
+	}
+	if (!pathname.startsWith(INTERNAL_MEDIA_PREFIX)) return null;
+	const key = pathname.slice(INTERNAL_MEDIA_PREFIX.length);
+	if (!key || !isSafeTransformKey(key)) return null;
+	return key;
+}
+
+/** Type guard for {@link ImageTransformFormat}. */
+export function isTransformFormat(value: string): value is ImageTransformFormat {
+	return (ALLOWED_TRANSFORM_FORMATS as readonly string[]).includes(value);
+}
+
+/** Outcome of parsing transform query params: validated options or an error. */
+export type ParsedTransformParams =
+	| { ok: true; options: ImageTransformOptions }
+	| { ok: false; message: string };
+
+/**
+ * Resolve the quality to send to the image binding for a transform. An
+ * explicitly-requested quality always wins. Otherwise lossy formats
+ * (WebP/AVIF/JPEG) get {@link DEFAULT_TRANSFORM_QUALITY} because the Images
+ * binding encodes near-losslessly when quality is omitted; lossless PNG gets
+ * `undefined` because an explicit PNG quality switches the binding to lossy
+ * PNG8, which is not a safe default for a lossless format.
+ */
+export function resolveTransformQuality(
+	format: ImageTransformFormat,
+	requested: number | undefined,
+): number | undefined {
+	if (requested !== undefined) return requested;
+	return format === "png" ? undefined : DEFAULT_TRANSFORM_QUALITY;
+}
+
+/**
+ * Parse and validate `?w=&h=&f=&q=` query params. Width is required (it sizes
+ * the rendition); dimensions are bounded so a request can't ask for an
+ * unbounded or nonsensical transform. Format falls back to
+ * {@link DEFAULT_TRANSFORM_FORMAT} when not requested. `q` accepts Astro presets
+ * or finite numbers rounded and clamped to 1-100. It is otherwise left
+ * `undefined` so the caller can apply a per-format
+ * default (lossy formats get one, lossless PNG does not — see
+ * {@link DEFAULT_TRANSFORM_QUALITY}).
+ */
+export function parseTransformParams(params: URLSearchParams): ParsedTransformParams {
+	const width = parseDimension(params.get("w"));
+	if (width === null) return { ok: false, message: "Invalid 'w' (width)" };
+	if (width === undefined) return { ok: false, message: "Missing 'w' (width)" };
+
+	const height = parseDimension(params.get("h"));
+	if (height === null) return { ok: false, message: "Invalid 'h' (height)" };
+
+	const formatRaw = params.get("f");
+	let format: ImageTransformFormat = DEFAULT_TRANSFORM_FORMAT;
+	if (formatRaw !== null) {
+		if (!isTransformFormat(formatRaw)) {
+			return { ok: false, message: `Unsupported 'f' (format): ${formatRaw}` };
+		}
+		format = formatRaw;
+	}
+
+	let quality: number | undefined;
+	const qualityRaw = params.get("q");
+	if (qualityRaw !== null) {
+		if (Object.hasOwn(QUALITY_PRESETS, qualityRaw)) {
+			quality = QUALITY_PRESETS[qualityRaw];
+		} else {
+			const q = NUMERIC_QUALITY.test(qualityRaw) ? Number(qualityRaw) : Number.NaN;
+			if (!Number.isFinite(q)) {
+				return { ok: false, message: "Invalid 'q' (quality), expected a number or Astro preset" };
+			}
+			quality = Math.round(Math.min(100, Math.max(1, q)));
+		}
+	}
+
+	return { ok: true, options: { width, height, format, quality } };
+}
+
+/**
+ * Parse a dimension query value.
+ * - `undefined`: param absent
+ * - `null`: present but invalid (non-integer, out of range)
+ * - `number`: valid, within [1, MAX_TRANSFORM_DIMENSION]
+ */
+function parseDimension(raw: string | null): number | undefined | null {
+	if (raw === null) return undefined;
+	if (!DECIMAL_DIGITS.test(raw)) return null;
+	const n = Number(raw);
+	if (n < 1 || n > MAX_TRANSFORM_DIMENSION) return null;
+	return n;
+}

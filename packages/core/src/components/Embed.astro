@@ -1,0 +1,160 @@
+---
+import { sanitizeHref } from "../utils/url.js";
+import { sanitizeContent } from "../utils/sanitize.js";
+
+/**
+ * Portable Text Embed block component
+ *
+ * Renders YouTube and Vimeo players, self-hosted video and audio, and
+ * sanitized provider HTML. Links to the embed URL when sanitizing removed an
+ * iframe or left nothing to show.
+ */
+export interface Props {
+	node: {
+		_type: "embed";
+		_key: string;
+		url: string;
+		provider?: string;
+		html?: string;
+		caption?: string;
+	};
+}
+
+const { node } = Astro.props;
+
+if (!node?.url) {
+	return null;
+}
+
+const { url: rawUrl, provider, html, caption } = node;
+const url = sanitizeHref(rawUrl);
+
+const YOUTUBE_HOSTS = new Set(["youtube.com", "www.youtube.com", "m.youtube.com"]);
+const VIMEO_HOSTS = new Set(["vimeo.com", "www.vimeo.com"]);
+const YOUTUBE_ID_PATTERN = /^[a-zA-Z0-9_-]{11}$/;
+const YOUTUBE_SHORT_PATH_PATTERN = /^\/([a-zA-Z0-9_-]{11})\/?$/;
+const YOUTUBE_EMBED_PATH_PATTERN = /^\/embed\/([a-zA-Z0-9_-]{11})\/?$/;
+const VIMEO_PATH_PATTERN = /^\/(\d+)(?:\/|$)/;
+const IFRAME_PATTERN = /<iframe\b([^>]*)>[\s\S]*?<\/iframe>/gi;
+const ATTRIBUTE_VALUE_PATTERN = /="[^"]*"/g;
+const SRC_ATTRIBUTE_PATTERN = /\ssrc(?=[\s/]|$)/i;
+const TAG_PATTERN = /<[^>]*>/g;
+const MEDIA_TAG_PATTERN = /<(?:img|iframe)\b/i;
+
+function getYouTubeId(input: URL | null): string | null {
+	if (!input) return null;
+	const id =
+		input.hostname === "youtu.be"
+			? input.pathname.match(YOUTUBE_SHORT_PATH_PATTERN)?.[1]
+			: YOUTUBE_HOSTS.has(input.hostname)
+				? input.pathname === "/watch"
+					? input.searchParams.get("v")
+					: input.pathname.match(YOUTUBE_EMBED_PATH_PATTERN)?.[1]
+				: null;
+	return id && YOUTUBE_ID_PATTERN.test(id) ? id : null;
+}
+
+function getVimeoId(input: URL | null): string | null {
+	if (!input || !VIMEO_HOSTS.has(input.hostname)) return null;
+	return input.pathname.match(VIMEO_PATH_PATTERN)?.[1] || null;
+}
+
+const parsedUrl = URL.canParse(url) ? new URL(url) : null;
+const videoUrl =
+	parsedUrl?.protocol === "https:" || parsedUrl?.protocol === "http:" ? parsedUrl : null;
+const youtubeId = getYouTubeId(videoUrl);
+const vimeoId = getVimeoId(videoUrl);
+
+// Check if this is a self-hosted video or audio
+const isSelfHostedVideo = provider === "video";
+const isSelfHostedAudio = provider === "audio";
+const sanitizedHtml = html ? sanitizeContent(html) : "";
+// sanitize-html keeps an iframe from a host it doesn't allow but drops its `src`.
+const embedHtml = sanitizedHtml.replace(IFRAME_PATTERN, (iframe, attributes: string) =>
+	SRC_ATTRIBUTE_PATTERN.test(attributes.replace(ATTRIBUTE_VALUE_PATTERN, "")) ? iframe : "",
+);
+const hasEmbedHtml =
+	embedHtml.replace(TAG_PATTERN, "").trim() !== "" || MEDIA_TAG_PATTERN.test(embedHtml);
+const showLink = !hasEmbedHtml || embedHtml !== sanitizedHtml;
+---
+
+<figure class="emdash-embed">
+	{
+		isSelfHostedVideo ? (
+			<div class="emdash-embed-video">
+				<video controls preload="metadata">
+					<source src={url} />
+					Your browser does not support the video element.
+				</video>
+			</div>
+		) : isSelfHostedAudio ? (
+			<div class="emdash-embed-audio">
+				<audio controls preload="metadata">
+					<source src={url} />
+					Your browser does not support the audio element.
+				</audio>
+			</div>
+		) : youtubeId ? (
+			<div class="emdash-embed-video">
+				<iframe
+					src={`https://www.youtube.com/embed/${youtubeId}`}
+					title="YouTube video"
+					allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+					allowfullscreen
+				/>
+			</div>
+		) : vimeoId ? (
+			<div class="emdash-embed-video">
+				<iframe
+					src={`https://player.vimeo.com/video/${vimeoId}`}
+					title="Vimeo video"
+					allow="autoplay; fullscreen; picture-in-picture"
+					allowfullscreen
+				/>
+			</div>
+		) : (
+			<>
+				{hasEmbedHtml && <div class="emdash-embed-html" set:html={embedHtml} />}
+				{showLink && (
+					<a href={url} target="_blank" rel="noopener noreferrer">
+						{url}
+					</a>
+				)}
+			</>
+		)
+	}
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<style>
+	.emdash-embed {
+		margin: 1.5rem 0;
+	}
+	.emdash-embed-video {
+		position: relative;
+		padding-bottom: 56.25%; /* 16:9 */
+		height: 0;
+		overflow: hidden;
+	}
+	.emdash-embed-video iframe,
+	.emdash-embed-video video {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		border: 0;
+	}
+	.emdash-embed-audio {
+		width: 100%;
+	}
+	.emdash-embed-audio audio {
+		width: 100%;
+	}
+	.emdash-embed figcaption {
+		font-size: 0.875rem;
+		color: var(--emdash-caption-color, var(--color-muted, #666));
+		margin-top: 0.5rem;
+		text-align: center;
+	}
+</style>

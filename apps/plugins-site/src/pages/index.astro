@@ -1,0 +1,46 @@
+---
+import BuildCta from "../components/home/BuildCta.astro";
+import Hero from "../components/home/Hero.astro";
+import HowItWorks from "../components/home/HowItWorks.astro";
+import RecentPlugins from "../components/home/RecentPlugins.astro";
+import SectionNotch from "../components/home/SectionNotch.astro";
+import TrustBento from "../components/home/TrustBento.astro";
+import PluginArt from "../components/PluginArt.astro";
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { searchCatalog, withLatestReleases } from "../lib/catalog.js";
+import { recentlyUpdated } from "../lib/discovery.js";
+import { REGISTRY_PAGE_CACHE } from "../lib/registry.js";
+
+const result = await searchCatalog("");
+const catalog = "packages" in result ? result.packages : (result.partial ?? []);
+const hasError = "error" in result && catalog.length === 0;
+const recentEntries = await withLatestReleases(recentlyUpdated(catalog));
+
+if (!("error" in result)) {
+	Astro.cache.set({ ...REGISTRY_PAGE_CACHE, tags: ["registry"] });
+}
+
+const websiteJsonLd = {
+	"@context": "https://schema.org",
+	"@type": "WebSite",
+	name: "EmDash Plugins",
+	url: new URL("/", Astro.site ?? Astro.url.origin).href,
+};
+---
+
+<BaseLayout jsonLd={websiteJsonLd}>
+	<Hero />
+	<RecentPlugins entries={recentEntries} hasError={hasError} />
+	<SectionNotch />
+	<TrustBento />
+	<HowItWorks />
+	<BuildCta>
+		<PluginArt slot="art" seed="idea" variant="feature" />
+	</BuildCta>
+</BaseLayout>
+
+<style is:global>
+	:root {
+		--main-end-space: 0;
+	}
+</style>

@@ -1,0 +1,286 @@
+/**
+ * Scheduled publishing sweep
+ *
+ * Promotes content whose scheduled publish time has passed. Driven by the
+ * platform scheduler alongside cron ticks and system cleanup — never by a
+ * request. On Node the cron scheduler's maintenance pass calls it; on
+ * Cloudflare the Worker's `scheduled()` handler does.
+ *
+ * Like `runSystemCleanup`, each collection sweep is independent and non-fatal:
+ * one collection failing must not stop the rest.
+ */
+
+import type { Kysely } from "kysely";
+
+import { handleContentPublish } from "./api/handlers/content.js";
+import {
+	ContentRepository,
+	findNextScheduledAt,
+	findTypesWithDueContent,
+} from "./database/repositories/content.js";
+import { OptionsRepository } from "./database/repositories/options.js";
+import type { Database } from "./database/types.js";
+import { SchemaRegistry } from "./schema/registry.js";
+
+/** A content item that was promoted to published by a sweep. */
+export interface PublishedRef {
+	collection: string;
+	id: string;
+}
+
+/**
+ * Default cap on items promoted per collection in a single sweep. Bounds the
+ * publish/webhook fan-out of one tick so a large backlog can't exhaust a Worker
+ * invocation's CPU/subrequest budget; the remainder drains on later ticks.
+ */
+export const SCHEDULED_PUBLISH_BATCH_LIMIT = 100;
+const SCHEDULED_PUBLISH_CURSOR_PREFIX = "emdash:scheduled-publish-cursor:";
+
+interface ScheduledPublishCursor {
+	scheduledAt: string;
+	id: string;
+}
+
+function scheduledPublishCursorKey(collection: string): string {
+	return `${SCHEDULED_PUBLISH_CURSOR_PREFIX}${collection}`;
+}
+
+function isScheduledPublishCursor(value: unknown): value is ScheduledPublishCursor {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"scheduledAt" in value &&
+		typeof value.scheduledAt === "string" &&
+		"id" in value &&
+		typeof value.id === "string"
+	);
+}
+
+/**
+ * Publishes a single content item. Mirrors the relevant subset of
+ * `handleContentPublish`'s return shape. Production callers pass
+ * `EmDashRuntime.handleContentPublish` so `content:afterPublish` hooks fire
+ * (search indexing, webhooks, syndication); the default falls back to the raw
+ * handler (no hooks) for callers that have only a `db`.
+ */
+export type ScheduledPublishFn = (
+	collection: string,
+	id: string,
+	options: {
+		publishedAt?: string;
+		requireScheduledDue?: boolean;
+		expectedScheduledAt?: string;
+		currentTime?: Date;
+	},
+) => Promise<{ success: boolean; error?: { code?: string } }>;
+
+export interface PublishDueContentOptions {
+	/**
+	 * Publish callback. Production callers pass the runtime's
+	 * `handleContentPublish` so `content:afterPublish` hooks fire (search
+	 * indexing, webhooks, syndication). Defaults to the raw DB handler (no hooks).
+	 */
+	publish?: ScheduledPublishFn;
+	/**
+	 * Invoked after each collection's batch with the items promoted in that
+	 * batch. Lets request-less callers (the Cloudflare `scheduled()` handler)
+	 * purge edge-cache tags incrementally instead of only after the whole sweep,
+	 * so a runtime killed mid-sweep strands at most one batch behind stale cache
+	 * rather than everything published so far. Failures are logged, never fatal.
+	 */
+	onPublished?: (refs: PublishedRef[]) => Promise<void>;
+	/**
+	 * Maximum items promoted per collection per sweep. Defaults to
+	 * `SCHEDULED_PUBLISH_BATCH_LIMIT`. Pass `0` (or a negative) for unbounded.
+	 */
+	limit?: number;
+	/** Clock value shared by due selection and the final publication fence. */
+	currentTime?: Date;
+	/**
+	 * When set, the sweep also reports the earliest `scheduled_at` after
+	 * `currentTime` and no later than this time, so a caller can wait for it
+	 * and publish it on time.
+	 */
+	upcomingUntil?: Date;
+}
+
+export interface ScheduledSweepResult {
+	published: PublishedRef[];
+	/** Earliest upcoming `scheduled_at` within `upcomingUntil`, or `null`. */
+	nextScheduledAt: Date | null;
+}
+
+/**
+ * Publish every content item whose `scheduled_at` is in the past.
+ *
+ * Finds the collections with due content (`findTypesWithDueContent`), then, in
+ * each of them, the due items (`findReadyToPublish` returns both scheduled
+ * drafts and published entries with pending scheduled changes), and publishes
+ * each. `publish()` clears `scheduled_at`, so a second sweep is a no-op — safe
+ * to run on every tick.
+ *
+ * Bounded per collection by `limit` (default `SCHEDULED_PUBLISH_BATCH_LIMIT`):
+ * a large backlog drains across successive ticks rather than in one unbounded
+ * pass. After each collection's batch, `onPublished` (if given) is awaited so
+ * cache-tag invalidation happens incrementally, not just at the very end.
+ *
+ * Returns every item it promoted so request-less callers (the Cloudflare
+ * `scheduled()` handler) can also act on the full set.
+ */
+export async function publishDueContent(
+	db: Kysely<Database>,
+	options: PublishDueContentOptions = {},
+): Promise<PublishedRef[]> {
+	const { published } = await sweepScheduledContent(db, options);
+	return published;
+}
+
+/**
+ * `publishDueContent`, plus the next upcoming scheduled time when
+ * `upcomingUntil` is set.
+ */
+export async function sweepScheduledContent(
+	db: Kysely<Database>,
+	options: PublishDueContentOptions = {},
+): Promise<ScheduledSweepResult> {
+	const {
+		publish,
+		onPublished,
+		limit = SCHEDULED_PUBLISH_BATCH_LIMIT,
+		currentTime = new Date(),
+		upcomingUntil,
+	} = options;
+	const published: PublishedRef[] = [];
+
+	let collections;
+	try {
+		collections = await new SchemaRegistry(db).listCollections();
+	} catch (error) {
+		console.error("[scheduled-publish] Failed to list collections:", error);
+		return { published, nextScheduledAt: null };
+	}
+
+	const repo = new ContentRepository(db);
+	const optionsRepo = new OptionsRepository(db);
+	const doPublish: ScheduledPublishFn =
+		publish ?? ((collection, id, opts) => handleContentPublish(db, collection, id, opts));
+	// 0 / negative means unbounded; findReadyToPublish treats that as "no LIMIT".
+	const batchLimit = limit > 0 ? limit : undefined;
+
+	let dueCollections: Set<string> | undefined;
+	try {
+		dueCollections = await findTypesWithDueContent(
+			db,
+			collections.map((collection) => collection.slug),
+			currentTime,
+		);
+	} catch (error) {
+		console.error("[scheduled-publish] Failed to find collections with due content:", error);
+	}
+
+	for (const collection of collections) {
+		if (dueCollections && !dueCollections.has(collection.slug)) continue;
+		try {
+			let cursor: ScheduledPublishCursor | undefined;
+			let cursorRevision: string | null = null;
+			if (batchLimit !== undefined) {
+				try {
+					const stored = await optionsRepo.getVersioned(scheduledPublishCursorKey(collection.slug));
+					cursorRevision = stored?.revision ?? null;
+					if (isScheduledPublishCursor(stored?.value)) cursor = stored.value;
+				} catch (error) {
+					console.error(
+						`[scheduled-publish] Failed to read cursor for "${collection.slug}":`,
+						error,
+					);
+				}
+			}
+			let due = await repo.findReadyToPublish(collection.slug, batchLimit, currentTime, cursor);
+			if (cursor && due.length === 0) {
+				due = await repo.findReadyToPublish(collection.slug, batchLimit, currentTime);
+			}
+			const batch: PublishedRef[] = [];
+			for (const item of due) {
+				// First publication of a scheduled draft should record the intended
+				// scheduled time, not the (later) sweep time. Items already published
+				// with pending draft changes keep their original published_at.
+				const publishedAt = item.publishedAt == null ? (item.scheduledAt ?? undefined) : undefined;
+				const result = await doPublish(collection.slug, item.id, {
+					publishedAt,
+					requireScheduledDue: true,
+					expectedScheduledAt: item.scheduledAt ?? undefined,
+					currentTime,
+				});
+				if (result.success) {
+					batch.push({ collection: collection.slug, id: item.id });
+				} else if (
+					result.error?.code === "NOT_DUE" ||
+					result.error?.code === "PUBLISH_REJECTED" ||
+					result.error?.code === "CONFLICT"
+				) {
+					// Unscheduled, rescheduled, edited, or published by an overlapping
+					// sweep between selection and publish; skip quietly. An item that is
+					// still due is retried by the next sweep.
+				} else {
+					console.error(
+						`[scheduled-publish] Failed to publish ${collection.slug}/${item.id}:`,
+						result.error,
+					);
+				}
+			}
+			const lastAttempted = due.at(-1);
+			if (batchLimit !== undefined && lastAttempted?.scheduledAt) {
+				try {
+					await optionsRepo.compareAndSet(
+						scheduledPublishCursorKey(collection.slug),
+						cursorRevision,
+						{
+							scheduledAt: lastAttempted.scheduledAt,
+							id: lastAttempted.id,
+						},
+					);
+				} catch (error) {
+					console.error(
+						`[scheduled-publish] Failed to save cursor for "${collection.slug}":`,
+						error,
+					);
+				}
+			}
+
+			if (batch.length > 0) {
+				published.push(...batch);
+				if (onPublished) {
+					// Purge this batch's cache tags before moving to the next
+					// collection, so a mid-sweep kill can't strand already-published
+					// content behind stale cache.
+					try {
+						await onPublished(batch);
+					} catch (error) {
+						console.error(
+							`[scheduled-publish] onPublished failed after "${collection.slug}" batch:`,
+							error,
+						);
+					}
+				}
+			}
+		} catch (error) {
+			console.error(`[scheduled-publish] Sweep failed for "${collection.slug}":`, error);
+		}
+	}
+
+	let nextScheduledAt: Date | null = null;
+	if (upcomingUntil) {
+		try {
+			nextScheduledAt = await findNextScheduledAt(
+				db,
+				collections.map((collection) => collection.slug),
+				currentTime,
+				upcomingUntil,
+			);
+		} catch (error) {
+			console.error("[scheduled-publish] Failed to find upcoming scheduled content:", error);
+		}
+	}
+
+	return { published, nextScheduledAt };
+}

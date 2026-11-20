@@ -1,0 +1,20 @@
+---
+interface Props {
+	placeholder?: string;
+}
+
+const { placeholder = "Search..." } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+
+---
+
+<form method="get" action={`${base}/search`} class="widget-search">
+	<input
+		type="search"
+		name="q"
+		placeholder={placeholder}
+		aria-label="Search"
+		class="widget-search__input"
+	/>
+	<button type="submit" class="widget-search__button">Search</button>
+</form>
